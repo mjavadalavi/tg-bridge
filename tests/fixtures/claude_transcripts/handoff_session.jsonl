@@ -1,0 +1,18 @@
+{"type": "summary", "summary": "Login fix", "leafUuid": "leaf-1"}
+{"type": "user", "isMeta": true, "message": {"role": "user", "content": "<local-command-caveat>ignore me</local-command-caveat>"}}
+{"type": "system", "subtype": "informational", "content": "context compacted"}
+{"type": "user", "message": {"role": "user", "content": "Fix the login bug in src/auth.py"}, "session_id": "sess-1"}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "private reasoning here", "signature": "sig"}, {"type": "text", "text": "I will read the file first."}]}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tu_1", "name": "Read", "input": {"file_path": "/home/x/proj/src/auth.py"}}]}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_1", "is_error": false, "content": "def login(): pass"}]}}
+this line is not json at all
+[1, 2, 3]
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "more private", "signature": "sig"}, {"type": "tool_use", "id": "tu_2", "name": "Bash", "input": {"command": "pytest -q", "description": "Run the tests"}}]}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Tests pass."}]}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "   "}]}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Thanks, now commit it"}]}}
+{"type": "user", "message": {"role": "user", "content": "ünïcode ✓"}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tu_3", "name": "Grep", "input": {"pattern": "login", "path": "/home/x/proj/src"}}]}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tu_4", "name": "mcp__srv__tool", "input": {}}]}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "only thinking", "signature": "sig"}]}}
+{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tu_5", "input": {"command": "x"}}]}}

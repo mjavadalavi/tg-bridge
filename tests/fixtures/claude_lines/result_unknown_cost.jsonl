@@ -1,0 +1,1 @@
+{"type": "result", "subtype": "success", "is_error": false, "duration_ms": 900, "num_turns": 1, "result": "ok", "session_id": "sess-abc", "total_cost_usd": 0.5, "hasUnknownModelCost": true, "usage": {"input_tokens": 1, "output_tokens": 2}, "modelUsage": {"mystery-model": {"inputTokens": 1, "outputTokens": 2}}}

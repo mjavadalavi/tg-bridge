@@ -1,0 +1,13 @@
+{"type": "control_response", "response": {"subtype": "success", "request_id": "req_1_x", "response": {"commands": []}}}
+{"type": "system", "subtype": "init", "session_id": "sess-123", "model": "fake"}
+{"type": "system", "subtype": "thinking_tokens", "session_id": "sess-123", "tokens": 5}
+{"type": "assistant", "parent_tool_use_id": null, "session_id": "sess-123", "message": {"content": [{"type": "text", "text": "Let me check."}]}}
+{"type": "assistant", "parent_tool_use_id": null, "session_id": "sess-123", "message": {"content": [{"type": "tool_use", "id": "tu_1", "name": "Read", "input": {"file_path": "/home/x/proj/x.txt"}}]}}
+{"type": "user", "parent_tool_use_id": null, "session_id": "sess-123", "message": {"content": [{"type": "tool_result", "tool_use_id": "tu_1", "is_error": true, "content": "File does not exist.\nmore"}]}}
+{"type": "system", "subtype": "api_retry", "session_id": "sess-123", "attempt": 1, "max_retries": 10, "error": "rate_limit", "retry_delay_ms": 8000}
+{"type": "assistant", "parent_tool_use_id": null, "session_id": "sess-123", "message": {"content": [{"type": "tool_use", "id": "tu_2", "name": "Bash", "input": {"command": "ls\n-la", "description": "List files"}}]}}
+{"type": "assistant", "parent_tool_use_id": "tu_2", "session_id": "sess-123", "message": {"content": [{"type": "tool_use", "id": "tu_3", "name": "Glob", "input": {"pattern": "**/*.py"}}]}}
+{"type": "assistant", "parent_tool_use_id": "tu_2", "session_id": "sess-123", "message": {"content": [{"type": "text", "text": "SUBAGENT-SECRET"}]}}
+{"type": "assistant", "parent_tool_use_id": null, "session_id": "sess-123", "message": {"content": [{"type": "text", "text": "ok:allow"}]}}
+{"type": "control_request", "request_id": "perm_1", "request": {"subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "echo hi", "description": "Say hi"}, "permission_suggestions": [{"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "echo *"}], "behavior": "allow", "destination": "localSettings"}]}}
+{"type": "result", "subtype": "success", "is_error": false, "result": "ok:allow", "session_id": "sess-123"}

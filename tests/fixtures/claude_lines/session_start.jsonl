@@ -1,0 +1,5 @@
+{"type": "system", "subtype": "hook_started", "hook": "SessionStart:startup", "session_id": "sess-abc"}
+{"type": "system", "subtype": "hook_response", "hook": "SessionStart:startup", "output": "", "session_id": "sess-abc"}
+{"type": "system", "subtype": "session_title_changed", "title": "tg:side", "session_id": "sess-abc"}
+{"type": "system", "subtype": "init", "session_id": "sess-abc", "model": "claude-sonnet-x", "permissionMode": "acceptEdits", "cwd": "/home/x/proj", "tools": ["Read", "Bash"], "slash_commands": ["compact", "review"]}
+{"type": "system", "subtype": "thinking_tokens", "tokens": 12, "session_id": "sess-abc"}

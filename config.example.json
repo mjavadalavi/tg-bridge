@@ -1,0 +1,18 @@
+{
+  "allow_user_ids": [123456789],
+  "default_mode": "bypassPermissions",
+  "launchers": {
+    "claude": {"cmd": "claude", "config_dir": "~/.claude"},
+    "fast": {"cmd": "claude --model haiku", "config_dir": "~/.claude"}
+  },
+  "agent_launchers": {
+    "codex": {"backend": "codex", "command": "codex", "config_dir": "~/.codex"}
+  },
+  "default_topic": {"launcher": "claude"},
+  "topics": {
+    "work": {"launcher": "claude", "cwd": "~/workspace"}
+  },
+  "models": ["opus", "sonnet", "haiku", "fable", "default"],
+  "cwd_shortcuts": ["~/workspace"],
+  "search_roots": ["~/workspace"]
+}

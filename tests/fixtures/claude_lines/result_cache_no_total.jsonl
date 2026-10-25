@@ -1,0 +1,1 @@
+{"type": "result", "subtype": "success", "is_error": false, "duration_ms": 1500, "num_turns": 3, "result": "ok", "session_id": "sess-abc", "usage": {"input_tokens": 12, "cache_read_input_tokens": 80000, "output_tokens": 5}, "modelUsage": {"claude-sonnet-x": {"inputTokens": 12, "outputTokens": 5, "costUSD": 0.01, "contextWindow": 200000}}}

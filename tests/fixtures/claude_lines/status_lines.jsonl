@@ -1,0 +1,4 @@
+{"type": "system", "subtype": "status", "status": "compacting", "session_id": "sess-abc"}
+{"type": "system", "subtype": "api_retry", "attempt": 2, "max_retries": 10, "error": "rate_limit", "retry_delay_ms": 8000, "session_id": "sess-abc"}
+{"type": "system", "subtype": "api_retry", "error": "overloaded", "session_id": "sess-abc"}
+{"type": "system", "subtype": "status", "status": "requesting", "session_id": "sess-abc"}
