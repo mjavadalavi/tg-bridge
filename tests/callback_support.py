@@ -67,6 +67,9 @@ class StubSession:
             self.on_stop()
         self.stopped.set()
 
+    def halt_turn(self) -> None:  # the ⏹ and Now taps end the turn with halt_turn, which is stop() for this stand-in
+        self.stop()
+
     def set_model(self, model: str) -> bool:
         self.models.append(model)
         return True

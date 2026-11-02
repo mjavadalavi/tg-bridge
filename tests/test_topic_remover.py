@@ -195,3 +195,20 @@ class QueueClearTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ViewFilesTests(unittest.TestCase):
+    """remove_view_files (the topic's files in the view folder): the pane's .session record goes with the topic, like the
+    claim, while the .lock file and the delete request files stay."""
+
+    def test_the_session_record_is_removed_with_the_topic_view_files(self) -> None:
+        home = self.enterContext(TempHome()).home
+        view = os.path.join(home, "view")
+        os.makedirs(view)
+        names = ["5150.session", "5150.json", "5150.term", "5150.turn", "5150.lock", "5150.delete"]
+        for name in names:
+            open(os.path.join(view, name), "w", encoding="utf-8").close()
+        open(os.path.join(view, "5151.session"), "w", encoding="utf-8").close()  # another topic: untouched
+        self.assertEqual(remove_view_files(view, 5150), 4)
+        self.assertEqual(sorted(os.listdir(view)), ["5150.delete", "5150.lock", "5151.session"])
+

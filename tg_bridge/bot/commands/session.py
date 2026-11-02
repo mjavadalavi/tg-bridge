@@ -133,8 +133,8 @@ class SessionCommands:
         to close. The turn is marked as stopped on purpose (abort and the feed's stop mark) and its session is stopped on
         a daemon thread, because stop() can take ~10 s."""
         running = self._live.request_abort(thread, stop_tap=True)
-        if running is not None:
-            threading.Thread(target=running.session.stop, daemon=True).start()
+        if running is not None:  # halt_turn: a terminal session gets an Escape, the bridge's process is stopped
+            threading.Thread(target=running.session.halt_turn, daemon=True).start()
             return StopResult(StopKind.STOPPED)
         if self._linger is not None and self._linger.request_release(thread):
             return StopResult(StopKind.RELEASED)

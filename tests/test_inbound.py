@@ -33,6 +33,8 @@ from tests.inbound_support import (
 
 QUEUE_FULL = "📥 queue full (5) — wait for the current turn to finish."
 QUEUED_SECOND = "📥 queued — position 2 after the current turn."
+QUEUED_TERMINAL_SECOND = ("📥 queued — position 2; the topic's terminal session (tg-bridge view) is busy "
+                          "or has text typed in it.")
 SPAWNED = "✅ spawned budget-claude in tmux window 'mytask' ({pane}) — your message is its first prompt."
 
 
@@ -356,6 +358,13 @@ class QueueTests(InboundCase):
         self.assertEqual([button["callback_data"] for button in row],
                          [f"now:{THREAD}:{nid}", f"jump:{THREAD}:{nid}", f"drop:{THREAD}:{nid}"])
         self.assertEqual(self.starts.started, [(THREAD, TOPIC)])
+
+    def test_a_message_queued_while_the_topic_waits_for_its_terminal_says_so(self) -> None:
+        self.dispatcher.waiting_terminal = lambda thread: True  # the runner is in the terminal wait (see test_terminal_attach)
+        self.handle(self.message("one"))
+        self.assertIs(self.handle(self.message("two")), Disposition.DEFERRED)
+        self.assertEqual(self.sent(), [QUEUED_TERMINAL_SECOND])
+        self.assertEqual(len(self.keyboards()[0][0]), 3, "the queued notice lost its Now/Next/Drop buttons")
 
     def test_messages_keep_their_order(self) -> None:
         for text in ("a", "b", "c"):

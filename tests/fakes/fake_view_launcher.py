@@ -1,4 +1,4 @@
-"""Fake launcher for the view pane tests (tests/test_view_pane.py): stands in for iclaude, oclaude or claude.
+"""Fake launcher for the view pane tests (tests/test_view_pane.py): stands in for claude-work, claude-alt or claude.
 
 The first argument is the launcher's kind; the rest is the argv the pane passed on. It appends one JSON line to the file
 FAKE_VIEW_OUT: {"kind", "argv" (the arguments after this script, the kind first), "cwd" (where it runs), "claim" (whether

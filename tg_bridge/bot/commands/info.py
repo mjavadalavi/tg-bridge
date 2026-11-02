@@ -33,6 +33,7 @@ LINGER_STATUS_TEXT = ("turn: idle — session kept open for background work ({pe
 LINGER_QUIET_STATUS_TEXT = ("turn: idle — background work finished; the session closes in a few seconds (/stop closes "
                             "it now)")
 TERMINAL_STATUS_TEXT = "turn: open in the terminal"
+ATTACHED_STATUS_TEXT = "turn: in the terminal session (tg-bridge view)"
 
 
 def register_info_commands(registry: CommandRegistry) -> None:
@@ -95,8 +96,8 @@ def _turn_line(running: RunningTurn | None, linger: LingerStatus | None, termina
     """The turn line of /status: the terminal when it holds the topic's session, else a running turn (a background
     update of a kept session is named as one), else the kept session with its background work and minutes left, else
     idle."""
-    if terminal:
-        return TERMINAL_STATUS_TEXT
+    if terminal:  # a running turn while a claim holds the topic is a turn in that terminal session
+        return ATTACHED_STATUS_TEXT if running is not None else TERMINAL_STATUS_TEXT
     if running is not None:
         if linger is not None and linger.self_turn:
             return SELF_TURN_STATUS_TEXT.format(tools=running.feed.tools)

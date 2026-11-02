@@ -60,6 +60,8 @@ PANE_FAILED_TEXT = "⚠️ {info}"
 PANE_LABEL = "pane {pane}"
 SPAWNED_TEXT = "✅ spawned {launcher} in tmux window '{name}' ({pane}) — your message is its first prompt."
 QUEUED_TEXT = "📥 queued — position {position} after the current turn."
+QUEUED_TERMINAL_TEXT = ("📥 queued — position {position}; the topic's terminal session (tg-bridge view) is busy "
+                        "or has text typed in it.")
 QUEUE_FULL_TEXT = "📥 queue full ({limit}) — wait for the current turn to finish."
 REFUSED_LOG = "REFUSED message from {user} ({uid}) — allowlist not provisioned"
 REMOVING_LOG = "late message for a topic being removed: dropped (thread {thread})"
@@ -344,8 +346,9 @@ class MessageHandler:
             self._say(chat_id, thread, QUEUE_FULL_TEXT.format(limit=QUEUE_MAX))
             return Disposition.DONE
         if delivery.notify and delivery.nid is not None:
+            text = QUEUED_TERMINAL_TEXT if self._dispatcher.waiting_terminal(thread) else QUEUED_TEXT
             self._out.submit(self._messenger.send_buttons, chat_id, thread,
-                             QUEUED_TEXT.format(position=delivery.position), queue_rows(thread, delivery.nid))
+                             text.format(position=delivery.position), queue_rows(thread, delivery.nid))
         return Disposition.DEFERRED
 
     # --- helpers

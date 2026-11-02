@@ -23,6 +23,7 @@ from tg_bridge.core.view_recorder import META_SUFFIX, STATE_IDLE, STATE_LINGERIN
 from tg_bridge.logging_ import Logger
 
 THREAD = 5150
+UUID = "0f3c9a7e-1b2d-4c5e-8f60-7a8b9c0d1e2f"
 OTHER_THREAD = 5151
 
 
@@ -125,11 +126,11 @@ class DaemonSide(ClaimCase):
         self.assertFalse(os.path.exists(os.path.join(self.view, f"{THREAD}{META_SUFFIX}")))
 
     def test_begin_turn_marks_running_and_keeps_the_other_meta_fields(self) -> None:
-        self.write_meta(STATE_IDLE, topic="Launch notes", transport="tui", launcher="iclaude")
+        self.write_meta(STATE_IDLE, topic="Launch notes", transport="tui", launcher="claude-work")
         self.assertTrue(terminal_claim.begin_turn(self.view, THREAD, self.clock))
         meta = self.meta()
         self.assertEqual(meta["state"], STATE_RUNNING)
-        self.assertEqual((meta["topic"], meta["transport"], meta["launcher"]), ("Launch notes", "tui", "iclaude"))
+        self.assertEqual((meta["topic"], meta["transport"], meta["launcher"]), ("Launch notes", "tui", "claude-work"))
         self.assertEqual(meta["updated"], self.clock.now())
 
     def test_begin_turn_clears_a_stale_claim_and_starts(self) -> None:
@@ -160,7 +161,7 @@ class TurnMarkCase(ClaimCase):
     recorder is the real ViewRecorder, whose TurnResult writes 'idle' while the CLI of the turn may still run."""
 
     def recorder(self) -> ViewRecorder:
-        return ViewRecorder(self.view, THREAD, "alpha", "tui", "iclaude", self.clock,
+        return ViewRecorder(self.view, THREAD, "alpha", "tui", "claude-work", self.clock,
                             Logger(os.path.join(self.home.home, "bridge.log")))
 
 
@@ -221,3 +222,66 @@ class StatusLine(unittest.TestCase):
         self.assertEqual(TERMINAL_STATUS_TEXT, "turn: open in the terminal")
         self.assertEqual(_turn_line(None, None), "turn: idle")
         self.assertEqual(_turn_line(None, None, False), "turn: idle")
+
+
+class ClaimFields(ClaimCase):
+    """The claim carries the pane, the session uuid, the launcher's config folder and the topic's folder."""
+
+    def test_the_claim_round_trips_all_fields(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.5, pane="%3", uuid=UUID,
+                                                  config_dir="/home/u/.claude", cwd="/home/u/work"))
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual(claim, terminal_claim.Claim(pid=os.getpid(), started=7.5, pane="%3", uuid=UUID,
+                                                     config_dir="/home/u/.claude", cwd="/home/u/work"))
+
+    def test_the_claim_carries_the_tmux_socket(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.5, pane="%3", uuid=UUID,
+                                                  socket="/tmp/tmux-1000/default"))
+        self.assertEqual(terminal_claim.read_claim(self.view, THREAD).socket, "/tmp/tmux-1000/default")
+
+    def test_an_old_format_claim_reads_with_empty_fields(self) -> None:
+        self.write_claim(os.getpid())  # the file written before the fields existed: pid and started only
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual(claim, terminal_claim.Claim(pid=os.getpid(), started=1.0))
+        self.assertEqual((claim.pane, claim.uuid, claim.config_dir, claim.cwd), ("", "", "", ""))
+        self.assertTrue(os.path.exists(self.claim_file()), "an old-format claim with a live pid is kept")
+
+    def test_a_claim_with_a_dead_pid_reads_as_none_and_is_removed(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, dead_pid(), 7.0, pane="%3", uuid=UUID))
+        self.assertIsNone(terminal_claim.read_claim(self.view, THREAD))
+        self.assertFalse(os.path.exists(self.claim_file()), "the stale claim was not removed")
+
+
+NEW_UUID = "66666666-7777-8888-9999-000000000000"
+
+
+class MovedSessionTests(ClaimCase):
+    """update_uuid (a /clear or /resume moved the tab's session) and the .session record the pane writes at exit."""
+
+    def test_update_uuid_changes_the_uuid_of_the_claim_held_by_that_pid_and_keeps_the_rest(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, pane="%3", uuid=UUID,
+                                                  config_dir="/cfg", cwd="/work", socket="/tmp/sock"))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID))
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual((claim.uuid, claim.pane, claim.config_dir, claim.cwd, claim.socket, claim.started),
+                         (NEW_UUID, "%3", "/cfg", "/work", "/tmp/sock", 7.0))
+
+    def test_update_uuid_is_refused_for_another_pid_or_without_a_live_claim(self) -> None:
+        self.assertFalse(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID), "no claim yet")
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, pane="%3", uuid=UUID))
+        self.assertFalse(terminal_claim.update_uuid(self.view, THREAD, dead_pid(), NEW_UUID), "another pid")
+        self.assertEqual(terminal_claim.read_claim(self.view, THREAD).uuid, UUID, "a foreign pid changed the claim")
+
+    def test_write_ended_then_take_ended_reads_and_removes_the_record(self) -> None:
+        terminal_claim.write_ended(self.view, THREAD, NEW_UUID, "/cfg", "/work", 42.5)
+        self.assertTrue(os.path.exists(os.path.join(self.view, f"{THREAD}.session")))
+        ended = terminal_claim.take_ended(self.view, THREAD)
+        self.assertEqual(ended, terminal_claim.Ended(uuid=NEW_UUID, config_dir="/cfg", cwd="/work", ended=42.5))
+        self.assertIsNone(terminal_claim.take_ended(self.view, THREAD), "a record is read once")
+        self.assertFalse(os.path.exists(os.path.join(self.view, f"{THREAD}.session")))
+
+    def test_a_garbled_ended_record_is_removed_and_reads_as_none(self) -> None:
+        with open(os.path.join(self.view, f"{THREAD}.session"), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        self.assertIsNone(terminal_claim.take_ended(self.view, THREAD))
+        self.assertFalse(os.path.exists(os.path.join(self.view, f"{THREAD}.session")))

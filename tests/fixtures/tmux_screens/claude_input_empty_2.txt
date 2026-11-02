@@ -1,0 +1,9 @@
+  ● The earlier answer is shown here.
+  It has a second line of plain text.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── tg:sample-project-02 ─
+❯ 
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Model: Opus 5.5 | Ctx: 167.0k | ⎇ no git | (no git)                                                                                                                                 cwd: /home/user/workspace
+  Cache Hit: 9.8% | Thinking: high | [Rate limited]                                                                                                                                               Total: 114.6M
+  [Rate limited] | [Rate limited] | [Rate limited]
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents

@@ -68,6 +68,10 @@ class DocsCleanupPort(unittest.TestCase):
         self.assertIn("Finish or checkpoint within ~20 minutes; if the task is bigger, stop at a checkpoint and say "
                       "what remains.", self.rules)
 
+    def test_rules_forbid_markdown_tables(self) -> None:
+        """Telegram cannot show tables: the RULES tell the agent to use short lists instead."""
+        self.assertIn("Telegram cannot show tables: never use Markdown tables; use short lists instead.", self.rules)
+
     def test_rules_have_no_unfilled_placeholders(self) -> None:
         """1d: no unformatted placeholders left in the formatted RULES."""
         self.assertNotIn("{", self.rules)

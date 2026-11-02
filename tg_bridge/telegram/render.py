@@ -17,6 +17,77 @@ _BOLD_RE = re.compile(r'\*\*(?=\S)(.+?)(?<=\S)\*\*')
 _ITALIC_STAR_RE = re.compile(r'(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])')
 _ITALIC_UNDER_RE = re.compile(r'(?<!\w)_(?=\S)([^_\n]+?)(?<=\S)_(?!\w)')
 _LINK_RE = re.compile(r'\[([^\]\n]+)\]\((https?://[^\s)"<>]+)\)')
+_TABLE_SEP_RE = re.compile(r'^\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?$')  # the |---|:--:| row under a table header
+_CELL_TOKEN_RE = re.compile(r'(`+).*?(?<!`)\1(?!`)|\\\||\|')  # code spans and escaped pipes are skipped, a bare | splits
+
+
+def _split_cells(s):
+    """Split a row body on its bare pipes only: a pipe inside a backtick code span or after a backslash is text."""
+    cells, last = [], 0
+    for m in _CELL_TOKEN_RE.finditer(s):
+        if m.group(0) == '|':
+            cells.append(s[last:m.start()])
+            last = m.end()
+    cells.append(s[last:])
+    return cells
+
+
+def _table_cells(line):
+    """The cells of one table row: the outer pipes dropped, each cell stripped, and an escaped \\| turned into a
+    literal |."""
+    s = line.strip()
+    s = s[1:] if s.startswith('|') else s
+    s = s[:-1] if s.endswith('|') and not s.endswith('\\|') else s
+    return [c.strip().replace('\\|', '|') for c in _split_cells(s)]
+
+
+def _table_row_line(header, cells):
+    """One body row as a bullet: '• Header: cell · Header: cell'. Empty cells are skipped; a column without a header
+    label, or a one-column table, shows its cell alone. None when the row has no cell text at all."""
+    labelled = len(header) > 1
+    pairs = []
+    for idx, cell in enumerate(cells):
+        if not cell:
+            continue
+        label = header[idx] if labelled and idx < len(header) else ''
+        pairs.append(f'{label}: {cell}' if label else cell)
+    return '• ' + ' · '.join(pairs) if pairs else None
+
+
+def _tables_as_lists(seg):
+    """Markdown tables in one stretch of prose become bullet lines (Telegram cannot show tables). A table is a header
+    row '| … |', a separator row of dashes, then body rows containing a pipe; any other line is kept as it is."""
+    lines = seg.split('\n')
+    out, i = [], 0
+    while i < len(lines):
+        head = lines[i].strip()
+        sep = lines[i + 1].strip() if i + 1 < len(lines) else ''
+        is_table = (len(head) > 1 and head.startswith('|') and head.endswith('|')
+                    and '|' in sep and _TABLE_SEP_RE.match(sep))
+        if not is_table:
+            out.append(lines[i])
+            i += 1
+            continue
+        header = _table_cells(head)
+        j, start = i + 2, len(out)
+        while j < len(lines) and lines[j].strip() and '|' in lines[j]:
+            body = lines[j].strip()
+            row = None if _TABLE_SEP_RE.match(body) else _table_row_line(header, _table_cells(body))  # a repeated |---| row is dropped
+            if row:
+                out.append(row)
+            j += 1
+        if len(out) == start:  # no body row to label: the header cells alone, as one line
+            row = _table_row_line([], header)
+            if row:
+                out.append(row)
+        i = j
+    return '\n'.join(out)
+
+
+def _tables_outside_fences(text):
+    """The whole markdown with its tables already turned into bullet lines; fenced blocks are returned untouched."""
+    parts = _FENCE_BLOCK_RE.split(text)
+    return ''.join(p if i % 2 else _tables_as_lists(p) for i, p in enumerate(parts))
 
 
 def _prose_html(seg):
@@ -48,7 +119,7 @@ def md_to_html(text):
         if i % 2:  # a fenced block
             out.append(f'<pre><code>{_fence_body(part).strip(chr(10))}</code></pre>')
         else:
-            out.append(_prose_html(part))
+            out.append(_prose_html(_tables_as_lists(part)))
     return ''.join(out)
 
 
@@ -91,7 +162,7 @@ def _answer_chunks(text):
     """The answer as markdown chunks that each fit one message, split only between units. None when it would
     need more than ANSWER_MAX_MESSAGES messages, or a unit cannot fit at all."""
     chunks, cur = [], ''
-    for md, is_code in _md_units(text):
+    for md, is_code in _md_units(_tables_outside_fences(text)):  # tables become bullets before any cut, so no chunk gets a bare header-less row
         for piece in _fit(md, is_code):
             cand = f'{cur}\n\n{piece}' if cur else piece
             if len(md_to_html(cand)) <= ANSWER_CHUNK:

@@ -1,0 +1,1 @@
+view: window demo added

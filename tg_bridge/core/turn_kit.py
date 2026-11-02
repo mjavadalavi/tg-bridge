@@ -17,12 +17,13 @@ Lock map: TurnKit holds no lock of its own. TurnState, AnswerCollector, UsageRec
 their own state. Nothing here holds a lock while it calls another service.
 """
 
+import re
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
-from tg_bridge.agents.base import AgentBackend, AgentSession
+from tg_bridge.agents.base import AgentBackend, AgentSession, AttachSpec
 from tg_bridge.agents.events import AgentEvent, TurnResult, UsageEvent
 from tg_bridge.clock import Clock, utc_stamp
 from tg_bridge.config import Config, LauncherSpec
@@ -49,6 +50,15 @@ from tg_bridge.store.turns import TurnRepo
 GRACEFUL_SECONDS = 10.0  # after a normal end the CLI gets this long to exit on its own (input closed, no interrupt)
 STDERR_LINES = 20  # the stderr lines searched for the resume error
 TAIL_LINES = 10  # the stderr lines shown in a process error
+LOG_TAIL_CHARS = 2000  # the end of a raw tail written to the bridge log instead of the reply
+_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")  # ANSI CSI and two-byte escapes
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # control characters, the newline and tab kept
+
+
+def log_text(raw: str) -> str:
+    """The tail as log text: the escape sequences and control characters of a terminal screen removed, the last
+    LOG_TAIL_CHARS kept."""
+    return _CONTROL.sub("", _ESCAPE.sub("", raw)).strip()[-LOG_TAIL_CHARS:]
 
 
 class TurnProgress(Protocol):
@@ -69,11 +79,13 @@ FeedFactory = Callable[[int | str, int, Callable[[], bool]], TurnProgress]
 @dataclass(frozen=True)
 class TurnReply:
     """What the turn produced. answer and err are both None only when a shutdown refused the spawn: nothing ran, and
-    the caller re-marks the inbox row for a later try."""
+    the caller re-marks the inbox row for a later try. terminal_busy is set (with both None) when the terminal session
+    of an attached turn was not ready: nothing was pasted, and the message waits for the terminal again."""
 
     answer: str | None
     err: str | None
     outcome: TurnOutcome
+    terminal_busy: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +106,7 @@ class TurnPlan:
     deny_tools: tuple[str, ...]
     system_rules: str
     stored_uuid: str
+    attach: AttachSpec | None = None  # set: the turn runs in that terminal session (nothing is spawned or kept)
 
 
 @dataclass(frozen=True)
@@ -116,6 +129,7 @@ class _Attempt:
     feed: TurnProgress
     started_wall: float
     started_mono: float
+    terminal_busy: bool = False  # the attached terminal was not ready: refused, and the reply says so
 
 
 @dataclass(frozen=True)
@@ -220,7 +234,7 @@ def wait_turn(turn: TurnState, session: AgentSession, done: threading.Event, thr
             turn.begin_stopping()
         if turn.check_caps() is not None:
             turn.begin_stopping()
-            session.stop()
+            session.halt_turn()  # the bridge's process is stopped; a terminal session gets an Escape only
             return
         if turn.observe_alive(session.alive()):
             return
@@ -230,10 +244,13 @@ def wait_turn(turn: TurnState, session: AgentSession, done: threading.Event, thr
 
 
 def finish_attempt(kit: TurnKit, session: AgentSession | None, live: LiveRegistry, *, refused: bool,
-                   launch_err: str | None, stop_code: int | None) -> _Attempt:
+                   launch_err: str | None, stop_code: int | None, readable_tail: bool, logger: Logger,
+                   terminal_busy: bool = False) -> _Attempt:
     """The facts of one launch, read after its teardown: the stop flags (consumed, so the next turn starts unmarked),
     the outcome, and the stderr tails. The caller has already stopped the session and closed its feed. A refused
-    launch reads no flags. stop_code is the exit code the stop reaped, the fallback when the reader saw none."""
+    launch reads no flags. stop_code is the exit code the stop reaped, the fallback when the reader saw none.
+    readable_tail is the launcher's Capabilities flag: when False the tail is not for the reply; on an error outcome
+    (the only one whose reply shows the tail) it goes to the bridge log with the thread id."""
     flags = AbortFlags(False, False) if refused else live.consume_abort(kit.turn.thread_id)
     if flags.aborted:  # ⏭ Now or a ⏹ tap: the stop was requested on purpose
         kit.turn.request_stop()
@@ -243,6 +260,12 @@ def finish_attempt(kit: TurnKit, session: AgentSession | None, live: LiveRegistr
     outcome = kit.turn.finish(result, launch_failed=launch_err is not None,
                               shutting_down=live.is_shutting_down())
     stderr = session.stderr_tail(STDERR_LINES) if session is not None else ""
+    tail = session.stderr_tail(TAIL_LINES).strip() if session is not None else ""
+    if tail and not readable_tail:
+        if outcome is TurnOutcome.ERROR:
+            logger.log(f"thread {kit.turn.thread_id}: process output, kept out of the reply (not readable):\n"
+                       f"{log_text(tail)}")
+        tail = ""
     return _Attempt(
         refused=refused, outcome=outcome, result=result, usage=kit.usage.usage, texts=kit.collector.texts,
         tools=kit.collector.tools, limit=limit, stop_tap=flags.stop_tap, aborted=flags.aborted,
@@ -250,9 +273,9 @@ def finish_attempt(kit: TurnKit, session: AgentSession | None, live: LiveRegistr
         # the reader reports the exit only after the stdout EOF, which a child can delay past the stop: the code
         # the stop reaped is the fallback, as the live file reads the process's own return code
         exit_code=kit.collector.exit_code if kit.collector.exit_code is not None else stop_code,
-        tail=(session.stderr_tail(TAIL_LINES).strip() if session is not None else ""),
+        tail=tail,
         resume_failed=bool(result is not None and result.resume_failed) or NO_CONVERSATION in stderr,
-        feed=kit.feed, started_wall=kit.started_wall, started_mono=kit.started_mono,
+        feed=kit.feed, started_wall=kit.started_wall, started_mono=kit.started_mono, terminal_busy=terminal_busy,
     )
 
 
@@ -265,7 +288,7 @@ class TurnCloser:
 
     def close(self, plan: TurnPlan, attempt: _Attempt, fresh: str, *, session_kept: bool = True) -> TurnReply:
         if attempt.refused:
-            return TurnReply(None, None, attempt.outcome)
+            return TurnReply(None, None, attempt.outcome, terminal_busy=attempt.terminal_busy)
         answer, err = compose_reply(
             attempt.outcome, result=attempt.result, texts=attempt.texts, limit=attempt.limit,
             stop_tap=attempt.stop_tap, tools=attempt.tools, launch_err=attempt.launch_err,

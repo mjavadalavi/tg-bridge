@@ -1,0 +1,8 @@
+tg-bridge view · demo
+
+launcher: claude-alt   folder: /home/user/project   session: 0a1b2c3d
+  1 claude-work   2 claude-alt ✓   3 claude
+1-9: change the launcher (Telegram uses it too)
+
+
+Enter: open this session in Claude Code

@@ -91,6 +91,9 @@ class StubSession:
             self.on_stop()
         self.stopped.set()
 
+    def halt_turn(self) -> None:  # the ⏹ and Now taps end the turn with halt_turn, which is stop() for this stand-in
+        self.stop()
+
 
 class EndingClock(FakeClock):
     """A FakeClock whose sleep() runs a hook: the test ends the turn while finish_new waits."""

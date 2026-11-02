@@ -7,7 +7,7 @@ and receives AgentEvents through the EventSink. The sink runs on the session's r
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from tg_bridge.agents.events import AgentEvent, ApprovalRequest, Decision, HandoffEntry
@@ -28,6 +28,8 @@ class Capabilities:
     preassigned_id: bool             # Claude --session-id; Codex False (the id is learned from thread/start)
     linger: bool = False             # the session may be kept open after a turn while background work is pending
                                      # (needs the BackgroundWork and TurnBegan events)
+    readable_tail: bool = True       # the stderr tail is text for the owner (print, Codex); False when it is a raw
+                                     # terminal screen (tui, attached): the bridge log gets it, the reply does not
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +46,32 @@ class DiskSession:
     uuid: str
     title: str
     modified: float                  # seconds since the epoch
+
+
+def always_attached() -> bool:
+    return True
+
+
+class TerminalNotReady(RuntimeError):
+    """A terminal session cannot take a message now: its pane is busy, has text typed in it, or is gone. Nothing was
+    pasted, so the message is not consumed; the owner waits for the terminal again (TerminalWait) and retries."""
+
+
+@dataclass(frozen=True, slots=True)
+class AttachSpec:
+    """The terminal session a turn runs in: a Claude Code process that a `tg-bridge view` tab owns (its tmux pane, the
+    session uuid it runs, the launcher's config folder and the topic's folder). The socket is the tmux server's socket
+    path, '' for the default server. The backend opens an attached session for it; no process is spawned.
+    still_attached tells whether the tab's claim for this turn is still held (the CLI is still running in the pane); it
+    is not part of the spec's identity."""
+
+    socket: str
+    pane: str
+    uuid: str
+    config_dir: str
+    cwd: str
+    pid: int = field(default=0, compare=False, hash=False)  # the view pane's pid that holds the claim (0: none)
+    still_attached: Callable[[], bool] = field(default=always_attached, compare=False, hash=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +92,7 @@ class SessionSpec:
     errfile_dir: str
     view_dir: str = ""              # tui sessions mirror their raw output to <view_dir>/<thread>.pty; '' = none
     tui_size: tuple[int, int] = DEFAULT_TUI_SIZE  # (rows, cols) of the TUI's pseudo-terminal
+    attach: AttachSpec | None = None  # set: the turn runs in that terminal session (no process is spawned)
 
 
 class RuleMatcher(Protocol):
@@ -117,6 +146,11 @@ class AgentSession(ABC):
     def stop(self, grace: float = 5.0) -> int | None:
         """interrupt, then EOF, then the SIGINT/SIGTERM/SIGKILL ladder, then a process-group sweep. Returns the process's
         return code, or None when there is no process (or it has no code yet)."""
+
+    def halt_turn(self) -> None:
+        """Ends the running turn as a ⏹ tap or /stop asks. The default stops the session's process; a session whose
+        process is not the bridge's (an attached terminal session) overrides it, so the turn ends without a stop."""
+        self.stop()
 
     @abstractmethod
     def alive(self) -> bool: ...

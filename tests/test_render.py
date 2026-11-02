@@ -166,5 +166,62 @@ class MarkdownUnitTests(unittest.TestCase):
         self.assertEqual(_md_units('   \n\n  '), [])
 
 
+class MarkdownTableTests(unittest.TestCase):
+    """Markdown tables in prose become bullet lines with header labels; tables inside fences and lone pipes stay."""
+
+    def test_three_column_table_becomes_bullets_with_labels_and_empty_cells_skipped(self) -> None:
+        text = "| Name | Price | Stock |\n|---|---|---|\n| Tea | 10 | 3 |\n| Milk |  | 5 |"
+        self.assertEqual(md_to_html(text), "• Name: Tea · Price: 10 · Stock: 3\n• Name: Milk · Stock: 5")
+
+    def test_table_inside_fence_is_untouched(self) -> None:
+        text = "```\n| a | b |\n|---|---|\n| 1 | 2 |\n```"
+        self.assertEqual(md_to_html(text), "<pre><code>| a | b |\n|---|---|\n| 1 | 2 |</code></pre>")
+
+    def test_persian_table_keeps_its_text(self) -> None:
+        text = "| نام | قیمت |\n|---|---|\n| چای | ۱۰ هزار تومان |"
+        self.assertEqual(md_to_html(text), "• نام: چای · قیمت: ۱۰ هزار تومان")
+
+    def test_text_before_and_after_the_table_is_kept(self) -> None:
+        text = "Before\n| a | b |\n|---|---|\n| 1 | 2 |\nAfter"
+        self.assertEqual(md_to_html(text), "Before\n• a: 1 · b: 2\nAfter")
+
+    def test_inline_markdown_in_cells_is_converted(self) -> None:
+        text = "| **Item** | `Code` |\n|---|---|\n| [site](https://e.io) | _z_ |"
+        self.assertEqual(md_to_html(text),
+                         '• <b>Item</b>: <a href="https://e.io">site</a> · <code>Code</code>: <i>z</i>')
+
+    def test_empty_header_gives_plain_cells(self) -> None:
+        text = "|  |  |\n|---|---|\n| a | b |"
+        self.assertEqual(md_to_html(text), "• a · b")
+
+    def test_pipe_inside_code_span_does_not_split_the_cell(self) -> None:
+        text = "| a | b |\n|---|---|\n| `x|y` | 2 |"
+        self.assertEqual(md_to_html(text), "• a: <code>x|y</code> · b: 2")
+
+    def test_escaped_pipe_becomes_literal_pipe_in_cell(self) -> None:
+        text = "| a | b |\n|---|---|\n| p\\|q | 2 |"
+        self.assertEqual(md_to_html(text), "• a: p|q · b: 2")
+
+    def test_header_without_body_rows_is_kept_as_one_line(self) -> None:
+        self.assertEqual(md_to_html("| a | b |\n|---|---|"), "• a · b")
+
+    def test_repeated_separator_row_in_body_is_skipped(self) -> None:
+        text = "| a | b |\n|---|---|\n| 1 | 2 |\n|---|---|\n| 3 | 4 |"
+        self.assertEqual(md_to_html(text), "• a: 1 · b: 2\n• a: 3 · b: 4")
+
+    def test_long_table_split_into_chunks_has_no_raw_table_rows(self) -> None:
+        table = "| name | val |\n|---|---|\n" + "\n".join(f"| r{i} | v |" for i in range(400))
+        chunks = _answer_chunks(table)
+        self.assertIsNotNone(chunks)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertFalse(any(line.startswith('|') for line in md_to_html(chunk).split('\n')))
+            self.assertTrue(all(line.startswith('•') for line in md_to_html(chunk).split('\n')))
+        self.assertIn('• name: r399 · val: v', '\n'.join(md_to_html(c) for c in chunks))
+
+    def test_lone_pipe_line_is_unchanged(self) -> None:
+        self.assertEqual(md_to_html("a | b"), "a | b")
+
+
 if __name__ == '__main__':
     unittest.main()

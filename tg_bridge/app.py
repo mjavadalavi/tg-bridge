@@ -15,6 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from tg_bridge.agents.claude.attached_session import pane_idle
 from tg_bridge.agents.defaults import build_default_registry, title_launcher_from_env
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.bot.callbacks.approvals import ApprovalTaps
@@ -254,7 +255,8 @@ class App:
         dispatcher = Dispatcher(
             turns=runner, slots=slots, inbox=inbox_rows, messenger=messenger, answers=answers, titles=titles,
             client=telegram, live=live, config=config, logger=logger, linger=linger,
-            view_dir=paths.view if views_on else "", removals=removals)
+            view_dir=paths.view if views_on else "", removals=removals,
+            pane_idle=lambda claim: pane_idle(claim.socket, claim.pane))  # a terminal claim's turns wait for its pane
         remover = TopicRemover(
             live=live, linger=linger, dispatcher=dispatcher,
             forget=TopicForget(db=db, sessions=sessions, history=history, rules=rules, asks=asks, inbox=inbox_rows,

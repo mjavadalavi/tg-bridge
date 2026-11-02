@@ -5,7 +5,7 @@ the pane's tty, with --resume, --model and the permission flags of its mode, in 
 the CLI runs and is gone after it. busy (meta state running or lingering) shows the mirror with a top line and refuses
 Enter. Ctrl+C and q do nothing on ready. The CLI is tests/fakes/fake_view_launcher.py: a stdlib script that records its
 argv and cwd and exits, so no claude process starts. Every launcher in these tests is a full command that names the fake,
-never a bare name, so the real iclaude or claude on this machine is never run. Keys come from a scripted source, or from a
+never a bare name, so the real claude-work or claude on this machine is never run. Keys come from a scripted source, or from a
 real pseudo-terminal (os.openpty) in the terminal case. The mouse setting uses the scripted tmux of viewer_support.
 """
 
@@ -45,11 +45,12 @@ from tg_bridge.store.sessions import SessionRepo
 
 THREAD = 42
 UUID = "0f3c9a7e-1b2d-4c5e-8f60-7a8b9c0d1e2f"
+FRESH_UUID = "6b1e2f3a-9c4d-4e5f-8a7b-0c1d2e3f4a5b"  # the session id a topic without one starts with (injected)
 FAKE = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tests", "fakes",
                     "fake_view_launcher.py")
 ENTER = b"\r"
 CTRL_C = b"\x03"
-KINDS = ("iclaude", "oclaude", "claude")
+KINDS = ("claude-work", "claude-alt", "claude")
 LOCAL_MODES = termios.ECHO | termios.ICANON | termios.ISIG  # the local flags the raw mode turns off
 
 
@@ -93,7 +94,7 @@ class PaneCase(HomeCase):
         self.addCleanup(db.close)
         db.execute("DELETE FROM sessions WHERE thread_id=?", (THREAD,))
         repo = SessionRepo(db, FakeClock())
-        stored = fake_command("iclaude") if launcher is None else launcher
+        stored = fake_command("claude-work") if launcher is None else launcher
         repo.ensure(THREAD, name, stored, self.folder, mode)
         if uuid:
             repo.set_uuid(THREAD, uuid)
@@ -116,7 +117,7 @@ class PaneCase(HomeCase):
         out = io.StringIO()
         self.assertEqual(run_topic_pane(self.paths, THREAD, self.make_config, out=out, clock=FakeClock(),
                                         stop_after=rounds, stdin=io.StringIO(), keys=ScriptedKeys(keys),
-                                        switch=switch), 0)
+                                        switch=switch, new_uuid=lambda: FRESH_UUID), 0)
         return out
 
     def children(self) -> list[dict]:
@@ -131,11 +132,11 @@ class ReadyTests(PaneCase):
         self.make_topic(model="opus", mode="acceptEdits")
         self.pane([ENTER], rounds=1)
         [child] = self.children()
-        self.assertEqual(child["argv"], ["iclaude", "--resume", UUID, "--model", "opus", "--permission-mode", "acceptEdits",
+        self.assertEqual(child["argv"], ["claude-work", "--resume", UUID, "--model", "opus", "--permission-mode", "acceptEdits",
                                          "--allow-dangerously-skip-permissions"])
         self.assertEqual(os.path.realpath(child["cwd"]), os.path.realpath(self.folder))
 
-    def test_each_launcher_kind_and_mode_has_its_own_argv_and_no_resume_without_a_uuid(self) -> None:
+    def test_each_launcher_kind_and_mode_has_its_own_argv_and_session_id_without_a_uuid(self) -> None:
         for kind in KINDS:
             for mode in ("bypassPermissions", "plan"):
                 with self.subTest(kind=kind, mode=mode):
@@ -144,19 +145,73 @@ class ReadyTests(PaneCase):
                     self.make_topic(launcher=fake_command(kind), uuid="", mode=mode)
                     self.pane([ENTER], rounds=1)
                     [child] = self.children()
-                    self.assertEqual(child["argv"], [kind, "--permission-mode", mode,
+                    self.assertEqual(child["argv"], [kind, "--session-id", FRESH_UUID, "--permission-mode", mode,
                                                      "--allow-dangerously-skip-permissions"])
 
+    def run_claims(self, *, uuid: str = UUID, env: dict[str, str] | None = None) -> list[tuple[list[str], object]]:
+        """Runs the pane once on Enter and returns (argv, the claim read while the CLI runs) for each run."""
+        seen: list[tuple[list[str], object]] = []
+
+        def run_cli(argv: Sequence[str], cwd: str, environ: Mapping[str, str]) -> int:
+            seen.append((list(argv), terminal_claim.read_claim(self.view, THREAD)))
+            return 0
+
+        self.make_topic(uuid=uuid)
+        with mock.patch.dict(os.environ, env or {}):
+            run_topic_pane(self.paths, THREAD, self.make_config, out=io.StringIO(), clock=FakeClock(), stop_after=1,
+                           stdin=io.StringIO(), keys=ScriptedKeys([ENTER]), run=run_cli,
+                           new_uuid=lambda: FRESH_UUID)
+        return seen
+
+    def test_open_session_writes_pane_uuid_config_dir_and_cwd_into_the_claim(self) -> None:
+        [(argv, claim)] = self.run_claims(env={"TMUX_PANE": "%7"})
+        self.assertEqual(argv[argv.index("--resume") + 1], UUID)
+        self.assertEqual((claim.pane, claim.uuid), ("%7", UUID))
+        self.assertEqual(claim.config_dir, os.path.join(self.home, ".claude"))  # the launcher's folder, expanded
+        self.assertEqual(os.path.realpath(claim.cwd), os.path.realpath(self.folder))
+        self.assertEqual(claim.pid, os.getpid())
+
+    def test_open_session_names_the_tmux_socket_of_the_pane(self) -> None:
+        [(_argv, claim)] = self.run_claims(env={"TMUX_PANE": "%7", "TMUX": "/tmp/tmux-1000/default,4242,0"})
+        self.assertEqual(claim.socket, "/tmp/tmux-1000/default")
+
+    def test_a_fresh_topic_starts_with_session_id_and_its_claim_names_the_same_uuid(self) -> None:
+        [(argv, claim)] = self.run_claims(uuid="", env={"TMUX_PANE": "%9"})
+        self.assertEqual(argv[argv.index("--session-id") + 1], FRESH_UUID)
+        self.assertNotIn("--resume", argv)
+        self.assertEqual((claim.uuid, claim.pane), (FRESH_UUID, "%9"))
+        self.assertIsNone(terminal_claim.read_claim(self.view, THREAD), "the claim is gone after the CLI exits")
+
+    def test_the_session_the_cli_ran_is_recorded_when_it_exits(self) -> None:
+        self.run_claims(uuid="", env={"TMUX_PANE": "%9"})
+        ended = terminal_claim.take_ended(self.view, THREAD)
+        self.assertIsNotNone(ended, "the pane did not record the session its CLI ran")
+        self.assertEqual(ended.uuid, FRESH_UUID)
+        self.assertEqual(ended.config_dir, os.path.join(self.home, ".claude"))
+        self.assertEqual(os.path.realpath(ended.cwd), os.path.realpath(self.folder))
+        self.assertGreater(ended.ended, 0.0)
+
+    def test_a_cli_that_could_not_start_records_no_session(self) -> None:
+        def run_fails(argv: Sequence[str], cwd: str, environ: Mapping[str, str]) -> int:
+            raise OSError("no such launcher")
+
+        self.make_topic(uuid="")
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%9"}):
+            run_topic_pane(self.paths, THREAD, self.make_config, out=io.StringIO(), clock=FakeClock(), stop_after=1,
+                           stdin=io.StringIO(), keys=ScriptedKeys([ENTER]), run=run_fails,
+                           new_uuid=lambda: FRESH_UUID)
+        self.assertIsNone(terminal_claim.take_ended(self.view, THREAD))
+
     def test_the_stored_pick_wins_over_the_stored_launcher(self) -> None:
-        self.make_topic(launcher=fake_command("claude"), pick="oclaude")
+        self.make_topic(launcher=fake_command("claude"), pick="claude-alt")
         self.pane([ENTER], rounds=1)
-        self.assertEqual(self.children()[0]["kind"], "oclaude")
+        self.assertEqual(self.children()[0]["kind"], "claude-alt")
 
     def test_the_topic_launcher_from_config_is_used_over_the_stored_one(self) -> None:
-        self.topic_launcher = fake_command("oclaude")
+        self.topic_launcher = fake_command("claude-alt")
         self.make_topic(launcher=fake_command("claude"))
         self.pane([ENTER], rounds=1)
-        self.assertEqual(self.children()[0]["kind"], "oclaude")
+        self.assertEqual(self.children()[0]["kind"], "claude-alt")
 
     def test_the_claim_exists_while_the_cli_runs_and_is_gone_after_it(self) -> None:
         self.make_topic()
@@ -174,7 +229,7 @@ class ReadyTests(PaneCase):
     def test_the_ready_screen_shows_the_header_and_only_the_last_feed_lines(self) -> None:
         self.make_topic(feed=40, uuid="")
         out = self.pane([], rounds=1).getvalue()
-        self.assertIn("launcher: iclaude", out)
+        self.assertIn("launcher: claude-work", out)
         self.assertIn("session: new", out)
         self.assertIn("feed line 40", out)
         self.assertIn("feed line 11", out)
@@ -399,9 +454,9 @@ class LauncherKeyTests(PaneCase):
     """The number keys of the ready screen: the list line, the switch, the reply, and the refusals."""
 
     def test_the_list_line_marks_the_current_claude_launcher(self) -> None:
-        self.make_topic(pick="oclaude")
+        self.make_topic(pick="claude-alt")
         out = self.pane([], rounds=1).getvalue()
-        self.assertIn("  1 iclaude   2 oclaude \u2713   3 claude", out)
+        self.assertIn("  1 claude-work   2 claude-alt \u2713   3 claude", out)
         self.assertIn(CHOICE_HINT_LINE, out)
 
     def test_a_digit_changes_the_launcher_and_shows_the_reply(self) -> None:
@@ -445,7 +500,7 @@ class LauncherKeyTests(PaneCase):
     def test_a_failed_switch_keeps_the_pane_alive_and_shows_the_failed_line(self) -> None:
         self.make_topic()
         for exc in (ValueError("bad pick"), OSError("disk gone"), sqlite3.Error("db locked"),
-                    RuntimeError("schema too new"), KeyError("oclaude")):
+                    RuntimeError("schema too new"), KeyError("claude-alt")):
             with self.subTest(exc=type(exc).__name__):
                 def failing(thread: int, name: str, picked: str, error: Exception = exc) -> str:
                     raise error
@@ -485,19 +540,19 @@ class SwitchTests(PaneCase):
     def make_split_config(self) -> Config:
         """Two Claude launchers with their own config folders: a switch between them is not a same-folder change."""
         launchers = {kind: {"cmd": fake_command(kind), "config_dir": os.path.join(self.home, f"cfg-{kind}")}
-                     for kind in ("iclaude", "oclaude")}
+                     for kind in ("claude-work", "claude-alt")}
         return Config({"launchers": launchers}, home=self.home, env={}, log=lambda _line: None)
 
     def test_the_real_switch_stores_the_pick_the_telegram_command_stores(self) -> None:
         config = self.make_split_config()
         self.make_topic(uuid="")
-        reply = switch_launcher(self.paths, lambda: config, THREAD, "alpha", "oclaude")
-        self.assertIn("launcher: oclaude", reply)
+        reply = switch_launcher(self.paths, lambda: config, THREAD, "alpha", "claude-alt")
+        self.assertIn("launcher: claude-alt", reply)
         row = read_topic(self.paths, THREAD)
         self.assertIsNotNone(row)
-        self.assertEqual(row.launcher_pick, "oclaude")
+        self.assertEqual(row.launcher_pick, "claude-alt")
 
     def test_the_next_enter_after_a_digit_opens_the_new_launcher(self) -> None:
         self.make_topic(uuid="")
         self.pane([b"2", ENTER], rounds=2)
-        self.assertEqual([child["kind"] for child in self.children()], ["oclaude"])
+        self.assertEqual([child["kind"] for child in self.children()], ["claude-alt"])

@@ -2,9 +2,10 @@
 
 ready: a header (topic, launcher, folder, session id short), the last FEED_TAIL_LINES lines of <thread>.feed, and the
 Enter line. Enter claims the topic (core/terminal_claim, under its flock) and runs the real CLI as a child of the pane, on
-the pane's own tty: argv = the launcher's argv + --resume <uuid> when the topic has one + --model when it has one + the
-permission flags of its mode (permission_args, the tui transport's mapping). cwd is the topic's folder. When the CLI exits
-the claim is removed and the pane is ready again.
+the pane's own tty: argv = the launcher's argv + --resume <uuid> when the topic has one, else --session-id <new uuid>,
+--model when it has one and the permission flags of its mode (permission_args, the tui transport's mapping). cwd is the
+topic's folder. The claim names the pane, the session uuid, the launcher's config folder and the cwd
+(core/terminal_claim). When the CLI exits the claim is removed and the pane is ready again.
 
 Number keys 1..9 on ready change the topic's launcher (daemon/view_launcher): the same change as Telegram's /launcher,
 under the topic's flock and refused while the topic is busy. The reply of the last change shows until the next key.
@@ -34,6 +35,7 @@ import sqlite3
 import subprocess
 import sys
 import termios
+import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -103,6 +105,8 @@ class Topic:
     argv: tuple[str, ...] | None
     problem: str
     choices: tuple[str, ...] = ()  # the configured Claude launchers the number keys pick from
+    uuid: str = ""                 # the session the CLI runs: the topic's, or the new one a fresh topic starts with
+    config_dir: str = ""           # the launcher's Claude config folder, expanded (LauncherSpec.config_dir)
 
 
 SwitchFn = Callable[[int, str, str], str]  # thread, topic name, launcher name -> the reply text
@@ -121,12 +125,15 @@ def read_topic(paths: Paths, thread_id: int) -> SessionRecord | None:
         return None
 
 
-def child_argv(config: Config, row: SessionRecord, launcher: LauncherSpec) -> tuple[str, ...]:
-    """The CLI's argv for the topic: the launcher's argv, --resume <uuid> when the topic has one, --model when it has
-    one, and the permission flags of its mode. Without the bridge's hook settings and system prompt."""
+def child_argv(config: Config, row: SessionRecord, launcher: LauncherSpec, session_uuid: str) -> tuple[str, ...]:
+    """The CLI's argv for the topic: the launcher's argv, --resume <uuid> when the topic has one, else --session-id
+    <session_uuid> so the new session's id is known from the start, --model when the topic has one, and the permission
+    flags of its mode. Without the bridge's hook settings and system prompt."""
     args = [*launcher.argv]
     if row.uuid:
         args += ["--resume", row.uuid]
+    else:
+        args += ["--session-id", session_uuid]
     model = topic_model(row)
     if model:
         args += ["--model", model]
@@ -244,7 +251,8 @@ class ViewPane:
     clock, the output and the key source; the CLI runs through run, which tests may replace."""
 
     def __init__(self, paths: Paths, thread_id: int, load: Callable[[], Config], out: TextIO, clock: Clock,
-                 keys: KeySource, run: RunChild | None = None, switch: SwitchFn | None = None) -> None:
+                 keys: KeySource, run: RunChild | None = None, switch: SwitchFn | None = None,
+                 new_uuid: Callable[[], str] | None = None) -> None:
         self._paths = paths
         self._thread = thread_id
         self._load = load
@@ -253,6 +261,7 @@ class ViewPane:
         self._keys = keys
         self._run = _run_child if run is None else run
         self._switch = partial(switch_launcher, paths, load) if switch is None else switch
+        self._new_uuid = (lambda: str(uuid.uuid4())) if new_uuid is None else new_uuid  # a fresh topic's session id
         self._follower = Follower(os.path.join(paths.view, str(thread_id)), out)
         self._drawn = ""       # the last ready screen drawn, or BUSY_MARK
         self._notice = ""      # a line from the last attempt to open the CLI, shown on the ready screen
@@ -287,7 +296,9 @@ class ViewPane:
         if launcher.backend != BACKEND_CLAUDE:
             problem = NO_BACKEND_LINE.format(backend=launcher.backend)
             return Topic(name, launcher.name, cwd, session, None, problem, choices)
-        return Topic(name, launcher.name, cwd, session, child_argv(config, row, launcher), "", choices)
+        session_uuid = row.uuid or self._new_uuid()
+        argv = child_argv(config, row, launcher, session_uuid)
+        return Topic(name, launcher.name, cwd, session, argv, "", choices, session_uuid, launcher.config_dir)
 
     def _busy(self) -> bool:
         """True while the bridge owns the topic: the meta state is running or lingering, or its turn mark is there (the
@@ -352,17 +363,24 @@ class ViewPane:
         live claim) changes nothing. The claim is removed when the CLI exits, also when it could not start."""
         view_dir = self._paths.view
         pid = os.getpid()
-        if not terminal_claim.take_claim(view_dir, self._thread, pid, self._clock.now()):
+        fields = dict(pane=os.environ.get("TMUX_PANE", ""), uuid=topic.uuid, config_dir=topic.config_dir, cwd=topic.cwd,
+                      socket=os.environ.get("TMUX", "").split(",")[0])  # $TMUX = socket,server pid,session
+        if not terminal_claim.take_claim(view_dir, self._thread, pid, self._clock.now(), **fields):
             return
         self._notice = ""
+        ran = False
         try:
             terminal.cooked()
             self._run(topic.argv or (), topic.cwd, child_env(os.environ))
+            ran = True
         except OSError as exc:
             self._notice = START_FAILED_LINE.format(detail=exc)
         finally:
             terminal.raw()
             terminal_claim.release_claim(view_dir, self._thread, pid)
+            if ran:  # the session the CLI ran is recorded, so a topic without a session can adopt it (no DB write here)
+                terminal_claim.write_ended(view_dir, self._thread, topic.uuid, topic.config_dir, topic.cwd,
+                                           self._clock.now())
             self._drawn = ""
 
     def _write(self, text: str) -> None:
@@ -372,15 +390,17 @@ class ViewPane:
 
 def run_topic_pane(paths: Paths, thread_id: int, load: Callable[[], Config], out: TextIO | None = None,
                    clock: Clock = SystemClock(), stop_after: int | None = None, stdin: TextIO | None = None,
-                   keys: KeySource | None = None, run: RunChild | None = None, switch: SwitchFn | None = None) -> int:
+                   keys: KeySource | None = None, run: RunChild | None = None, switch: SwitchFn | None = None,
+                   new_uuid: Callable[[], str] | None = None) -> int:
     """view-pane <thread>: runs the pane until its window closes. out is stdout when omitted; stdin (stdin when omitted)
     is the terminal the keys come from when it is one, and the keys argument replaces it when given. run replaces the
-    CLI runner and switch the launcher change (tests; the default is view_launcher.switch_launcher). stop_after rounds
+    CLI runner and switch the launcher change (tests; the default is view_launcher.switch_launcher), new_uuid the
+    session id a fresh topic starts with (tests; the default is uuid4). stop_after rounds
     (for tests) end the loop. Returns 0."""
     terminal = _Terminal(sys.stdin if stdin is None else stdin)
     source = keys if keys is not None else (
         _TerminalKeys(terminal.fd) if terminal.fd is not None else _Unattended(clock))
-    pane = ViewPane(paths, thread_id, load, sys.stdout if out is None else out, clock, source, run, switch)
+    pane = ViewPane(paths, thread_id, load, sys.stdout if out is None else out, clock, source, run, switch, new_uuid)
     try:
         terminal.raw()
         for _ in _rounds(stop_after):

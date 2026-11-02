@@ -1,0 +1,9 @@
+  ● The earlier answer is shown here.
+  It has a second line of plain text.
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── tg:topic1 ─
+❯ 
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Model: Opus 5.5 | Ctx: 116.4k | ⎇ master | (+1,-0)                                                                                                                        cwd: /home/user/workspace/project-a
+  Cache Hit: 99.1% | Thinking: high | [Rate limited]                                                                                                                                                Total: 5.2M
+  [Rate limited] | [Rate limited] | [Rate limited]
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · 1 feedback draft

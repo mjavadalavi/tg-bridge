@@ -103,7 +103,7 @@ class QueueTaps:
         interrupted = self._linger is not None and self._linger.request_interrupt(thread)
         running = None if interrupted else self._live.request_abort(thread, stop_tap=False)
         if running is not None:  # stop() can take ~20 s: the tap answers at once, the stop runs on its own thread
-            threading.Thread(target=running.session.stop, daemon=True).start()
+            threading.Thread(target=running.session.halt_turn, daemon=True).start()
         tap.toast(NOW_TOAST)
         tap.edit(NOW_NOTE)
 

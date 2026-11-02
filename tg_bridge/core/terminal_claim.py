@@ -1,7 +1,11 @@
 """Terminal claims: the lock between `tg-bridge view` and the daemon for one topic's session (spec: the Lock section).
 
-A claim is the file <view>/<thread>.term (JSON: pid, started). The view pane writes it while it runs the real CLI on its
-own tty. A claim is live while its pid is alive. A claim whose pid is dead is stale: it is removed when it is read.
+A claim is the file <view>/<thread>.term (JSON: pid, started, pane, socket, uuid, config_dir, cwd). The view pane writes
+it while it runs the real CLI on its own tty; pane is the tmux pane, socket the tmux server's socket path ('' for the
+default server), uuid the session it runs, config_dir its launcher's
+Claude folder and cwd its folder, so the daemon can later send a message into that session. A claim is live while its
+pid is alive. A claim whose pid is dead is stale: it is removed when it is read. A file without the new keys reads as
+"" there.
 
 The topic's state lives in the meta file <view>/<thread>.json that ViewRecorder writes. The state "running" or
 "lingering" means the bridge owns the session, so the pane must not claim it.
@@ -34,16 +38,32 @@ from tg_bridge.logging_ import Logger
 CLAIM_SUFFIX = ".term"
 LOCK_SUFFIX = ".lock"
 TURN_SUFFIX = ".turn"
+ENDED_SUFFIX = ".session"  # the session the pane ran, written when its CLI exits (see write_ended)
 BUSY_STATES = (STATE_RUNNING, STATE_LINGERING)  # the bridge owns the session in these states
 TERMINAL_NOTICE = "🖥 this session is open in the terminal (tg-bridge view); your message runs when you close it there."
 
 
 @dataclass(frozen=True)
+class Ended:
+    """The session a view tab ran, as the pane wrote it when the CLI exited. ended is the wall-clock time of the exit."""
+
+    uuid: str
+    config_dir: str
+    cwd: str
+    ended: float
+
+
+@dataclass(frozen=True)
 class Claim:
-    """A terminal claim that names a live process."""
+    """A terminal claim that names a live process. The text fields are "" when the claim file does not hold them."""
 
     pid: int
     started: float
+    pane: str = ""
+    uuid: str = ""
+    config_dir: str = ""
+    cwd: str = ""
+    socket: str = ""
 
 
 def claim_path(view_dir: str, thread_id: int) -> str:
@@ -56,6 +76,18 @@ def turn_path(view_dir: str, thread_id: int) -> str:
 
 def _meta_path(view_dir: str, thread_id: int) -> str:
     return os.path.join(view_dir, f"{thread_id}{META_SUFFIX}")
+
+
+def ended_path(view_dir: str, thread_id: int) -> str:
+    return os.path.join(view_dir, f"{thread_id}{ENDED_SUFFIX}")
+
+
+def _write_json_locked(path: str, fields: dict) -> None:
+    """Replaces the file with the fields as JSON (written beside it, then renamed: a reader never sees half of it)."""
+    tmp = path + TMP_SUFFIX
+    with open(tmp, "wb") as handle:
+        handle.write(json.dumps(fields).encode("utf-8"))
+    os.replace(tmp, path)
 
 
 @contextmanager
@@ -103,7 +135,14 @@ def _read_claim(path: str) -> Claim | None:
     if not isinstance(pid, int) or isinstance(pid, bool) or not isinstance(started, (int, float)):
         _remove(path)
         return None
-    return Claim(pid=pid, started=float(started))
+    return Claim(pid=pid, started=float(started), pane=_text_field(data, "pane"), uuid=_text_field(data, "uuid"),
+                 config_dir=_text_field(data, "config_dir"), cwd=_text_field(data, "cwd"),
+                 socket=_text_field(data, "socket"))
+
+
+def _text_field(data: dict, key: str) -> str:
+    value = data.get(key)
+    return value if isinstance(value, str) else ""
 
 
 def _live_claim_locked(view_dir: str, thread_id: int) -> Claim | None:
@@ -161,10 +200,16 @@ def turn_marked(view_dir: str, thread_id: int) -> bool:
         return _turn_marked_locked(view_dir, thread_id)
 
 
-def live_claim(view_dir: str, thread_id: int) -> Claim | None:
-    """The live claim of the topic, or None. A stale claim (dead pid) is removed here."""
+def read_claim(view_dir: str, thread_id: int) -> Claim | None:
+    """The live claim of the topic with its pane, uuid, config_dir and cwd, or None. A stale claim (dead pid) is removed
+    here. The same liveness rule as live_claim."""
     with _locked(view_dir, thread_id):
         return _live_claim_locked(view_dir, thread_id)
+
+
+def live_claim(view_dir: str, thread_id: int) -> Claim | None:
+    """The live claim of the topic, or None. A stale claim (dead pid) is removed here."""
+    return read_claim(view_dir, thread_id)
 
 
 def _free_locked(view_dir: str, thread_id: int) -> bool:
@@ -185,16 +230,20 @@ def free_topic(view_dir: str, thread_id: int) -> Iterator[bool]:
         yield _free_locked(view_dir, thread_id)
 
 
-def take_claim(view_dir: str, thread_id: int, pid: int, started: float) -> bool:
+def take_claim(view_dir: str, thread_id: int, pid: int, started: float, *, pane: str = "", uuid: str = "",
+               config_dir: str = "", cwd: str = "", socket: str = "") -> bool:
     """The pane's claim. False when another claim is live, the turn mark exists, or the meta says running or lingering:
-    the pane then stays busy. True when the claim file was written for this pid."""
+    the pane then stays busy. True when the claim file was written for this pid, with the pane, the session uuid, the
+    launcher's config folder and the topic's folder."""
     with _locked(view_dir, thread_id):
         if not _free_locked(view_dir, thread_id):
             return False
         path = claim_path(view_dir, thread_id)
         tmp = path + TMP_SUFFIX
+        fields = {"pid": pid, "started": started, "pane": pane, "uuid": uuid, "config_dir": config_dir, "cwd": cwd,
+                  "socket": socket}
         with open(tmp, "wb") as handle:
-            handle.write(json.dumps({"pid": pid, "started": started}).encode("utf-8"))
+            handle.write(json.dumps(fields).encode("utf-8"))
         os.replace(tmp, path)
         return True
 
@@ -208,6 +257,48 @@ def release_claim(view_dir: str, thread_id: int, pid: int) -> bool:
             return False
         _remove(path)
         return True
+
+
+def update_uuid(view_dir: str, thread_id: int, pid: int, uuid: str) -> bool:
+    """Sets the session uuid of the live claim that names this pid: a /clear or /resume in the tab moved the session to
+    another transcript, and the next message must follow that one. False when the claim is gone or names another pid, so
+    a claim that was released or taken by another tab is never changed."""
+    with _locked(view_dir, thread_id):
+        claim = _live_claim_locked(view_dir, thread_id)
+        if claim is None or claim.pid != pid:
+            return False
+        _write_json_locked(claim_path(view_dir, thread_id), {
+            "pid": pid, "started": claim.started, "pane": claim.pane, "uuid": uuid, "config_dir": claim.config_dir,
+            "cwd": claim.cwd, "socket": claim.socket})
+        return True
+
+
+def write_ended(view_dir: str, thread_id: int, uuid: str, config_dir: str, cwd: str, ended: float) -> None:
+    """The pane's record of the session its CLI ran, written after the CLI exits. A topic that has no session yet adopts
+    this uuid on its next normal turn (TurnRunner), so a session started in the tab is resumed, not started again."""
+    with _locked(view_dir, thread_id):
+        _write_json_locked(ended_path(view_dir, thread_id), {"uuid": uuid, "config_dir": config_dir, "cwd": cwd,
+                                                             "ended": ended})
+
+
+def take_ended(view_dir: str, thread_id: int) -> Ended | None:
+    """Reads and removes the record of the topic's last view session. None when there is none or it is not readable."""
+    with _locked(view_dir, thread_id):
+        path = ended_path(view_dir, thread_id)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            _remove(path)
+            return None
+        _remove(path)
+    if not isinstance(data, dict):
+        return None
+    ended = data.get("ended")
+    return Ended(uuid=_text_field(data, "uuid"), config_dir=_text_field(data, "config_dir"),
+                 cwd=_text_field(data, "cwd"), ended=float(ended) if isinstance(ended, (int, float)) else 0.0)
 
 
 def begin_turn(view_dir: str, thread_id: int, clock: Clock) -> bool:

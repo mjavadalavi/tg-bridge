@@ -1,0 +1,9 @@
+  ● The earlier answer is shown here.
+  It has a second line of plain text.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── tg:sample-thesis ─
+❯ یک پیام نمونه که هنوز فرستاده نشده
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Model: Opus 5.5 | Ctx: 0 | ⎇ main | (+9,-1)                                                                                                                             cwd: /home/user/workspace/docs/thesis
+  Cache Hit: 0.0% | Thinking: high | [Rate limited]                                                                                                                                               Total: 122.3M
+  [Rate limited] | [Rate limited] | [Rate limited]
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents

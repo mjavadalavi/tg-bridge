@@ -9,6 +9,9 @@ relaunch as a fresh session when the stored session is gone -> the turns row (it
 sessions.last_active) -> the feed summary -> the reply (answer, err). The per-launch objects and the end of the turn are
 in core/turn_kit.py. The session's sink is a SessionRouter (core/session_router.py) that holds the attempt's end gate.
 
+Attached: a turn with an attach target (a claim of a terminal tab) runs in that terminal session: the resume id is the
+claim's uuid, nothing is kept or offered for linger, no mark is taken here, and no relaunch is tried (_run_attached).
+
 Linger: before a new launch is planned, the LingerService is asked for the topic's kept session (claim). When it has
 one with the same key, the turn runs on that running process with no spawn: the attempt reuses its router and
 permission binding and attaches a new gate to the router. When a turn ends normally, its session is offered to the
@@ -23,11 +26,13 @@ import json
 import threading
 import uuid as uuidlib
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 
-from tg_bridge.agents.base import AgentSession, SessionSpec
+from tg_bridge.agents.base import AgentSession, AttachSpec, SessionSpec, TerminalNotReady
 from tg_bridge.agents.registry import BackendRegistry, UnknownBackend
 from tg_bridge.clock import Clock, utc_stamp
-from tg_bridge.config import Config, LauncherError
+from tg_bridge.config import BACKEND_CLAUDE, Config, LauncherError
+from tg_bridge.core import terminal_handoff
 from tg_bridge.core.events_bus import TurnEventBus
 from tg_bridge.core.handoff import HandoffService
 from tg_bridge.core.linger import HeldSession, LingerOffer, LingerService
@@ -113,14 +118,15 @@ class TurnRunner:
         self._closer = TurnCloser(turns=turns, clock=clock)
 
     def run(self, *, thread_id: int, chat_id: int, topic: str, text: str, sender: str,
-            slot: SlotLike | None = None, images: tuple[str, ...] = ()) -> TurnReply:
+            slot: SlotLike | None = None, images: tuple[str, ...] = (), attach: AttachSpec | None = None) -> TurnReply:
         """One user turn. Sets the active marker, runs the turn, and removes the marker unless a shutdown began.
-        images are local photo paths for native image input (they are dropped for a backend without it)."""
+        images are local photo paths for native image input (they are dropped for a backend without it). attach names the
+        terminal session the turn runs in (None: the bridge spawns its own process)."""
         key = active_key(thread_id)
         self._kv.set(key, json.dumps({"chat_id": chat_id, "name": topic,
                                       "started": utc_stamp(self._clock.now())}))
         try:
-            reply = self._run_body(thread_id, chat_id, topic, text, sender, slot, images)
+            reply = self._run_body(thread_id, chat_id, topic, text, sender, slot, images, attach)
         finally:
             if not self._live.is_shutting_down():  # a shutdown keeps the marker on purpose
                 self._kv.delete(key)
@@ -131,11 +137,15 @@ class TurnRunner:
     # planning
 
     def _run_body(self, thread_id: int, chat_id: int, topic: str, text: str, sender: str,
-                  slot: SlotLike | None, images: tuple[str, ...]) -> TurnReply:
+                  slot: SlotLike | None, images: tuple[str, ...], attach: AttachSpec | None) -> TurnReply:
         try:
             plan = self._plan(thread_id, chat_id, topic, text, sender, images)
         except (LauncherError, UnknownBackend) as exc:  # refused before any session id is stored
             return TurnReply(None, f"launcher failed: {exc}", TurnOutcome.ERROR)
+        if attach is not None:
+            return self._run_attached(plan, attach, slot)
+        plan = terminal_handoff.adopt_ended(self._view_dir, plan, sessions=self._sessions, history=self._history,
+                                            logger=self._logger)
         held = self._claim(plan)
         if held is not None:  # the kept process of this topic runs the turn: no spawn, no resume, no relaunch
             try:
@@ -196,14 +206,33 @@ class TurnRunner:
             system_rules=format_rules(topic, sender), stored_uuid=row.uuid,
         )
 
+    def _run_attached(self, plan: TurnPlan, attach: AttachSpec, slot: SlotLike | None) -> TurnReply:
+        """One turn in the terminal session of a view tab. The session resumes the claim's uuid, so a fresh one is stored by
+        the recorder when it starts (SessionStarted). Nothing is kept: the terminal's process is not the bridge's, and the
+        session is stopped (its transcript follow closed) when the turn ends: the terminal's session stays open, so the
+        reply says it is kept. Only Claude sessions can be attached."""
+        if plan.backend.name != BACKEND_CLAUDE:
+            return TurnReply(None, f"the terminal session is a Claude session, this topic runs on {plan.backend.name}",
+                             TurnOutcome.ERROR)
+        plan = replace(plan, attach=attach)
+        recorder = SessionRecorder(sessions=self._sessions, history=self._history, kv=self._kv,
+                                   thread_id=plan.thread_id, text=plan.text, cwd=plan.cwd,
+                                   launcher=plan.launcher.command, backend=plan.backend.name,
+                                   known_uuid=plan.stored_uuid)
+        attempt = self._attempt(plan, recorder, attach.uuid, None, slot)
+        if not attempt.refused and recorder.known not in ("", attach.uuid):  # the turn moved to another transcript
+            terminal_handoff.move_claim(self._view_dir, plan.thread_id, attach.pid, recorder.known, self._logger)
+        return self._closer.close(plan, attempt, "")
+
     def _relaunch_fresh(self, attempt: _Attempt) -> bool:
         """True when the stored session was not found and nothing else ended the turn (cap, stop tap)."""
         return not attempt.refused and attempt.resume_failed and attempt.limit is None and not attempt.aborted
 
     def _may_linger(self, plan: TurnPlan) -> bool:
-        """True when this turn's session may be kept after it: a linger service is wired, the backend can keep a session
-        open, and the config allows linger (both the seconds and the session cap are above zero)."""
-        return (self._linger is not None and plan.backend.capabilities_for(plan.launcher).linger
+        """True when this turn's session may be kept after it: a linger service is wired, the turn is not an attached one
+        (a terminal's process is never kept), the backend can keep a session open, and the config allows linger (both the
+        seconds and the session cap are above zero)."""
+        return (self._linger is not None and plan.attach is None and plan.backend.capabilities_for(plan.launcher).linger
                 and self._config.linger_seconds() > 0 and self._config.linger_max_sessions() > 0)
 
     def _claim(self, plan: TurnPlan) -> HeldSession | None:
@@ -245,13 +274,14 @@ class TurnRunner:
         registered = False
         stop_code: int | None = None
         kept = False  # set by after() when the linger service takes the session at this turn's end
+        not_ready = False  # set when an attached terminal was not ready (TerminalNotReady)
 
         def after() -> bool:
             """The wait's after_result: at a normal end it offers the session to the linger service. True leaves the
             input open only when the session was kept. Any other end (linger off, refused, or background work still
             pending) gets the graceful end as before: the CLI has GRACEFUL_SECONDS to exit by itself, then the stop."""
             nonlocal kept
-            if self._linger is None or session is None:
+            if self._linger is None or session is None or plan.attach is not None:
                 return False
             kept = self._linger.offer(LingerOffer(plan=plan, session=session, router=router, binding=kit.binding,
                                                   recorder=recorder, kit=kit))
@@ -274,6 +304,9 @@ class TurnRunner:
                 refused, launch_err = self._drive(plan, kit.turn, kit.binding, session, kit.feed, kit.done, after)
             else:
                 refused, launch_err = self._drive_kept(plan, kit, router, session, gate, after)
+        except TerminalNotReady:  # the terminal took no message: nothing ran, so the launch is refused (no reply)
+            refused = True
+            not_ready = True
         except Exception as exc:  # a launch that failed before or during start
             launch_err = f"launcher failed: {str(exc)[:LAUNCH_ERROR_CHARS]}"
         finally:
@@ -293,7 +326,8 @@ class TurnRunner:
                 kit.view.finish()
             kit.feed.close()  # the feed posts what is left before the answer goes out
         return finish_attempt(kit, session, self._live, refused=refused, launch_err=launch_err,
-                              stop_code=stop_code)
+                              stop_code=stop_code, readable_tail=plan.backend.capabilities_for(plan.launcher).readable_tail,
+                              logger=self._logger, terminal_busy=not_ready)
 
     def _drive(self, plan: TurnPlan, turn: TurnState, binding: TurnBinding, session: AgentSession, feed: TurnProgress,
                done: threading.Event, after: Callable[[], bool]) -> tuple[bool, str | None]:
@@ -310,6 +344,8 @@ class TurnRunner:
             session.send_user(plan.text, plan.images)
             wait_turn(turn, session, done, plan.thread_id, self._live, self._poll_seconds, after_result=after)
             return False, None
+        except TerminalNotReady:  # raised to _attempt, which refuses the launch without a reply
+            raise
         except Exception as exc:
             return False, f"launcher failed: {str(exc)[:LAUNCH_ERROR_CHARS]}"
 
@@ -372,5 +408,5 @@ class TurnRunner:
             cwd=plan.cwd, mode=plan.mode, model=plan.model, resume_id=resume_id, new_id=new_id,
             allow_rules=plan.allow_rules, deny_tools=plan.deny_tools, system_rules=system_rules,
             env=dict(self._base_env, TZ=TIMEZONE), errfile_dir=self._errfile_dir, view_dir=self._view_dir,
-            tui_size=self._config.tui_size(),
+            tui_size=self._config.tui_size(), attach=plan.attach,
         )

@@ -69,18 +69,20 @@ class FinishAttemptTests(KitCase):
         session = _StubSession()
         live.begin_turn(THREAD, session, kit.feed)
         self.assertIsNotNone(live.request_abort(THREAD, stop_tap=True))
-        attempt = finish_attempt(kit, session, live, refused=False, launch_err=None, stop_code=None)
+        attempt = finish_attempt(kit, session, live, refused=False, launch_err=None,
+                                  readable_tail=True, logger=self.h.logger, stop_code=None)
         self.assertEqual((attempt.aborted, attempt.stop_tap), (True, True))
         self.assertTrue(kit.turn.stop_requested)  # the same state request_stop() sets on the turn
         self.assertFalse(live.is_aborted(THREAD))
         # exit code: the stop reaped the process; with no exit seen by the reader, its code is the one kept. An exit
         # the reader did see (after the stdout EOF) wins over it.
-        reaped = finish_attempt(self.kit(), session, LiveRegistry(), refused=False, launch_err=None, stop_code=137)
+        reaped = finish_attempt(self.kit(), session, LiveRegistry(), refused=False, launch_err=None,
+                                  readable_tail=True, logger=self.h.logger, stop_code=137)
         self.assertEqual(reaped.exit_code, 137)
         seen = self.kit()
         seen.collector.on_event(ProcessExited(returncode=0))
         self.assertEqual(finish_attempt(seen, session, LiveRegistry(), refused=False, launch_err=None,
-                                        stop_code=137).exit_code, 0)
+                                        readable_tail=True, logger=self.h.logger, stop_code=137).exit_code, 0)
 
 
 if __name__ == "__main__":

@@ -17,13 +17,15 @@ block in (the media placeholder and the slot permit) are sliced while the topic 
 Threads: the inbound handler calls deliver and reserve on its own thread; each topic's runner thread runs _run, with the
 hold ticks inside it.
 
-Terminal: with a view folder, a turn of a topic starts only when no terminal claim (tg-bridge view) is live on it. The
-check and the turn mark are one step under the topic's claim lock (terminal_claim.begin_turn). The mark stays while the
-topic's process may run: after a kept session's turn it stays until the hold ends (the tick that ends it clears it),
-and a turn that left no kept session clears it when it ends (terminal_claim.end_turn). A begun turn keeps its mark
-through its slot wait: the hold ticks of that wait never clear it, since the turn is about to spawn its process. While a claim is live, the head
-message waits, polling each POLL seconds; the topic is told once with TERMINAL_NOTICE. Without a view folder the
-terminal is not checked at all.
+Terminal: with a view folder, the head message waits for the terminal claims of the topic (core/terminal_wait). A
+claim with a pane and a session uuid is attachable: when its pane is idle, the message runs as a turn in that terminal
+session (TerminalTurn.attach set; no turn mark is taken, the process belongs to the terminal). A pane that is not ready
+when the turn is about to paste (TerminalNotReady) sends the message back into that wait, with no reply. A claim without
+them keeps the old wait. Otherwise a turn starts only when no claim is live: the check and the turn mark are one step under the
+topic's claim lock (terminal_claim.begin_turn). The mark stays while the topic's process may run: after a kept session's
+turn it stays until the hold ends (the tick that ends it clears it), and a turn that left no kept session clears it when
+it ends (terminal_claim.end_turn). A begun turn keeps its mark through its slot wait: the hold ticks of that wait never
+clear it, since the turn is about to spawn its process. Without a view folder the terminal is not checked at all.
 
 Lock map: none. TopicQueues and LingerService guard their own data; nothing is called under a lock here. The claim lock
 is an fcntl file lock taken inside terminal_claim, and only file I/O runs under it.
@@ -34,6 +36,7 @@ import threading
 import time
 from collections.abc import Callable
 
+from tg_bridge.agents.base import AttachSpec
 from tg_bridge.clock import Clock, SystemClock
 from tg_bridge.config import Config
 from tg_bridge.core import terminal_claim
@@ -41,6 +44,7 @@ from tg_bridge.core.linger import LINGER_CAP_TEXT, LINGER_EXIT_TEXT, POLL_SECOND
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.removals import Removals
 from tg_bridge.core.slots import Slot, SlotPool
+from tg_bridge.core.terminal_wait import TerminalWait
 from tg_bridge.core.titles import TitleService
 from tg_bridge.core.topic_queues import Admission, Delivery, Placeholder, QueuedItem, TopicQueues, _Entry, _HeadKind
 from tg_bridge.core.turn_runner import TurnRunner
@@ -87,6 +91,7 @@ class Dispatcher:
         poll_seconds: float = POLL_SECONDS,
         view_dir: str = "",  # the view folder of the terminal claims; '' = views off, the terminal is not checked
         removals: Removals | None = None,  # the marks of topics being removed, shared with TopicRemover
+        pane_idle: Callable[[terminal_claim.Claim], bool] | None = None,  # the probe of an attachable claim's pane
     ) -> None:
         self._turns = turns
         self._slots = slots
@@ -107,10 +112,18 @@ class Dispatcher:
         self._view_dir = view_dir
         self._queues = TopicQueues()
         self._removals = removals if removals is not None else Removals(self._clock)
+        self._terminal = TerminalWait(
+            view_dir=view_dir, removals=self._removals, shutting_down=live.is_shutting_down, clock=self._clock,
+            logger=logger, messenger=messenger, poll_seconds=poll_seconds, pane_idle=pane_idle,
+            holding=self._holding, tick=self._hold_tick)
 
     def busy(self, thread_id: int) -> bool:
         """True while the topic's runner runs: a message is queued, taken or in a turn, or a session is held."""
         return self._queues.busy(thread_id)
+
+    def waiting_terminal(self, thread_id: int) -> bool:
+        """True while the topic's head message waits for its terminal session (tg-bridge view) to be free."""
+        return self._terminal.waiting(thread_id)
 
     def removing(self, thread_id: int) -> bool:
         """True while the topic is being removed (or was forgotten a moment ago): its messages are dropped."""
@@ -301,40 +314,20 @@ class Dispatcher:
             self._logger.log(f"linger: thread {thread_id} notice not sent: {str(exc)[:SEND_ERROR_CHARS]}")
 
     def _run_entry(self, thread_id: int, topic: str, entry: _Entry, text: str, images: tuple[str, ...]) -> bool:
-        """Run one queued message as a turn, once the terminal does not hold the topic. False: the runner must stop
-        (restart stop, shutdown refusal, shutdown while the terminal held the topic)."""
-        if not self._await_terminal(thread_id, entry):  # no turn started: the row is still pending for a restart
-            return False
-        try:
-            return self._run_turn(thread_id, topic, entry, text, images)
-        finally:
-            self._end_terminal(thread_id)
-
-    def _await_terminal(self, thread_id: int, entry: _Entry) -> bool:
-        """Waits while a live terminal claim holds the topic, then marks the turn as starting (begin_turn). The topic is
-        told once per wait. A held kept session is ticked between the polls, as in the other waits. False: shutdown came
-        first, and nothing was marked. Without a view folder this returns at once."""
-        if not self._view_dir:
-            return True
-        notified = False
-        failures = 0
-        while not self._removals.active(thread_id) and not self._begin_terminal(thread_id):
-            if self._live.is_shutting_down():
+        """Run one queued message as a turn, once the terminal allows it (TerminalWait). False: the runner must stop
+        (restart stop, shutdown refusal, shutdown while the terminal held the topic). A terminal that was not ready when
+        the turn was to start (_run_turn returns None) sends the message back into the terminal wait, without a reply."""
+        while True:
+            turn = self._terminal.wait(thread_id, entry.chat_id)
+            if turn is None:  # no turn started: the row is still pending for a restart
                 return False
-            if not notified:
-                notified = True
-                self._notify_terminal(entry.chat_id, thread_id)
-            if self._holding(thread_id):
-                failures = self._hold_tick(thread_id, failures)
-            time.sleep(self._poll)
-        return True
-
-    def _begin_terminal(self, thread_id: int) -> bool:
-        try:
-            return terminal_claim.begin_turn(self._view_dir, thread_id, self._clock)
-        except OSError as exc:  # the views are best-effort: the turn runs, its feed may be missing
-            self._logger.log(f"terminal: thread {thread_id} claim check failed: {str(exc)[:SEND_ERROR_CHARS]}")
-            return True
+            try:
+                done = self._run_turn(thread_id, topic, entry, text, images, turn.attach)
+            finally:
+                if turn.attach is None:  # an attached turn marks nothing: the terminal's process is not the bridge's
+                    self._end_terminal(thread_id)
+            if done is not None:
+                return done
 
     def _end_terminal(self, thread_id: int) -> None:
         """Clears the topic's turn mark once no process of the topic is left. A kept session (the topic is held) keeps
@@ -347,15 +340,13 @@ class Dispatcher:
         except OSError as exc:
             self._logger.log(f"terminal: thread {thread_id} turn end not recorded: {str(exc)[:SEND_ERROR_CHARS]}")
 
-    def _notify_terminal(self, chat_id: int | str, thread_id: int) -> None:
-        try:
-            self._messenger.send_text(chat_id, thread_id, terminal_claim.TERMINAL_NOTICE)
-        except Exception as exc:  # the notice is lost, the message still waits and runs
-            self._logger.log(f"terminal: thread {thread_id} notice not sent: {str(exc)[:SEND_ERROR_CHARS]}")
-
-    def _run_turn(self, thread_id: int, topic: str, entry: _Entry, text: str, images: tuple[str, ...]) -> bool:
-        """The turn of one queued message. False: the runner must stop (restart stop, shutdown refusal). A topic removed
-        before the turn spawns gets no turn: the message is dropped here (checked before any write and after the slot)."""
+    def _run_turn(self, thread_id: int, topic: str, entry: _Entry, text: str, images: tuple[str, ...],
+                  attach: AttachSpec | None) -> bool | None:
+        """The turn of one queued message. False: the runner must stop (restart stop, shutdown refusal). None: the
+        terminal session was not ready (busy, text typed in it, or gone): nothing ran, the row is pending again and the
+        message goes back into the terminal wait. A topic removed before the turn spawns gets no turn: the message is
+        dropped here (checked before any write and after the slot). attach names the terminal session the turn runs in
+        (None: the bridge spawns its own process)."""
         chat_id = entry.chat_id
         if self._removals.active(thread_id):
             self._drop_removing(thread_id, entry.update_id)
@@ -374,9 +365,13 @@ class Dispatcher:
                 return True
             try:
                 reply = self._turns.run(thread_id=thread_id, chat_id=chat_id, topic=topic, text=text,
-                                        sender=entry.sender, slot=slot, images=images)
+                                        sender=entry.sender, slot=slot, images=images, attach=attach)
             finally:
                 slot.give_back()
+            if reply.terminal_busy:  # nothing was pasted: the message waits for the terminal again, no reply is sent
+                self._replay_later(entry.update_id)
+                self._logger.log(f"turn {topic}: terminal not ready, the message waits for it again")
+                return None
             if reply.err == RESTART_TEXT:  # a restart stopped this turn: recover() tells the topic, the row stays done
                 return False
             # a shutdown refused the spawn: the message replays on restart

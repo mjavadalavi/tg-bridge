@@ -135,7 +135,7 @@ so it may not match the topic name exactly. New topics get a window automaticall
 closes, and a renamed topic's window gets the new name.
 
 Each tab is the topic's real Claude Code session. Enter opens it, using the same launcher Telegram uses for that
-topic (`iclaude`, `oclaude`, `claude` or another one you set), so the session you get is the one Telegram talks to:
+topic (`claude-work`, `claude-alt`, `claude` or another one you set), so the session you get is the one Telegram talks to:
 
 - Enter in a tab starts Claude Code in that topic's folder and resumes its session, so you continue the same
   conversation in the terminal.

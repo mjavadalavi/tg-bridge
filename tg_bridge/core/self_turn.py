@@ -140,7 +140,9 @@ class SelfTurns:
             if launch_err is not None:
                 self._logger.log(f"self turn: thread {thread} did not run: {launch_err}")
             return SelfTurnEnd(ran=False, outcome=None, alive=alive)
-        attempt = finish_attempt(kit, ctx.session, self._live, refused=False, launch_err=launch_err, stop_code=None)
+        attempt = finish_attempt(kit, ctx.session, self._live, refused=False, launch_err=launch_err, stop_code=None,
+                                 readable_tail=plan.backend.capabilities_for(plan.launcher).readable_tail,
+                                 logger=self._logger)
         # a stop or a cap of a self turn closes the session (D2: only an interrupt keeps it), so its reply says so
         kept = attempt.outcome not in (TurnOutcome.STOPPED, TurnOutcome.CAPPED)
         reply = self._closer.close(plan, attempt, "", session_kept=kept)

@@ -17,9 +17,11 @@ from collections.abc import Sequence
 
 from tg_bridge.agents.base import AgentBackend, AgentSession, Capabilities, DiskSession, EventSink, ModeChoice, SessionSpec
 from tg_bridge.agents.claude import history, sessions_index
+from tg_bridge.agents.claude.attached_session import AttachedSession
 from tg_bridge.agents.claude.handoff import read_entries
 from tg_bridge.agents.claude.rules import ClaudeRuleMapper
 from tg_bridge.agents.claude.session import ClaudeSession
+from tg_bridge.agents.claude.tmux_pane import TmuxRunner, run_tmux
 from tg_bridge.agents.claude.tui_session import ClaudeTuiSession
 from tg_bridge.agents.events import ApprovalRequest, HandoffEntry
 from tg_bridge.agents.rules import RuleGrammar
@@ -46,6 +48,7 @@ CLAUDE_TUI_CAPABILITIES = Capabilities(
     cost_usd=False,            # the transcript carries no total_cost_usd, so there is no cost to show
     images=False,              # photos reach Claude as a '[photo saved ...]' text line, as in print
     preassigned_id=True,       # --session-id works in the TUI, so the id is still stored before the process starts
+    readable_tail=False,       # the tail of a TUI session is its raw PTY screen (redrawn frames, spinner, menus)
     linger=True,               # the transcript tail reports background work and the self turns it starts (C4)
 )
 # Labels are the /mode picker's button texts, in the live file's order (MODE_PICK).
@@ -84,10 +87,12 @@ class ClaudeBackend(AgentBackend):
     name = BACKEND_CLAUDE
     capabilities = CLAUDE_CAPABILITIES
 
-    def __init__(self, *, logger: Logger, clock: Clock, title_argv: Sequence[str] = ()) -> None:
+    def __init__(self, *, logger: Logger, clock: Clock, title_argv: Sequence[str] = (),
+                 tmux_run: TmuxRunner = run_tmux) -> None:
         self._logger = logger
         self._clock = clock
         self._title_argv = tuple(title_argv)   # empty: no auto-titles
+        self._tmux_run = tmux_run              # the tmux calls of an attached session (a fake in tests)
         self.rules = ClaudeRules()
 
     def capabilities_for(self, spec: LauncherSpec) -> Capabilities:
@@ -102,7 +107,13 @@ class ClaudeBackend(AgentBackend):
         return cfg.models()
 
     def open_session(self, spec: SessionSpec, sink: EventSink) -> AgentSession:
-        """The tui transport runs the interactive TUI through a PTY; every other launcher runs the print session."""
+        """A turn with spec.attach runs in that terminal session (no process is spawned). The tui transport runs the
+        interactive TUI through a PTY; every other launcher runs the print session."""
+        if spec.attach is not None:
+            attach = spec.attach
+            return AttachedSession(spec, sink, socket=attach.socket, pane=attach.pane, uuid=attach.uuid,
+                                   config_dir=attach.config_dir, cwd=attach.cwd, logger=self._logger,
+                                   clock=self._clock, run=self._tmux_run, still_attached=attach.still_attached)
         if spec.launcher.transport == TRANSPORT_TUI:
             return ClaudeTuiSession(spec, sink, logger=self._logger, clock=self._clock)
         return ClaudeSession(spec, sink, logger=self._logger, clock=self._clock)

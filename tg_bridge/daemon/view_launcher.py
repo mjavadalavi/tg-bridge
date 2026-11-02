@@ -37,7 +37,7 @@ def claude_choices(config: Config) -> tuple[str, ...]:
 
 
 def choice_line(choices: Sequence[str], current: str) -> str:
-    """The launchers numbered, the current one marked: '  1 iclaude   2 oclaude ✓   3 claude'."""
+    """The launchers numbered, the current one marked: '  1 claude-work   2 claude-alt ✓   3 claude'."""
     parts = [f"{number} {name}{CHOICE_MARK if name == current else ''}" for number, name in enumerate(choices, start=1)]
     return "  " + CHOICE_SEPARATOR.join(parts)
 

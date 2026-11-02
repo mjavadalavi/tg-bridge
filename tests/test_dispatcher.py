@@ -57,6 +57,7 @@ class StubTurns:
         self._lock = threading.Lock()
         self.runs: list[tuple[int, str, str]] = []  # (thread_id, text, sender), in run order
         self.images: list[tuple[str, ...]] = []  # the images of each run, in run order
+        self.attaches: list[object] = []  # the attach target of each run (None: the bridge's own process)
         self.gates: dict[str, threading.Event] = {}
         self.replies: dict[str, TurnReply | Exception] = {}
         self._started: dict[str, threading.Event] = {}
@@ -65,15 +66,21 @@ class StubTurns:
         with self._lock:
             return self._started.setdefault(text, threading.Event())
 
+    def attached(self, text: str) -> object:
+        """The attach target the turn of text was given (None: the bridge's own process)."""
+        with self._lock:
+            return [a for (_, t, _), a in zip(self.runs, self.attaches) if t == text][-1]
+
     def texts_run(self, thread_id: int) -> list[str]:
         with self._lock:
             return [text for tid, text, _ in self.runs if tid == thread_id]
 
     def run(self, *, thread_id: int, chat_id: int, topic: str, text: str, sender: str,
-            slot: object = None, images: tuple[str, ...] = ()) -> TurnReply:
+            slot: object = None, images: tuple[str, ...] = (), attach: object = None) -> TurnReply:
         with self._lock:
             self.runs.append((thread_id, text, sender))
             self.images.append(tuple(images))
+            self.attaches.append(attach)
         self.started(text).set()
         gate = self.gates.get(text)
         if gate is not None:
