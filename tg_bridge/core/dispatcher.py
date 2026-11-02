@@ -1,30 +1,48 @@
-"""TopicQueues and Dispatcher: the per-topic message queue and its serial runner (C15).
+"""Dispatcher: the serial runner of each topic (C15). The queue data lives in tg_bridge.core.topic_queues.
 
-Port of the live file's _queues, _dispatchers, _queue_lk, QUEUE_MAX, _Pending, _reserve_slot, _unreserve, _dispatch and
-the queue part of _continue_message (tg-bridge.py:1983-2276, 3280-3330). A topic runs one turn at a time. Messages that
-arrive while a turn runs wait in the topic's queue, in order, at most QUEUE_MAX of them. A media message reserves its
-place at once as a Placeholder; its download and transcription fill it later, and the runner waits for it (at most
-MEDIA_WAIT_SECONDS) when it reaches the head of the queue.
-
-TopicQueues holds the queue data only. It starts no thread and sends nothing. Its lock guards the queues and the set of
-busy topics, and no caller of it ever holds that lock while calling another service.
+Port of the live file's _dispatchers, _dispatch and the runner part of _continue_message (tg-bridge.py:2200-2276,
+3280-3330). A topic runs one turn at a time. Messages that arrive while a turn runs wait in the topic's queue. A media
+message's placeholder is waited for (at most MEDIA_WAIT_SECONDS) when it reaches the head of the queue.
 
 Dispatcher starts one daemon runner thread per idle topic. The runner marks the inbox row done when its turn starts,
-sends the typing action, takes a slot, runs the TurnRunner, then sends the answer or the error and submits the title job.
-A turn that a restart stopped keeps its inbox row done (recover() reports it). A turn that a shutdown refused before it
-ran puts its row back to pending, so the next start replays it.
+sends the typing action, takes a slot, runs the TurnRunner, then sends the answer or the error and submits the title
+job. A turn that a restart stopped keeps its inbox row done (recover() reports it). A turn that a shutdown refused
+before it ran puts its row back to pending, so the next start replays it.
+
+Linger: while the LingerControl holds the topic's kept session, the runner stays on the topic (its queue keeps the
+topic busy) and calls wait_once on each tick, which runs the session's self turns and checks its end conditions. A
+message to an idle kept session is handed over quietly (HANDED) and wakes the tick. The two waits a head message can
+block in (the media placeholder and the slot permit) are sliced while the topic is held, so the ticks keep running.
+
+Threads: the inbound handler calls deliver and reserve on its own thread; each topic's runner thread runs _run, with the
+hold ticks inside it.
+
+Terminal: with a view folder, a turn of a topic starts only when no terminal claim (tg-bridge view) is live on it. The
+check and the turn mark are one step under the topic's claim lock (terminal_claim.begin_turn). The mark stays while the
+topic's process may run: after a kept session's turn it stays until the hold ends (the tick that ends it clears it),
+and a turn that left no kept session clears it when it ends (terminal_claim.end_turn). A begun turn keeps its mark
+through its slot wait: the hold ticks of that wait never clear it, since the turn is about to spawn its process. While a claim is live, the head
+message waits, polling each POLL seconds; the topic is told once with TERMINAL_NOTICE. Without a view folder the
+terminal is not checked at all.
+
+Lock map: none. TopicQueues and LingerService guard their own data; nothing is called under a lock here. The claim lock
+is an fcntl file lock taken inside terminal_claim, and only file I/O runs under it.
 """
 
-import enum
-import os
+import math
 import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
 
+from tg_bridge.clock import Clock, SystemClock
 from tg_bridge.config import Config
+from tg_bridge.core import terminal_claim
+from tg_bridge.core.linger import LINGER_CAP_TEXT, LINGER_EXIT_TEXT, POLL_SECONDS, HoldEnd, HoldResult, LingerControl
 from tg_bridge.core.live import LiveRegistry
-from tg_bridge.core.slots import SlotPool
+from tg_bridge.core.removals import Removals
+from tg_bridge.core.slots import Slot, SlotPool
 from tg_bridge.core.titles import TitleService
+from tg_bridge.core.topic_queues import Admission, Delivery, Placeholder, QueuedItem, TopicQueues, _Entry, _HeadKind
 from tg_bridge.core.turn_runner import TurnRunner
 from tg_bridge.core.turn_text import NO_OUTPUT, RESTART_TEXT
 from tg_bridge.logging_ import Logger
@@ -33,210 +51,12 @@ from tg_bridge.telegram.answers import AnswerSender
 from tg_bridge.telegram.client import TelegramClient
 from tg_bridge.telegram.messenger import Messenger
 
-QUEUE_MAX = 5  # messages a topic may hold behind its running turn
-MEDIA_WAIT_SECONDS = 300  # a queued voice/photo still not transcribed after this leaves its place (it is queued at the back)
+MEDIA_WAIT_SECONDS = 300  # a queued voice/photo still not transcribed after this leaves its place (queued at the back)
 ERROR_TEXT_CHARS = 200
 SEND_ERROR_CHARS = 120
-ID_BYTES = 5
-
-
-class Placeholder:
-    """A queue place reserved for a media message. Its worker fills text, images and sets ev; busy: a turn was running
-    when the place was reserved (the topic is then told where the message stands once it is filled)."""
-
-    __slots__ = ("ev", "text", "images", "busy")
-
-    def __init__(self, busy: bool) -> None:
-        self.ev = threading.Event()
-        self.text: str | None = None
-        self.images: tuple[str, ...] = ()
-        self.busy = busy
-
-
-class Admission(enum.Enum):
-    """What happened to a message handed to the queue."""
-
-    QUEUED = "queued"  # a text behind a running turn: the topic is told its position
-    STARTED = "started"  # the topic was idle: its runner was started with this message
-    RESERVED = "reserved"  # a media placeholder behind a running turn: no notice until it is filled
-    FILLED = "filled"  # a placeholder was filled in place (its place in the order is kept)
-    FULL = "full"  # the queue already holds QUEUE_MAX messages: nothing was queued
-
-
-@dataclass(frozen=True)
-class Delivery:
-    """The outcome of one queue operation. nid is the id the Now/Next/Drop buttons carry; position is 1-based."""
-
-    admission: Admission
-    nid: str | None = None
-    position: int = 0
-    busy: bool = False  # FILLED: whether a turn was running when the placeholder was reserved
-
-    @property
-    def notify(self) -> bool:
-        """Whether the topic should be told where its message stands (the queued notice with its buttons)."""
-        return self.admission is Admission.QUEUED or (self.admission is Admission.FILLED and self.busy)
-
-
-@dataclass(frozen=True)
-class QueuedItem:
-    """A queued message as a copy: text is None while a media placeholder is not filled yet."""
-
-    nid: str
-    text: str | None
-    chat_id: int | str
-    sender: str
-    update_id: int | None
-
-
-@dataclass(frozen=True)
-class _Entry:
-    nid: str
-    body: str | Placeholder
-    chat_id: int | str
-    sender: str
-    update_id: int | None
-    images: tuple[str, ...] = ()  # local image paths of a text entry; a placeholder keeps its own (Placeholder.images)
-
-
-class _HeadKind(enum.Enum):
-    EMPTY = "empty"  # nothing left: the topic is no longer busy
-    WAIT = "wait"  # the head is a placeholder that is not filled yet
-    READY = "ready"  # the head was taken off the queue and carries its text
-
-
-@dataclass(frozen=True)
-class _Head:
-    kind: _HeadKind
-    entry: _Entry | None = None
-    text: str | None = None
-    images: tuple[str, ...] = ()
-
-
-def _new_id() -> str:
-    return os.urandom(ID_BYTES).hex()
-
-
-def _snapshot(entry: _Entry) -> QueuedItem:
-    text = entry.body if isinstance(entry.body, str) else entry.body.text
-    return QueuedItem(entry.nid, text, entry.chat_id, entry.sender, entry.update_id)
-
-
-class TopicQueues:
-    """The message queue of every topic. Thread-safe; holds data only, so it is tested without threads."""
-
-    def __init__(self, max_items: int = QUEUE_MAX) -> None:
-        self._max = max_items
-        self._lock = threading.Lock()  # guards _queues and _busy
-        self._queues: dict[int | str, list[_Entry]] = {}
-        self._busy: set[int | str] = set()  # topics whose runner is running (or about to run)
-
-    def busy(self, thread_id: int | str) -> bool:
-        with self._lock:
-            return thread_id in self._busy
-
-    def reserve(self, thread_id: int | str, chat_id: int | str, sender: str, update_id: int | None) -> Delivery:
-        """Put a placeholder at the back of the topic's queue, so a media message keeps its place while its download
-        and transcription run. An idle topic is marked busy here, and the caller starts its runner (STARTED)."""
-        nid = _new_id()
-        with self._lock:
-            queue = self._queues.setdefault(thread_id, [])
-            if len(queue) >= self._max:
-                return Delivery(Admission.FULL)
-            busy = thread_id in self._busy
-            queue.append(_Entry(nid, Placeholder(busy), chat_id, sender, update_id))
-            if busy:
-                return Delivery(Admission.RESERVED, nid, len(queue))
-            self._busy.add(thread_id)
-            return Delivery(Admission.STARTED, nid, len(queue))
-
-    def deliver(self, thread_id: int | str, chat_id: int | str, sender: str, update_id: int | None, text: str,
-                reserved: str | None = None, images: tuple[str, ...] = ()) -> Delivery:
-        """Hand over a message's text and images. With reserved, the placeholder of that id is filled in place.
-        Otherwise the message joins the back of the queue: behind a running turn (QUEUED, or FULL at QUEUE_MAX), or as
-        the first message of an idle topic (STARTED). A reserved id that is no longer queued (its place was released)
-        is queued as new."""
-        nid = _new_id()
-        with self._lock:
-            queue = self._queues.setdefault(thread_id, [])
-            idx = self._index_of(queue, reserved) if reserved is not None else None
-            if idx is not None:
-                entry = queue[idx]
-                if isinstance(entry.body, Placeholder):
-                    entry.body.text = text
-                    entry.body.images = images
-                    entry.body.ev.set()
-                    return Delivery(Admission.FILLED, entry.nid, idx + 1, entry.body.busy)
-            if thread_id in self._busy:
-                if len(queue) >= self._max:
-                    return Delivery(Admission.FULL)
-                queue.append(_Entry(nid, text, chat_id, sender, update_id, images))
-                return Delivery(Admission.QUEUED, nid, len(queue))
-            queue.append(_Entry(nid, text, chat_id, sender, update_id, images))
-            self._busy.add(thread_id)
-            return Delivery(Admission.STARTED, nid, len(queue))
-
-    def unreserve(self, thread_id: int | str, nid: str | None) -> bool:
-        """Remove a placeholder that will never be filled (its download failed, or it timed out). Wakes a runner that
-        waits on it. True when this call removed it; False for None, an unknown id or one already filled."""
-        if nid is None:
-            return False
-        with self._lock:
-            queue = self._queues.get(thread_id) or []
-            for i, entry in enumerate(queue):
-                if entry.nid == nid and isinstance(entry.body, Placeholder) and entry.body.text is None:
-                    queue.pop(i)
-                    entry.body.ev.set()
-                    return True
-        return False
-
-    def to_front(self, thread_id: int | str, nid: str) -> bool:
-        """Move a queued message to the front (⏭ Now and ⏩ Next). False when it is not queued."""
-        with self._lock:
-            queue = self._queues.get(thread_id) or []
-            idx = self._index_of(queue, nid)
-            if idx is None:
-                return False
-            queue.insert(0, queue.pop(idx))
-            return True
-
-    def drop(self, thread_id: int | str, nid: str) -> QueuedItem | None:
-        """Remove a queued message (❌ Drop) and return it, or None when it is not queued. A placeholder is woken so
-        the runner does not wait for it."""
-        with self._lock:
-            queue = self._queues.get(thread_id) or []
-            idx = self._index_of(queue, nid)
-            if idx is None:
-                return None
-            entry = queue.pop(idx)
-            if isinstance(entry.body, Placeholder):
-                entry.body.ev.set()
-            return _snapshot(entry)
-
-    def snapshot(self, thread_id: int | str) -> tuple[QueuedItem, ...]:
-        """Copies of the queued messages of a topic, in queue order."""
-        with self._lock:
-            return tuple(_snapshot(entry) for entry in self._queues.get(thread_id) or [])
-
-    def take_head(self, thread_id: int | str) -> _Head:
-        """The next message for the runner. An unfilled placeholder at the head is left in place (WAIT). Otherwise the
-        head is removed and returned (READY). An empty queue ends the topic's busy state (EMPTY)."""
-        with self._lock:
-            queue = self._queues.get(thread_id) or []
-            if not queue:
-                self._busy.discard(thread_id)
-                return _Head(_HeadKind.EMPTY)
-            entry = queue[0]
-            if isinstance(entry.body, Placeholder) and entry.body.text is None:
-                return _Head(_HeadKind.WAIT, entry)
-            queue.pop(0)
-            if isinstance(entry.body, str):
-                return _Head(_HeadKind.READY, entry, entry.body, entry.images)
-            return _Head(_HeadKind.READY, entry, entry.body.text, entry.body.images)
-
-    @staticmethod
-    def _index_of(queue: list[_Entry], nid: str | None) -> int | None:
-        return next((i for i, entry in enumerate(queue) if entry.nid == nid), None)
+HOLD_FAILURE_LIMIT = 3  # failed hold ticks in a row before the held session is asked to close
+HOLD_FAILURE_PAUSE_SECONDS = 1.0  # a failed hold tick waits this long before the next, so a broken tick does not spin
+SECONDS_PER_MINUTE = 60
 
 
 class Dispatcher:
@@ -261,6 +81,12 @@ class Dispatcher:
         logger: Logger,
         media_wait_seconds: float = MEDIA_WAIT_SECONDS,
         start_thread: Callable[..., threading.Thread] = threading.Thread,
+        linger: LingerControl | None = None,
+        hold_failure_pause: float = HOLD_FAILURE_PAUSE_SECONDS,
+        clock: Clock | None = None,
+        poll_seconds: float = POLL_SECONDS,
+        view_dir: str = "",  # the view folder of the terminal claims; '' = views off, the terminal is not checked
+        removals: Removals | None = None,  # the marks of topics being removed, shared with TopicRemover
     ) -> None:
         self._turns = turns
         self._slots = slots
@@ -274,11 +100,28 @@ class Dispatcher:
         self._logger = logger
         self._media_wait = media_wait_seconds
         self._start_thread = start_thread
+        self._linger = linger  # None: no session is kept, the runner never holds a topic
+        self._hold_pause = hold_failure_pause
+        self._clock = clock if clock is not None else SystemClock()  # the media wait's deadline
+        self._poll = poll_seconds  # the slice of a media wait while the topic is held
+        self._view_dir = view_dir
         self._queues = TopicQueues()
+        self._removals = removals if removals is not None else Removals(self._clock)
+
+    def busy(self, thread_id: int) -> bool:
+        """True while the topic's runner runs: a message is queued, taken or in a turn, or a session is held."""
+        return self._queues.busy(thread_id)
+
+    def removing(self, thread_id: int) -> bool:
+        """True while the topic is being removed (or was forgotten a moment ago): its messages are dropped."""
+        return self._removals.active(thread_id)
 
     def reserve(self, thread_id: int, topic: str, chat_id: int | str, sender: str, update_id: int | None) -> Delivery:
         """Reserve a media message's place in the topic's queue. Starts the runner when the topic is idle."""
-        delivery = self._queues.reserve(thread_id, chat_id, sender, update_id)
+        if self._removals.active(thread_id):
+            self._drop_removing(thread_id, update_id)
+            return Delivery(Admission.DROPPED)
+        delivery = self._queues.reserve(thread_id, chat_id, sender, update_id, quiet=self._quiet(thread_id))
         if delivery.admission is Admission.STARTED:
             self._start(thread_id, topic)
         return delivery
@@ -287,10 +130,17 @@ class Dispatcher:
                 reserved: str | None = None, images: tuple[str, ...] = ()) -> Delivery:
         """Hand over a message's text and local image paths: a filled placeholder, a queued message, or the first
         message of an idle topic (which starts the runner). The images reach the turn's session as native image input
-        when its backend takes them. Notices and buttons are the caller's to send (see Delivery.notify)."""
-        delivery = self._queues.deliver(thread_id, chat_id, sender, update_id, text, reserved, images)
+        when its backend takes them. Notices and buttons are the caller's to send (see Delivery.notify). A message to an
+        idle kept session is HANDED: no notice, and the held runner is woken to take it."""
+        if self._removals.active(thread_id):
+            self._drop_removing(thread_id, update_id)
+            return Delivery(Admission.DROPPED)
+        delivery = self._queues.deliver(thread_id, chat_id, sender, update_id, text, reserved, images,
+                                        quiet=self._quiet(thread_id))
         if delivery.admission is Admission.STARTED:
             self._start(thread_id, topic)
+        elif delivery.admission is Admission.HANDED and self._linger is not None:
+            self._linger.wake(thread_id)
         return delivery
 
     def unreserve(self, thread_id: int, nid: str | None) -> bool:
@@ -309,19 +159,42 @@ class Dispatcher:
     def queue_snapshot(self, thread_id: int) -> tuple[QueuedItem, ...]:
         return self._queues.snapshot(thread_id)
 
+    def clear_queue(self, thread_id: int) -> int:
+        """Drops every queued message of a topic, as a topic removal does. Their inbox rows are marked done here, so a
+        refused removal does not replay them at the next start. Returns how many were dropped."""
+        items = self._queues.drain(thread_id)
+        for item in items:
+            self._mark_done(item.update_id)
+        return len(items)
+
+    def _drop_removing(self, thread_id: int, update_id: int | None) -> None:
+        self._mark_done(update_id)
+        self._logger.log(f"message for a topic being removed: dropped (thread {thread_id})")
+
     # the runner
 
     def _start(self, thread_id: int, topic: str) -> None:
         self._start_thread(target=self._run, args=(thread_id, topic), daemon=True,
                            name=f"tg-topic-{thread_id}").start()
 
+    def _quiet(self, thread_id: int) -> bool:
+        """True when the topic's kept session is idle with no self turn pending: its next message needs no notice."""
+        return self._linger is not None and self._linger.idle_alive(thread_id)
+
     def _run(self, thread_id: int, topic: str) -> None:
-        """Serial runner of one topic: turns run one at a time, queued messages follow in order. Returns when the queue
-        is empty, when a turn was stopped by a restart or refused by a shutdown, or when the bridge is shutting down."""
+        """Serial runner of one topic: turns run one at a time, queued messages follow in order. While the topic's kept
+        session is held, the runner stays on the topic and ticks the hold instead of returning on an empty queue.
+        Returns when the queue is empty and nothing is held, when a turn was stopped by a restart or refused by a
+        shutdown, or when the bridge is shutting down."""
+        failures = 0  # consecutive failed hold ticks of this runner
         while not self._live.is_shutting_down():
-            head = self._queues.take_head(thread_id)
+            holding = self._holding(thread_id)
+            head = self._queues.take_head(thread_id, keep_busy=holding)
             if head.kind is _HeadKind.EMPTY:
-                return
+                if not holding:
+                    return
+                failures = self._hold_tick(thread_id, failures)
+                continue
             if head.kind is _HeadKind.WAIT:
                 self._await_media(thread_id, head.entry)
                 continue
@@ -331,12 +204,29 @@ class Dispatcher:
                 return
 
     def _await_media(self, thread_id: int, entry: _Entry | None) -> None:
-        """Wait for the head placeholder for at most the media wait. On timeout the place is released and the topic is
-        told; the job still runs, and its late result is queued at the back by the inbound handler."""
+        """Wait for the head placeholder for at most the media wait. While the topic holds a kept session, the wait runs
+        in slices of poll_seconds and a hold tick runs between them; when the hold ends, the rest is one plain wait. On
+        timeout the place is released and the topic is told; the job still runs, and its late result is queued at the
+        back by the inbound handler. The slices are real waits on the event; only the deadline reads the injected
+        clock, so a FakeClock moves the deadline while the slices stay real."""
         if entry is None or not isinstance(entry.body, Placeholder):
             return
-        if entry.body.ev.wait(self._media_wait):
-            return
+        ev = entry.body.ev
+        deadline = self._clock.monotonic() + self._media_wait
+        failures = 0
+        while self._holding(thread_id):
+            left = deadline - self._clock.monotonic()
+            if left <= 0:
+                break  # the media wait is over: time out below
+            if ev.wait(min(self._poll, left)):
+                return
+            failures = self._hold_tick(thread_id, failures)
+        else:  # the topic is not held (any more): the rest of the wait is plain
+            if ev.wait(max(0.0, deadline - self._clock.monotonic())):
+                return
+        self._media_timed_out(thread_id, entry)
+
+    def _media_timed_out(self, thread_id: int, entry: _Entry) -> None:
         if self._queues.unreserve(thread_id, entry.nid):
             self._logger.log(f"thread {thread_id}: media message not transcribed after {self._media_wait}s "
                              "— released from the queue")
@@ -345,16 +235,143 @@ class Dispatcher:
                 f"⚠️ a voice/photo is still being processed after {self._media_wait}s — "
                 "the queue moved on; it will run as soon as it is ready.")
 
-    def _run_entry(self, thread_id: int, topic: str, entry: _Entry, text: str, images: tuple[str, ...]) -> bool:
-        """Run one queued message as a turn. False: the runner must stop (restart stop, shutdown refusal)."""
-        chat_id = entry.chat_id
+    def _holding(self, thread_id: int) -> bool:
+        return self._linger is not None and self._linger.holding(thread_id)
+
+    def _take_slot(self, thread_id: int, slot: Slot) -> bool:
+        """Wait for a slot permit. Without a held session this is the plain take(). While the topic is held, the wait is
+        a series of timed takes of poll_seconds, so the slot waiter stays in the pool's queue like any other topic, and
+        a hold tick runs between the slices while the topic is still held. When the hold ends, the timed takes go on
+        without ticks. The topic is told once that it is queued, as take() does. False: shutdown came first, no permit
+        taken."""
+        if not self._holding(thread_id):
+            return slot.take()
+        notified = False
+        failures = 0
+        while not slot.take_for(self._poll):
+            if self._slots.shutting_down():
+                return False
+            if not notified:
+                notified = True
+                self._slots.announce_queued(slot.chat_id, slot.thread_id)
+            if self._holding(thread_id):
+                failures = self._hold_tick(thread_id, failures, clear_mark=False)  # the turn is begun: its mark stays
+        return True
+
+    def _hold_tick(self, thread_id: int, failures: int, *, clear_mark: bool = True) -> int:
+        """One tick of a topic whose kept session is held: the linger service runs a pending self turn and checks the
+        end conditions. A cap or an exit with background work pending is told to the topic. A failed tick is logged and
+        the runner goes on, since it owns the topic's queue; after HOLD_FAILURE_LIMIT failures in a row the held session
+        is asked to close. Returns the count of consecutive failed ticks. clear_mark False (a tick inside a begun turn's
+        slot wait) leaves the turn mark alone: the turn's own end in _run_entry clears it, once no process is left."""
+        if self._linger is None:
+            return 0
         try:
-            self._mark_done(entry.update_id)  # the turn starts now: a restart from here is reported by recover(), not re-run
+            result = self._linger.wait_once(thread_id)
+        except Exception as exc:
+            failures += 1
+            self._logger.log(f"linger: thread {thread_id} hold tick failed ({failures} in a row): "
+                             f"{str(exc)[:SEND_ERROR_CHARS]}")
+            if failures >= HOLD_FAILURE_LIMIT:
+                self._linger.request_release(thread_id)  # refused while a self turn runs: the next tick tries again
+            if clear_mark:  # a tick that released the hold before it raised has left no process: the mark goes
+                self._end_terminal(thread_id)
+            time.sleep(self._hold_pause)
+            return failures
+        if result.end is not None and clear_mark:  # the hold ended and its process is gone: the mark goes with it
+            self._end_terminal(thread_id)
+        self._announce(thread_id, result)  # a lost notice is only logged: the session is already closed, so no failure
+        return 0
+
+    def _announce(self, thread_id: int, result: HoldResult) -> None:
+        """Tells the topic why a kept session closed while background work was still pending. Nothing else is posted.
+        A send that fails is logged and dropped; it never counts as a failed tick."""
+        if result.pending <= 0:
+            return
+        if result.end is HoldEnd.CAP:
+            minutes = math.ceil(self._config.linger_seconds() / SECONDS_PER_MINUTE)
+            text = LINGER_CAP_TEXT.format(minutes=minutes)
+        elif result.end is HoldEnd.EXITED:
+            text = LINGER_EXIT_TEXT.format(pending=result.pending)
+        else:
+            return
+        try:
+            self._messenger.send_text(result.chat_id, thread_id, text)
+        except Exception as exc:
+            self._logger.log(f"linger: thread {thread_id} notice not sent: {str(exc)[:SEND_ERROR_CHARS]}")
+
+    def _run_entry(self, thread_id: int, topic: str, entry: _Entry, text: str, images: tuple[str, ...]) -> bool:
+        """Run one queued message as a turn, once the terminal does not hold the topic. False: the runner must stop
+        (restart stop, shutdown refusal, shutdown while the terminal held the topic)."""
+        if not self._await_terminal(thread_id, entry):  # no turn started: the row is still pending for a restart
+            return False
+        try:
+            return self._run_turn(thread_id, topic, entry, text, images)
+        finally:
+            self._end_terminal(thread_id)
+
+    def _await_terminal(self, thread_id: int, entry: _Entry) -> bool:
+        """Waits while a live terminal claim holds the topic, then marks the turn as starting (begin_turn). The topic is
+        told once per wait. A held kept session is ticked between the polls, as in the other waits. False: shutdown came
+        first, and nothing was marked. Without a view folder this returns at once."""
+        if not self._view_dir:
+            return True
+        notified = False
+        failures = 0
+        while not self._removals.active(thread_id) and not self._begin_terminal(thread_id):
+            if self._live.is_shutting_down():
+                return False
+            if not notified:
+                notified = True
+                self._notify_terminal(entry.chat_id, thread_id)
+            if self._holding(thread_id):
+                failures = self._hold_tick(thread_id, failures)
+            time.sleep(self._poll)
+        return True
+
+    def _begin_terminal(self, thread_id: int) -> bool:
+        try:
+            return terminal_claim.begin_turn(self._view_dir, thread_id, self._clock)
+        except OSError as exc:  # the views are best-effort: the turn runs, its feed may be missing
+            self._logger.log(f"terminal: thread {thread_id} claim check failed: {str(exc)[:SEND_ERROR_CHARS]}")
+            return True
+
+    def _end_terminal(self, thread_id: int) -> None:
+        """Clears the topic's turn mark once no process of the topic is left. A kept session (the topic is held) keeps
+        its mark until the hold is released, and a shutdown keeps it: the lifecycle stops the process, and the start-up
+        sweep removes the mark."""
+        if not self._view_dir or self._holding(thread_id) or self._live.is_shutting_down():
+            return
+        try:
+            terminal_claim.end_turn(self._view_dir, thread_id, self._clock)
+        except OSError as exc:
+            self._logger.log(f"terminal: thread {thread_id} turn end not recorded: {str(exc)[:SEND_ERROR_CHARS]}")
+
+    def _notify_terminal(self, chat_id: int | str, thread_id: int) -> None:
+        try:
+            self._messenger.send_text(chat_id, thread_id, terminal_claim.TERMINAL_NOTICE)
+        except Exception as exc:  # the notice is lost, the message still waits and runs
+            self._logger.log(f"terminal: thread {thread_id} notice not sent: {str(exc)[:SEND_ERROR_CHARS]}")
+
+    def _run_turn(self, thread_id: int, topic: str, entry: _Entry, text: str, images: tuple[str, ...]) -> bool:
+        """The turn of one queued message. False: the runner must stop (restart stop, shutdown refusal). A topic removed
+        before the turn spawns gets no turn: the message is dropped here (checked before any write and after the slot)."""
+        chat_id = entry.chat_id
+        if self._removals.active(thread_id):
+            self._drop_removing(thread_id, entry.update_id)
+            return True
+        try:
+            # the turn starts now: a restart from here is reported by recover(), not re-run
+            self._mark_done(entry.update_id)
             self._typing(chat_id, thread_id)
             slot = self._slots.new_slot(chat_id, thread_id)
-            if not slot.take():  # a shutdown came while the message waited for a slot: it replays on restart
+            if not self._take_slot(thread_id, slot):  # a shutdown came while the message waited: it replays on restart
                 self._replay_later(entry.update_id)
                 return False
+            if self._removals.active(thread_id):  # the topic was removed while the slot was awaited: nothing spawns
+                slot.give_back()
+                self._drop_removing(thread_id, entry.update_id)
+                return True
             try:
                 reply = self._turns.run(thread_id=thread_id, chat_id=chat_id, topic=topic, text=text,
                                         sender=entry.sender, slot=slot, images=images)
@@ -362,7 +379,8 @@ class Dispatcher:
                 slot.give_back()
             if reply.err == RESTART_TEXT:  # a restart stopped this turn: recover() tells the topic, the row stays done
                 return False
-            if reply.answer is None and reply.err is None:  # a shutdown refused the spawn: the message replays on restart
+            # a shutdown refused the spawn: the message replays on restart
+            if reply.answer is None and reply.err is None:
                 self._replay_later(entry.update_id)
                 return False
             self._reply(chat_id, thread_id, topic, text, reply.answer, reply.err)

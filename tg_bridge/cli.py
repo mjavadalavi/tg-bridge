@@ -5,6 +5,10 @@
   sendfile | send-file <topic> <path> [caption]
   type <pane> <text>                 type text into a live tmux pane (no App, no database)
   spawn <command> <name> <text>      open a live seat in a new tmux window (no App, no database)
+  hook permission                    the TUI's PermissionRequest hook: stdin JSON to the session socket (no App)
+  view                               opens the tg-bridge tmux session: one read-only window per topic (no App)
+  view-sync / view-pane <thread>     the view's own helpers, run by its windows (no App)
+  view-delete <thread>               the view's Delete topic: the daemon deletes the topic here and in Telegram (no App)
   anything else                      prints the spec (tg_bridge.__doc__) and exits 0
 
 main() sets the umask to 0o077 first, as the live file did. A failure a command reports (unknown topic, a refused upload,
@@ -14,18 +18,22 @@ daemon has stopped its sessions. A SystemExit that carries a message prints it t
 
 import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TypeVar
 
 import tg_bridge
 from tg_bridge.app import App
-from tg_bridge.clock import SystemClock
+from tg_bridge.clock import Clock, SystemClock
 from tg_bridge.config import Config
 from tg_bridge.daemon.inbox import GROUP_KEY
 from tg_bridge.daemon.lifecycle import acquire_lock, ignore_stop_signals, install_stop_handlers
 from tg_bridge.daemon.panes import Panes
+from tg_bridge.daemon.permission_hook import run_hook_client
+from tg_bridge.daemon.view_delete import request_topic_delete, show_in_tmux
+from tg_bridge.daemon.view_pane import run_topic_pane
+from tg_bridge.daemon.viewer import Viewer, attach, run_sync
 from tg_bridge.logging_ import Logger
 from tg_bridge.paths import Paths
 from tg_bridge.telegram.upload import UploadRefused
@@ -37,14 +45,21 @@ DAEMON_START_LOG = "daemon start"
 DAEMON_STOP_LOG = "daemon stop: {count} session(s) signalled"
 UNKNOWN_TOPIC = "tg-bridge {command}: unknown topic {topic!r} or group not learned yet"
 UPLOAD_REFUSED = "tg-bridge sendfile: {detail}"
+VIEW_NO_TMUX = "tg-bridge view: tmux did not run: {detail}"
+VIEW_THREAD_NOT_A_NUMBER = "tg-bridge view-pane: the thread must be a number, not {thread!r}"
+VIEW_DELETE_NOT_A_NUMBER = "tg-bridge view-delete: the thread must be a number, not {thread!r}"
 USAGE = MappingProxyType({
     "send": "usage: tg-bridge send <topic> <text>",
     "sendfile": "usage: tg-bridge sendfile <topic> <path> [caption]",
     "type": "usage: tg-bridge type <pane> <text>",
     "spawn": "usage: tg-bridge spawn <command> <name> <text>",
+    "hook": "usage: tg-bridge hook permission",
+    "view-pane": "usage: tg-bridge view-pane <thread>",
+    "view-delete": "usage: tg-bridge view-delete <thread>",
 })
 # subcommand -> number of arguments it needs; extra arguments are ignored, as the live file ignored them
-REQUIRED_ARGUMENTS = MappingProxyType({"send": 2, "sendfile": 2, "type": 2, "spawn": 3})
+REQUIRED_ARGUMENTS = MappingProxyType({"send": 2, "sendfile": 2, "type": 2, "spawn": 3, "view-pane": 1,
+                                       "view-delete": 1})
 
 
 @dataclass(frozen=True)
@@ -56,6 +71,11 @@ class Runners:
     sendfile: Callable[[str, str, str], int]
     type_text: Callable[[str, str], int]
     spawn: Callable[[str, str, str], int]
+    hook_permission: Callable[[], int]
+    view: Callable[[], int]
+    view_sync: Callable[[], int]
+    view_pane: Callable[[str], int]
+    view_delete: Callable[[str], int]
 
 
 def route(args: Sequence[str], runners: Runners) -> int:
@@ -73,6 +93,19 @@ def route(args: Sequence[str], runners: Runners) -> int:
         return _with_arguments(command, rest, lambda: runners.type_text(rest[0], rest[1]))
     if command == "spawn":
         return _with_arguments(command, rest, lambda: runners.spawn(rest[0], rest[1], rest[2]))
+    if command == "hook":
+        if rest[:1] == ["permission"]:
+            return runners.hook_permission()
+        print(USAGE["hook"], file=sys.stderr)
+        return 1
+    if command == "view":
+        return runners.view()
+    if command == "view-sync":
+        return runners.view_sync()
+    if command == "view-pane":
+        return _with_arguments(command, rest, lambda: runners.view_pane(rest[0]))
+    if command == "view-delete":
+        return _with_arguments(command, rest, lambda: runners.view_delete(rest[0]))
     sys.stdout.write(tg_bridge.__doc__)
     return 0
 
@@ -136,7 +169,7 @@ def run_daemon(paths: Paths) -> None:
     raises SystemExit(0); the finally stops the live sessions (no new turn can start) and closes the database."""
     lock = acquire_lock(paths.lock)  # the lock lasts as long as this handle is open
     try:
-        app = App.build(paths, load_config(paths))
+        app = App.build(paths, load_config(paths), sweep_stale_views=True)  # the lock is held: no live turn exists yet
         try:
             _serve(app)
         finally:
@@ -155,6 +188,8 @@ def _serve(app: App) -> None:
     app.lifecycle.register_commands()  # after the handlers: a stop during this network call still shuts down cleanly
     app.lifecycle.recover()
     app.inbox.replay_inbox()
+    app.probe.start()  # the deleted-topic probe: its first round is 60 s later, on its own daemon thread
+    app.delete_requests.start()  # the view's delete requests, polled every 2 s on their own daemon thread
     app.poller.run()
 
 
@@ -167,8 +202,44 @@ def _with_app(paths: Paths, action: Callable[[App], T]) -> T:
         app.close()
 
 
+def open_view(paths: Paths) -> int:
+    """`view`: makes the tg-bridge tmux session when it is missing, then attaches to it. The sync window of the session
+    adds the topic windows. A tmux that cannot run is a message and exit 1."""
+    Viewer(paths, load_config(paths)).ensure_session()  # view-sync makes the windows: it is the only creator
+    try:
+        attach()
+    except OSError as exc:
+        print(VIEW_NO_TMUX.format(detail=exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+def view_topic_pane(paths: Paths, thread: str) -> int:
+    """`view-pane <thread>`: the pane of one topic's window (the ready, claude and busy screens). A thread that is not a
+    number is usage."""
+    if not thread.isdigit():
+        print(VIEW_THREAD_NOT_A_NUMBER.format(thread=thread), file=sys.stderr)
+        return 1
+    return run_topic_pane(paths, int(thread), lambda: load_config(paths))
+
+
+def view_delete_topic(paths: Paths, thread: str, environ: Mapping[str, str], clock: Clock,
+                      show: Callable[[str], None] = show_in_tmux) -> int:
+    """`view-delete <thread>`: asks the daemon to delete the topic. Prints the daemon's one-line answer and, inside
+    tmux (TMUX set), shows it there too. Exit 0 when the topic is gone (or was already gone), 1 otherwise."""
+    if not thread.isdigit():
+        print(VIEW_DELETE_NOT_A_NUMBER.format(thread=thread), file=sys.stderr)
+        return 1
+    ok, text = request_topic_delete(paths.view, int(thread), clock)
+    print(text)
+    if environ.get("TMUX"):
+        show(text)
+    return 0 if ok else 1
+
+
 def _live_runners(paths: Paths) -> Runners:
-    """The runners of the real command line: the App for the Telegram commands, tmux alone for type and spawn."""
+    """The runners of the real command line: the App for the Telegram commands, tmux alone for type and spawn, and the
+    view's files and tmux for the view commands."""
     panes = Panes(clock=SystemClock())
     return Runners(
         daemon=lambda: run_daemon(paths),
@@ -178,6 +249,11 @@ def _live_runners(paths: Paths) -> Runners:
         ),
         type_text=lambda pane, text: type_into_pane(panes, pane, text),
         spawn=lambda command, name, text: spawn_in_tmux(panes, command, name, text),
+        hook_permission=lambda: run_hook_client(sys.stdin, sys.stdout, os.environ),
+        view=lambda: open_view(paths),
+        view_sync=lambda: run_sync(paths, lambda: load_config(paths), SystemClock()),
+        view_pane=lambda thread: view_topic_pane(paths, thread),
+        view_delete=lambda thread: view_delete_topic(paths, thread, os.environ, SystemClock()),
     )
 
 

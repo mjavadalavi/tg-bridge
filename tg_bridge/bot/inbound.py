@@ -25,13 +25,15 @@ from typing import Any, Protocol
 
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.bot.commands.base import CommandDeps, CommandRegistry
+from tg_bridge.bot.keep_guard import WHAT_MODE, KeepGuard, applies
 from tg_bridge.config import BACKEND_CLAUDE, Config
 from tg_bridge.core.cwd import CwdService
-from tg_bridge.core.dispatcher import QUEUE_MAX, Admission, Dispatcher
+from tg_bridge.core.dispatcher import Dispatcher
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.media import MediaOutcome, MediaService
 from tg_bridge.core.permissions import BYPASS_MODE, PermissionService
-from tg_bridge.core.topic_backend import topic_backend
+from tg_bridge.core.topic_backend import topic_capabilities
+from tg_bridge.core.topic_queues import QUEUE_MAX, Admission
 from tg_bridge.core.topics import TopicKind, TopicResolver, guard_text
 from tg_bridge.core.workers import WorkerPool
 from tg_bridge.logging_ import Logger
@@ -51,6 +53,8 @@ AUTO_ON_TEXT = (
     'Send "auto off" to restore the approval buttons.'
 )
 AUTO_OFF_TEXT = "🛡 approvals restored — sensitive tools will ask via buttons again."
+AUTO_OFF_NEXT_TEXT = ("🛡 approvals restored from your next message — this launcher cannot change a running turn "
+                      "(tap Stop to end it now).")  # a running turn whose CLI cannot switch its mode live
 PANE_SENT_TEXT = "✅ → {where}"
 PANE_FAILED_TEXT = "⚠️ {info}"
 PANE_LABEL = "pane {pane}"
@@ -58,6 +62,7 @@ SPAWNED_TEXT = "✅ spawned {launcher} in tmux window '{name}' ({pane}) — your
 QUEUED_TEXT = "📥 queued — position {position} after the current turn."
 QUEUE_FULL_TEXT = "📥 queue full ({limit}) — wait for the current turn to finish."
 REFUSED_LOG = "REFUSED message from {user} ({uid}) — allowlist not provisioned"
+REMOVING_LOG = "late message for a topic being removed: dropped (thread {thread})"
 IGNORED_LOG = "IGNORED message from {user} ({uid}) — not allow-listed"
 NOW_LABEL = "⏭ Now"
 NEXT_LABEL = "⏩ Next"
@@ -121,6 +126,7 @@ class MessageHandler:
         media_pool: WorkerPool,
         seats: Seats,
         logger: Logger,
+        keep: KeepGuard | None = None,
     ) -> None:
         self._config = config
         self._topics = topics
@@ -140,6 +146,7 @@ class MessageHandler:
         self._media_pool = media_pool
         self._seats = seats
         self._logger = logger
+        self._keep = keep  # None: 'auto on' and 'auto off' apply at once, as before the confirm card (section 5 D1)
 
     # --- poll-thread guards
 
@@ -221,6 +228,9 @@ class MessageHandler:
         sender = sender_name(message.get("from") or {})
         row = self._sessions.get(thread)
         if row is None:
+            if self._dispatcher.removing(thread):  # a late update must not re-create a topic being removed
+                self._drop_removing(thread, update_id)
+                return Disposition.DONE
             row = self._new_topic(message, thread, chat_id, sender, text)
             if row is None:  # a spawn seat or an unknown topic answered the message
                 return Disposition.DONE
@@ -233,6 +243,12 @@ class MessageHandler:
         if self._commands.dispatch(self._deps, chat_id, thread, row.name, text):  # commands run now, never queued
             return Disposition.DONE
         return self._enqueue(chat_id, thread, row.name, sender, update_id, text, reserved, images)
+
+    def _drop_removing(self, thread: int, update_id: int | None) -> None:
+        """The Dispatcher's drop for a removed topic: the inbox row is marked done, so the update never replays."""
+        if update_id is not None:
+            self._inbox.done(update_id)
+        self._logger.log(REMOVING_LOG.format(thread=thread))
 
     def _new_topic(self, message: Mapping[str, Any], thread: int, chat_id: Any, sender: str,
                    text: str) -> SessionRecord | None:
@@ -292,13 +308,33 @@ class MessageHandler:
         if off_mode == BYPASS_MODE:
             off_mode = DEFAULT_OFF_MODE
         mode = BYPASS_MODE if word == AUTO_ON else off_mode
+        if self._keep is not None:
+            card = self._keep.hold(thread, WHAT_MODE, applies(lambda: self._store_auto(thread, mode, word)))
+            if card is not None:  # the change waits for the confirm card (section 5 D1)
+                self._out.submit(self._messenger.send_buttons, chat_id, thread, card.text, card.rows)
+                return True
+        self._store_auto(thread, mode, word)
+        self._say(chat_id, thread, self._auto_reply(thread, word))
+        self._logger.log(f"{word} thread {thread}")
+        return True
+
+    def _store_auto(self, thread: int, mode: str, word: str) -> None:
+        """Stores the topic's mode for 'auto on' or 'auto off' and sends it to a running turn on a thread of its own."""
         self._sessions.set_mode(thread, mode)
         if self._live.running(thread) is not None:
             threading.Thread(target=self._permissions.set_live_mode, args=(thread, mode),
                              kwargs={"by": word}, daemon=True).start()
-        self._say(chat_id, thread, AUTO_ON_TEXT if word == AUTO_ON else AUTO_OFF_TEXT)
-        self._logger.log(f"{word} thread {thread}")
-        return True
+
+    def _auto_reply(self, thread: int, word: str) -> str:
+        """The reply to 'auto on' / 'auto off'. 'auto off' during a turn whose CLI cannot change its mode live (a tui
+        turn started in bypass) says the approvals come back from the next message, not now."""
+        if word == AUTO_ON:
+            return AUTO_ON_TEXT
+        row = self._sessions.get(thread)
+        if self._live.running(thread) is not None and row is not None:
+            if not topic_capabilities(self._config, self._backends, row, row.name).live_mode:
+                return AUTO_OFF_NEXT_TEXT
+        return AUTO_OFF_TEXT
 
     def _enqueue(self, chat_id: Any, thread: int, name: str, sender: str, update_id: int | None, text: str,
                  reserved: str | None, images: tuple[str, ...]) -> Disposition:
@@ -320,7 +356,7 @@ class MessageHandler:
         row = self._sessions.get(thread)
         if row is None:
             return self._backends.get(BACKEND_CLAUDE).capabilities.images
-        return topic_backend(self._config, self._backends, row, row.name).capabilities.images
+        return topic_capabilities(self._config, self._backends, row, row.name).images
 
     def _say(self, chat_id: Any, thread: int, text: str) -> None:
         """A plain reply to the topic, through the ordered out-worker."""

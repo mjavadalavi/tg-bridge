@@ -5,8 +5,14 @@ and every repository are injected, so the same runner serves Claude and Codex an
 
 One turn: plan (launcher precedence, allow and deny tools, RULES text) -> the active:<thread> marker -> an attempt (open
 the session, attach the permissions, register it as live, start, send the user text, wait for the end) -> at most one
-relaunch as a fresh session when the stored session is gone -> the turns row (its insert also stamps sessions.last_active)
--> the feed summary -> the reply (answer, err).
+relaunch as a fresh session when the stored session is gone -> the turns row (its insert also stamps
+sessions.last_active) -> the feed summary -> the reply (answer, err). The per-launch objects and the end of the turn are
+in core/turn_kit.py. The session's sink is a SessionRouter (core/session_router.py) that holds the attempt's end gate.
+
+Linger: before a new launch is planned, the LingerService is asked for the topic's kept session (claim). When it has
+one with the same key, the turn runs on that running process with no spawn: the attempt reuses its router and
+permission binding and attaches a new gate to the router. When a turn ends normally, its session is offered to the
+service (the wait's after_result). A kept session is not stopped; every other one is, as before.
 
 Lock map: TurnRunner holds no lock of its own. LiveRegistry, WaitRouter and Database each lock themselves, and the
 per-turn objects (TurnState, AnswerCollector, SessionRecorder) lock their own state. Nothing here holds a lock while it
@@ -17,38 +23,43 @@ import json
 import threading
 import uuid as uuidlib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import Protocol
 
-from tg_bridge.agents.base import AgentBackend, AgentSession, SessionSpec
-from tg_bridge.agents.events import AgentEvent, SessionStarted, TurnResult, UsageEvent
+from tg_bridge.agents.base import AgentSession, SessionSpec
 from tg_bridge.agents.registry import BackendRegistry, UnknownBackend
 from tg_bridge.clock import Clock, utc_stamp
-from tg_bridge.config import Config, LauncherError, LauncherSpec
+from tg_bridge.config import Config, LauncherError
 from tg_bridge.core.events_bus import TurnEventBus
 from tg_bridge.core.handoff import HandoffService
-from tg_bridge.core.live import AbortFlags, LiveRegistry
+from tg_bridge.core.linger import HeldSession, LingerOffer, LingerService
+from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.media import PHOTO_NOTE
 from tg_bridge.core.permissions import BYPASS_MODE, PermissionService, TurnBinding
-from tg_bridge.core.turn_listeners import (
-    AnswerCollector,
-    EndGate,
-    ResultFreezer,
-    SessionRecorder,
-    UsageRecorder,
-    WaitRouter,
+from tg_bridge.core.session_router import Attach, SessionRouter
+from tg_bridge.core.topic_key import TopicKey, topic_cwd, topic_launcher, topic_mode, topic_model
+from tg_bridge.core.turn_kit import (
+    FeedFactory,
+    TurnCloser,
+    TurnKit,
+    TurnPlan,
+    TurnProgress,
+    TurnReply,
+    _Attempt,
+    build_kit,
+    finish_attempt,
+    open_view,
+    sync_open_asks,
+    wait_turn,
+    wire_gate,
 )
-from tg_bridge.core.turn_state import SlotLike, TurnOutcome, TurnPhase, TurnState
+from tg_bridge.core.turn_listeners import EndGate, SessionRecorder, WaitRouter
+from tg_bridge.core.turn_state import SlotLike, TurnOutcome, TurnState
 from tg_bridge.core.turn_text import (
     LAUNCH_ERROR_CHARS,
-    NO_CONVERSATION,
     TIMEZONE,
-    compose_reply,
     format_rules,
     fresh_note,
-    whole_seconds,
 )
-from tg_bridge.feed.format import final_header
+from tg_bridge.core.view_recorder import ViewFactory
 from tg_bridge.logging_ import Logger
 from tg_bridge.store.kv import KvRepo
 from tg_bridge.store.rules import RuleRepo
@@ -59,95 +70,14 @@ ACTIVE_PREFIX = "active:"
 DEFAULT_ALLOWED_TOOLS = "Read,Glob,Grep"
 KILL_SWITCH_TOOL = "KillShell"  # refused by the CLI even in bypass mode
 POLL_SECONDS = 1.0  # the wait loop's tick: caps, stop taps and dead-process checks (the live file's done.wait(1))
-STDERR_LINES = 20  # the stderr lines searched for the resume error
-TAIL_LINES = 10  # the stderr lines shown in a process error
 MAX_LAUNCHES = 2  # the first launch and the one fresh relaunch after a missing resume
-GRACEFUL_SECONDS = 10.0  # after a normal end the CLI gets this long to exit on its own (input closed, no interrupt)
-
-
-class TurnProgress(Protocol):
-    """The feed of one attempt (TurnFeed satisfies it). Called by the turn runner only."""
-
-    def start(self) -> None: ...
-
-    def on_event(self, event: AgentEvent) -> None: ...
-
-    def close(self) -> None: ...
-
-    def finish(self, header: str) -> None: ...
-
-
-FeedFactory = Callable[[int | str, int, Callable[[], bool]], TurnProgress]
-
-
-@dataclass(frozen=True)
-class TurnReply:
-    """What the turn produced. answer and err are both None only when a shutdown refused the spawn: nothing ran, and
-    the caller re-marks the inbox row for a later try."""
-
-    answer: str | None
-    err: str | None
-    outcome: TurnOutcome
-
-
-@dataclass(frozen=True)
-class TurnPlan:
-    """Everything decided before the first launch of a turn."""
-
-    thread_id: int
-    chat_id: int
-    topic: str
-    text: str
-    images: tuple[str, ...]
-    launcher: LauncherSpec
-    backend: AgentBackend
-    cwd: str
-    mode: str
-    model: str | None
-    allow_rules: tuple[str, ...]
-    deny_tools: tuple[str, ...]
-    system_rules: str
-    stored_uuid: str
-
-
-@dataclass(frozen=True)
-class _Attempt:
-    """The facts of one launch, gathered for the reply, the turns row and the feed summary."""
-
-    refused: bool
-    outcome: TurnOutcome
-    result: TurnResult | None
-    usage: UsageEvent | None
-    texts: tuple[str, ...]
-    tools: int
-    limit: float | None
-    stop_tap: bool
-    aborted: bool
-    launch_err: str | None
-    exit_code: int | None
-    tail: str
-    resume_failed: bool
-    feed: TurnProgress
-    started_wall: float
-    started_mono: float
+SELF_FIRST_RETRIES = 3  # the attach of a claimed turn is retried this often after a self turn ran in front of it
+BUSY_TEXT = "background turns kept starting before the message could run"
 
 
 def active_key(thread_id: int) -> str:
     """The kv key of a turn in progress. It survives a restart on purpose (recover() reads it)."""
     return f"{ACTIVE_PREFIX}{thread_id}"
-
-
-class _HandoffClearer:
-    """Discards the pending handoff digest once the fresh session that was given it has started. A turn that dies before
-    SessionStarted never reaches this, so its digest stays in kv for the next try."""
-
-    def __init__(self, handoff: HandoffService, thread_id: int) -> None:
-        self._handoff = handoff
-        self._thread_id = thread_id
-
-    def on_event(self, event: AgentEvent) -> None:
-        if isinstance(event, SessionStarted):
-            self._handoff.discard(self._thread_id)
 
 
 class TurnRunner:
@@ -158,6 +88,7 @@ class TurnRunner:
         waits: WaitRouter, sessions: SessionRepo, history: HistoryRepo, rules: RuleRepo, turns: TurnRepo,
         kv: KvRepo, handoff: HandoffService, feeds: FeedFactory, clock: Clock, logger: Logger,
         base_env: Mapping[str, str], errfile_dir: str, poll_seconds: float = POLL_SECONDS,
+        views: ViewFactory | None = None, view_dir: str = "", linger: LingerService | None = None,
     ) -> None:
         self._config = config
         self._registry = registry
@@ -176,6 +107,10 @@ class TurnRunner:
         self._base_env = dict(base_env)
         self._errfile_dir = errfile_dir
         self._poll_seconds = poll_seconds
+        self._views = views
+        self._view_dir = view_dir
+        self._linger = linger  # None: no session is kept after a turn (linger off), as before
+        self._closer = TurnCloser(turns=turns, clock=clock)
 
     def run(self, *, thread_id: int, chat_id: int, topic: str, text: str, sender: str,
             slot: SlotLike | None = None, images: tuple[str, ...] = ()) -> TurnReply:
@@ -201,11 +136,19 @@ class TurnRunner:
             plan = self._plan(thread_id, chat_id, topic, text, sender, images)
         except (LauncherError, UnknownBackend) as exc:  # refused before any session id is stored
             return TurnReply(None, f"launcher failed: {exc}", TurnOutcome.ERROR)
+        held = self._claim(plan)
+        if held is not None:  # the kept process of this topic runs the turn: no spawn, no resume, no relaunch
+            try:
+                attempt = self._attempt(plan, held.recorder, None, None, slot, held=held)
+            except Exception:  # raised before _attempt's own try (the kit, the wait registration): release the claim
+                self._release_claimed(held)
+                raise
+            return self._closer.close(plan, attempt, "")
         recorder = SessionRecorder(sessions=self._sessions, history=self._history, kv=self._kv,
                                    thread_id=thread_id, text=text, cwd=plan.cwd,
                                    launcher=plan.launcher.command, backend=plan.backend.name,
                                    known_uuid=plan.stored_uuid)
-        preassigned = plan.backend.capabilities.preassigned_id
+        preassigned = plan.backend.capabilities_for(plan.launcher).preassigned_id
         resume_id = plan.stored_uuid or None
         new_id = None
         if resume_id is None and preassigned:  # the id is stored BEFORE the process exists
@@ -220,7 +163,7 @@ class TurnRunner:
             self._logger.log(f"resume {uid} not found — restarting as new session "
                              + ("with same id" if preassigned else "as a new thread"))
             attempt = self._attempt(plan, recorder, None, uid if preassigned else None, slot)
-        return self._finish_turn(plan, attempt, fresh)
+        return self._closer.close(plan, attempt, fresh)
 
     def _plan(self, thread_id: int, chat_id: int, topic: str, text: str, sender: str,
               images: tuple[str, ...]) -> TurnPlan:
@@ -228,9 +171,9 @@ class TurnRunner:
         if row is None:
             raise RuntimeError(f"topic {thread_id} has no sessions row")
         cfgt = self._config.topic(topic)
-        launcher = self._config.resolve_launcher(row.launcher_pick, str(cfgt.get("launcher") or ""), row.launcher)
+        launcher = topic_launcher(self._config, row, topic)
         backend = self._registry.for_launcher(launcher)
-        mode = row.mode or self._config.default_mode()
+        mode = topic_mode(self._config, row)
         allow: tuple[str, ...] = ()
         if mode != BYPASS_MODE:  # bypass ignores the allow list, as the live file does
             allowed = cfgt.get("allowed_tools", DEFAULT_ALLOWED_TOOLS)
@@ -238,7 +181,7 @@ class TurnRunner:
         denied = cfgt.get("deny_tools") or []
         if isinstance(denied, str):
             denied = [denied]
-        if not backend.capabilities.images and images:
+        if not backend.capabilities_for(launcher).images and images:
             # a backend without image input gets each saved photo as a text note, so a photo is never dropped silently;
             # a note the text already carries is not added twice
             notes = [PHOTO_NOTE.format(path=path) for path in images]
@@ -248,7 +191,7 @@ class TurnRunner:
         return TurnPlan(
             thread_id=thread_id, chat_id=chat_id, topic=topic, text=text, images=tuple(images),
             launcher=launcher, backend=backend,
-            cwd=row.cwd or str(cfgt.get("cwd") or "") or self._config.home, mode=mode, model=row.model or None,
+            cwd=topic_cwd(self._config, row, topic), mode=mode, model=topic_model(row),
             allow_rules=allow, deny_tools=(KILL_SWITCH_TOOL, *(str(tool) for tool in denied)),
             system_rules=format_rules(topic, sender), stored_uuid=row.uuid,
         )
@@ -257,110 +200,161 @@ class TurnRunner:
         """True when the stored session was not found and nothing else ended the turn (cap, stop tap)."""
         return not attempt.refused and attempt.resume_failed and attempt.limit is None and not attempt.aborted
 
+    def _may_linger(self, plan: TurnPlan) -> bool:
+        """True when this turn's session may be kept after it: a linger service is wired, the backend can keep a session
+        open, and the config allows linger (both the seconds and the session cap are above zero)."""
+        return (self._linger is not None and plan.backend.capabilities_for(plan.launcher).linger
+                and self._config.linger_seconds() > 0 and self._config.linger_max_sessions() > 0)
+
+    def _claim(self, plan: TurnPlan) -> HeldSession | None:
+        """The kept record of this topic when it takes this turn (same launcher, folder, mode and model), else None."""
+        if self._linger is None:
+            return None
+        key = TopicKey(launcher_name=plan.launcher.name, launcher_command=plan.launcher.command, cwd=plan.cwd,
+                       mode=plan.mode, model=plan.model)
+        return self._linger.claim(plan.thread_id, key)
+
+    def _release_claimed(self, held: HeldSession) -> None:
+        """Ends a claimed record whose turn could not start: it leaves the map, its process stops, its cards are voided.
+        Safe after _attempt's own finally has already done the same (each step is idempotent)."""
+        self._linger.forget(held.thread_id, held.session)
+        try:
+            held.session.stop(grace=10)
+        finally:
+            held.router.close()
+            self._permissions.void_all(held.binding)
+
     # one launch
 
     def _attempt(self, plan: TurnPlan, recorder: SessionRecorder, resume_id: str | None, new_id: str | None,
-                 slot: SlotLike | None) -> _Attempt:
+                 slot: SlotLike | None, held: HeldSession | None = None) -> _Attempt:
+        """One launch of the turn. A held record reuses its kept session and binding (no spawn). The session is stopped
+        here unless the linger service keeps it after the turn (after_result offers it)."""
         thread = plan.thread_id
-        turn = TurnState(thread, self._clock, slot, max_active_seconds=self._config.max_turn_seconds(),
-                         hard_cap_seconds=self._config.hard_cap_seconds())
-        feed = self._feeds(plan.chat_id, thread, lambda: turn.phase is TurnPhase.WAITING_APPROVAL)
-        done = threading.Event()
-        collector = AnswerCollector(done)
-        usage = UsageRecorder()
-        binding = TurnBinding(thread_id=thread, chat_id=plan.chat_id, cwd=plan.cwd, rules=plan.backend.rules,
-                              mode=plan.mode)
-        started_wall, started_mono = self._clock.now(), self._clock.monotonic()
-        digest = self._pending_digest(thread, resume_id)
-        # the freezer leads: the active timer stops at the result before any listener (or the wait loop) can act on it
-        listeners = [ResultFreezer(turn.mark_result_received), feed, self._permissions.bind_turn(binding), usage,
-                     recorder, collector]
-        if digest:
-            listeners.append(_HandoffClearer(self._handoff, thread))
-        bus = TurnEventBus(listeners, self._logger)
-        gate = EndGate(bus.publish, self._logger)  # whatever the process sends after its end never reaches the listeners
-        spec = self._spec(plan, resume_id, new_id, digest)
-        session: AgentSession | None = None
+        kit = build_kit(plan, recorder, slot, clock=self._clock, config=self._config, feeds=self._feeds,
+                        permissions=self._permissions, handoff=self._handoff,
+                        pending_digest=lambda: self._pending_digest(thread, resume_id),
+                        open_view=lambda: open_view(self._views, plan, self._logger),
+                        binding=held.binding if held is not None else None)
+        if held is None:  # a held turn registers after its self-first servicing, in _drive_kept
+            self._waits.register(thread, kit.turn)
+        router = held.router if held is not None else SessionRouter(self._logger)  # the sink, for the session's life
+        session: AgentSession | None = held.session if held is not None else None
         launch_err: str | None = None
         refused = False
         registered = False
         stop_code: int | None = None
-        self._waits.register(thread, turn)
-        try:
-            session = plan.backend.open_session(spec, gate)
-            self._permissions.attach(binding, session)
-            registered = self._live.begin_turn(thread, session, feed)
-            if registered:
-                refused, launch_err = self._drive(plan, turn, session, feed, done)
+        kept = False  # set by after() when the linger service takes the session at this turn's end
+
+        def after() -> bool:
+            """The wait's after_result: at a normal end it offers the session to the linger service. True leaves the
+            input open only when the session was kept. Any other end (linger off, refused, or background work still
+            pending) gets the graceful end as before: the CLI has GRACEFUL_SECONDS to exit by itself, then the stop."""
+            nonlocal kept
+            if self._linger is None or session is None:
+                return False
+            kept = self._linger.offer(LingerOffer(plan=plan, session=session, router=router, binding=kit.binding,
+                                                  recorder=recorder, kit=kit))
+            return kept
+
+        try:  # from here on the view is finished by the finally, even when the wiring below raises
+            gate = wire_gate(kit, self._logger)
+            if held is None:
+                if self._may_linger(plan):
+                    # a self turn that starts after this turn's result waits for the offer, and an approval asked in
+                    # that window gets its card; the sink is the one that linger's offer installs with hold()
+                    router.arm(TurnEventBus([self._permissions.bind_turn(kit.binding), recorder], self._logger).publish)
+                router.attach(gate, user=True)
+                session = plan.backend.open_session(self._spec(plan, resume_id, new_id, kit.digest), router)
+                self._permissions.attach(kit.binding, session)
+            registered = self._live.begin_turn(thread, session, kit.feed)
+            if not registered:
+                refused = True  # a shutdown began: the spawn (or the held turn) is refused
+            elif held is None:
+                refused, launch_err = self._drive(plan, kit.turn, kit.binding, session, kit.feed, kit.done, after)
             else:
-                refused = True  # a shutdown began: the spawn is refused
+                refused, launch_err = self._drive_kept(plan, kit, router, session, gate, after)
         except Exception as exc:  # a launch that failed before or during start
             launch_err = f"launcher failed: {str(exc)[:LAUNCH_ERROR_CHARS]}"
         finally:
-            if session is not None:
-                stop_code = session.stop(grace=10)  # cheap when the process has already exited; its exit code is kept
+            # a kept session stays open with its router and binding; anything else is stopped and its cards voided
+            if not kept:
+                if session is not None:
+                    # cheap when the process has already exited; its exit code is kept
+                    stop_code = session.stop(grace=10)
+                router.close()  # after the stop, so the events of the stop flow through the gate as before
+                if self._linger is not None and session is not None:
+                    self._linger.forget(thread, session)  # drops the held record of this session, if there is one
+                self._permissions.void_all(kit.binding)  # the turn is over: its open permission cards are closed
             if registered:
-                self._live.end_turn(thread, session, feed)
-            self._permissions.void_all(binding)  # the turn is over: its open permission cards are closed
-            self._waits.unregister(thread, turn)
-            feed.close()  # the feed posts what is left before the answer goes out
-        flags = AbortFlags(False, False) if refused else self._live.consume_abort(thread)
-        if flags.aborted:  # ⏭ Now or a ⏹ tap: the stop was requested on purpose
-            turn.request_stop()
-        limit = turn.limit_hit  # recorded inside the wait loop only: the teardown above never reclassifies a finished turn
-        result = collector.result
-        outcome = turn.finish(result, launch_failed=launch_err is not None,
-                              shutting_down=self._live.is_shutting_down())
-        stderr = session.stderr_tail(STDERR_LINES) if session is not None else ""
-        return _Attempt(
-            refused=refused, outcome=outcome, result=result, usage=usage.usage, texts=collector.texts,
-            tools=collector.tools, limit=limit, stop_tap=flags.stop_tap, aborted=flags.aborted,
-            launch_err=launch_err,
-            # the reader reports the exit only after the stdout EOF, which a child can delay past the stop: the code
-            # the stop reaped is the fallback, as the live file reads the process's own return code
-            exit_code=collector.exit_code if collector.exit_code is not None else stop_code,
-            tail=(session.stderr_tail(TAIL_LINES).strip() if session is not None else ""),
-            resume_failed=bool(result is not None and result.resume_failed) or NO_CONVERSATION in stderr,
-            feed=feed, started_wall=started_wall, started_mono=started_mono,
-        )
+                self._live.end_turn(thread, session, kit.feed)
+            self._waits.unregister(thread, kit.turn)
+            if kit.view is not None:  # a launch that failed emits no end event: the view must not stay running
+                kit.view.finish()
+            kit.feed.close()  # the feed posts what is left before the answer goes out
+        return finish_attempt(kit, session, self._live, refused=refused, launch_err=launch_err,
+                              stop_code=stop_code)
 
-    def _drive(self, plan: TurnPlan, turn: TurnState, session: AgentSession, feed: TurnProgress,
-               done: threading.Event) -> tuple[bool, str | None]:
+    def _drive(self, plan: TurnPlan, turn: TurnState, binding: TurnBinding, session: AgentSession, feed: TurnProgress,
+               done: threading.Event, after: Callable[[], bool]) -> tuple[bool, str | None]:
         """Starts the session, sends the text and waits for the turn to end. Returns (refused, launch_err)."""
         try:
             feed.start()
             turn.start()
+            sync_open_asks(self._waits, self._permissions, binding)
             session.start()
             if self._live.is_shutting_down():  # the shutdown snapshot may have missed this process: stop it here
                 session.stop(grace=1)
                 return True, None
             turn.mark_running()
             session.send_user(plan.text, plan.images)
-            self._wait(turn, session, done, plan.thread_id)
+            wait_turn(turn, session, done, plan.thread_id, self._live, self._poll_seconds, after_result=after)
             return False, None
         except Exception as exc:
             return False, f"launcher failed: {str(exc)[:LAUNCH_ERROR_CHARS]}"
 
-    def _wait(self, turn: TurnState, session: AgentSession, done: threading.Event, thread_id: int) -> None:
-        """Waits until the turn has a result or its process is gone, checking the caps, the stop taps and a shutdown
-        on every tick. A cap stops the session here; a dead process ends the wait after the dead-process delay.
-        A normal end (a result arrived, no cap) closes the input and gives the CLI GRACEFUL_SECONDS to exit by itself:
-        no interrupt is sent, so the CLI has nothing to answer. The stop in _attempt is only the fallback."""
-        while not done.wait(self._poll_seconds):
-            turn.retry_slot()  # a turn that gave its permit back for a card takes one again as soon as one is free
-            if self._live.is_aborted(thread_id):
-                turn.request_stop()
-            if self._live.is_shutting_down():
-                turn.begin_stopping()
-            if turn.check_caps() is not None:
-                turn.begin_stopping()
-                session.stop()
-                return
-            if turn.observe_alive(session.alive()):
-                return
-        turn.mark_result_received()  # already done by the bus's ResultFreezer; kept so a result never leaves it running
-        if turn.limit_hit is None:
-            session.end_gracefully(GRACEFUL_SECONDS)
+    def _drive_kept(self, plan: TurnPlan, kit: TurnKit, router: SessionRouter, session: AgentSession, gate: EndGate,
+                    after: Callable[[], bool]) -> tuple[bool, str | None]:
+        """Runs a turn on a kept session, which is already running. The gate is attached first (a self turn that waits
+        runs in front of it). Then the feed and the turn start, the turn is registered for the waits, and the text goes
+        to the running process, so the self turns' time never counts against this turn's caps. A router that refuses
+        the gate ends the launch."""
+        try:
+            failed = self._attach_user(plan, kit, router, session, gate)
+            if failed is not None:
+                return False, failed
+            self._waits.register(plan.thread_id, kit.turn)
+            kit.feed.start()
+            kit.turn.start()
+            sync_open_asks(self._waits, self._permissions, kit.binding)
+            if self._live.is_shutting_down():  # the shutdown refuses the turn: stop the held process, as _drive does
+                session.stop(grace=1)
+                return True, None
+            kit.turn.mark_running()
+            session.send_user(plan.text, plan.images)
+            wait_turn(kit.turn, session, kit.done, plan.thread_id, self._live, self._poll_seconds, after_result=after)
+            return False, None
+        except Exception as exc:
+            return False, f"launcher failed: {str(exc)[:LAUNCH_ERROR_CHARS]}"
+
+    def _attach_user(self, plan: TurnPlan, kit: TurnKit, router: SessionRouter, session: AgentSession,
+                     gate: EndGate) -> str | None:
+        """Attaches the user turn's gate. A self turn that began after the claim (its events wait in the router) runs
+        first, through the linger service, and the attach is retried; the retries are bounded. None when attached, else
+        the launch error. The self turn's run removes this turn's live entry (SelfTurns registers its own turn under the
+        same thread and unregisters it at its end), so the live entry is registered again before each retry. Nothing of
+        the user turn is started here: its feed, turn and wait registration start after this returns."""
+        for _ in range(SELF_FIRST_RETRIES + 1):
+            result = router.attach(gate, user=True)
+            if result is Attach.ATTACHED:
+                return None
+            if result is not Attach.SELF_FIRST:
+                return "session closed"
+            if self._linger is None or not self._linger.resume(plan.thread_id):
+                return "session closed"
+            if not self._live.begin_turn(plan.thread_id, session, kit.feed):
+                return "session closed"
+        return BUSY_TEXT
 
     def _pending_digest(self, thread_id: int, resume_id: str | None) -> str:
         """The handoff digest a fresh session takes as context; '' for a resumed session or when none is pending."""
@@ -377,35 +371,6 @@ class TurnRunner:
             thread_id=plan.thread_id, chat_id=plan.chat_id, topic=plan.topic, launcher=plan.launcher,
             cwd=plan.cwd, mode=plan.mode, model=plan.model, resume_id=resume_id, new_id=new_id,
             allow_rules=plan.allow_rules, deny_tools=plan.deny_tools, system_rules=system_rules,
-            env=dict(self._base_env, TZ=TIMEZONE), errfile_dir=self._errfile_dir,
+            env=dict(self._base_env, TZ=TIMEZONE), errfile_dir=self._errfile_dir, view_dir=self._view_dir,
+            tui_size=self._config.tui_size(),
         )
-
-    # the end of a turn
-
-    def _finish_turn(self, plan: TurnPlan, attempt: _Attempt, fresh: str) -> TurnReply:
-        if attempt.refused:
-            return TurnReply(None, None, attempt.outcome)
-        answer, err = compose_reply(
-            attempt.outcome, result=attempt.result, texts=attempt.texts, limit=attempt.limit,
-            stop_tap=attempt.stop_tap, tools=attempt.tools, launch_err=attempt.launch_err,
-            exit_code=attempt.exit_code, tail=attempt.tail)
-        wall = self._clock.monotonic() - attempt.started_mono
-        attempt.feed.finish(final_header(attempt.outcome.stored, result=attempt.result, usage=attempt.usage,
-                                         tools=attempt.tools, wall=wall, limit_hit=whole_seconds(attempt.limit)))
-        result, usage = attempt.result, attempt.usage
-        self._turns.insert(
-            plan.thread_id, started=utc_stamp(attempt.started_wall), ended=utc_stamp(self._clock.now()),
-            status=attempt.outcome.stored, subtype=result.subtype if result is not None else "",
-            cost=usage.cost_usd if usage is not None else None,
-            cost_known=usage.cost_known if usage is not None else True,
-            in_tok=usage.input_tokens if usage is not None else None,
-            out_tok=usage.output_tokens if usage is not None else None,
-            num_turns=result.num_turns if result is not None else None,
-            duration_ms=result.duration_ms if result is not None else None,
-            error=err, backend=plan.backend.name)
-        if fresh:  # the user sees why this reply has no earlier context
-            if err:
-                err = f"{fresh}\n{err}"
-            else:
-                answer = f"{fresh}\n\n{answer or ''}"
-        return TurnReply(answer, err, attempt.outcome)

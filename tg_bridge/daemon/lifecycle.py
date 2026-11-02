@@ -8,6 +8,9 @@ Port of the start-up and shutdown parts of the live file: recover (tg-bridge.py:
   process gets a restart notice in its topic and is removed; the session id is kept, so "continue" resumes the turn.
   Every ask still pending was never answered and its turn is gone: PermissionService.recover_cards voids it and closes
   its card.
+- A kept session (linger:<thread>, LingerService) left in kv by the previous process gets LINGER_RESTART_NOTICE in its
+  topic, unless that topic already got the turn notice (one notice per topic), and its marker is removed. Its background
+  work died with the process, so the notice says it will not report back.
 - shutdown_sessions sets the shutdown flag first, so no turn can start after its snapshot of the live sessions. Then it
   stops every live session in parallel, inside one time budget (measured on the injected clock). A session whose process
   group is still alive when the budget is spent gets SIGKILL, so no orphan survives. The active markers of the turns
@@ -33,6 +36,7 @@ from typing import IO, Any, Protocol, runtime_checkable
 from tg_bridge.agents.base import AgentSession
 from tg_bridge.bot.commands.base import CommandRegistry
 from tg_bridge.clock import Clock
+from tg_bridge.core.linger import LINGER_PREFIX
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.permissions import PermissionService
 from tg_bridge.core.turn_runner import ACTIVE_PREFIX
@@ -47,6 +51,10 @@ ERROR_TEXT_LIMIT = 150
 RESTART_NOTICE = (
     "⚠️ the bridge restarted while this turn was running. "
     'The session is kept — send "continue" to pick up where it left off.'
+)
+LINGER_RESTART_NOTICE = (
+    "⚠️ the bridge restarted, so the background work of this topic's last turn (a Monitor, a background command or agent, "
+    "or a wakeup) was stopped and will not report back. Ask again if you still need it."
 )
 ALREADY_RUNNING = "tg-bridge: already running"
 SIGNAL_EXIT_CODE = 0
@@ -66,11 +74,13 @@ class ProcessGroupSession(Protocol):
 
 @dataclass(frozen=True)
 class Recovery:
-    """What start-up recovery did: the turn markers it cleared, the restart notices it sent, the asks it voided."""
+    """What start-up recovery did: the turn markers it cleared, the restart notices it sent, the asks it voided.
+    lingers counts the kept-session markers it cleared; notices counts both kinds of notice."""
 
     markers: int
     notices: int
     asks: int
+    lingers: int = 0
 
 
 def _group_alive(pgid: int) -> bool:
@@ -82,10 +92,10 @@ def _group_alive(pgid: int) -> bool:
         return False
 
 
-def _thread_of(key: str) -> int | None:
-    """The topic id named by an active:<thread> key, or None when the key is malformed."""
+def _thread_of(key: str, prefix: str) -> int | None:
+    """The topic id named by a <prefix><thread> key, or None when the key is malformed."""
     try:
-        return int(key[len(ACTIVE_PREFIX):])
+        return int(key[len(prefix):])
     except ValueError:
         return None
 
@@ -125,17 +135,28 @@ class Lifecycle:
 
     def recover(self) -> Recovery:
         """Start-up, before the replay: restart notices for the turns that were running, then the asks left pending."""
-        markers = notices = 0
+        markers = notices = lingers = 0
+        notified: set[int] = set()
         for key, value in self._kv.items_with_prefix(ACTIVE_PREFIX):
-            thread = _thread_of(key)
+            thread = _thread_of(key, ACTIVE_PREFIX)
             chat = _marker_info(value).get("chat_id")
             if thread is not None and chat is not None:
                 self._messenger.send_text(chat, thread, RESTART_NOTICE)
+                notified.add(thread)
                 notices += 1
             self._kv.delete(key)
             markers += 1
+        for key, value in self._kv.items_with_prefix(LINGER_PREFIX):
+            thread = _thread_of(key, LINGER_PREFIX)
+            chat = _marker_info(value).get("chat_id")
+            if thread is not None and chat is not None and thread not in notified:
+                self._messenger.send_text(chat, thread, LINGER_RESTART_NOTICE)
+                notified.add(thread)
+                notices += 1
+            self._kv.delete(key)
+            lingers += 1
         asks = self._permissions.recover_cards()
-        return Recovery(markers=markers, notices=notices, asks=asks)
+        return Recovery(markers=markers, notices=notices, asks=asks, lingers=lingers)
 
     def shutdown_sessions(self, budget: float = SHUTDOWN_BUDGET_SECONDS, grace: float = SHUTDOWN_GRACE_SECONDS) -> int:
         """Stops every live session in parallel within budget seconds, then SIGKILLs any group still alive.

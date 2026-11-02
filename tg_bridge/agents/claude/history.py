@@ -24,17 +24,31 @@ def encoded_cwd(cwd: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "-", cwd)
 
 
-def transcript_path(config_dir: str, cwd: str, sid: str) -> str | None:
-    """Where session sid's transcript sits under a Claude config folder: the cwd's own folder first, else any folder
-    holding that uuid. None when the id is malformed or the file is not there."""
-    if not config_dir or not cwd or not TRANSCRIPT_ID.fullmatch(sid or ""):
+def _valid(config_dir: str, cwd: str, sid: str) -> bool:
+    return bool(config_dir and cwd and TRANSCRIPT_ID.fullmatch(sid or ""))
+
+
+def cwd_transcript_path(config_dir: str, cwd: str, sid: str) -> str | None:
+    """Session sid's transcript in the cwd's own folder only (the one `claude --resume` looks in): the realpath and the
+    abspath encoded folders are both checked, and the newer copy wins. None when the id is malformed or no such copy
+    exists under that cwd. Other folders of the config dir are never looked at."""
+    if not _valid(config_dir, cwd, sid):
         return None
     projects = os.path.join(config_dir, "projects")
+    own = [os.path.join(projects, folder, sid + ".jsonl") for folder in _cwd_folders(cwd)]
+    present = [path for path in own if os.path.isfile(path)]
+    return max(present, key=_newest_key) if present else None
+
+
+def _cwd_folders(cwd: str) -> list[str]:
+    """The encoded folder names of a cwd: the realpath's, then the abspath's when it differs."""
     real = os.path.realpath(os.path.expanduser(cwd))
-    for folder in dict.fromkeys([encoded_cwd(real), encoded_cwd(os.path.abspath(os.path.expanduser(cwd)))]):
-        path = os.path.join(projects, folder, sid + ".jsonl")
-        if os.path.isfile(path):
-            return path
+    return list(dict.fromkeys([encoded_cwd(real), encoded_cwd(os.path.abspath(os.path.expanduser(cwd)))]))
+
+
+def _any_folder_path(config_dir: str, sid: str) -> str | None:
+    """The first folder of the config dir (sorted by name) that holds sid's transcript, or None."""
+    projects = os.path.join(config_dir, "projects")
     try:
         folders = sorted(os.listdir(projects))
     except OSError:
@@ -44,6 +58,23 @@ def transcript_path(config_dir: str, cwd: str, sid: str) -> str | None:
         if os.path.isfile(path):
             return path
     return None
+
+
+def transcript_path(config_dir: str, cwd: str, sid: str) -> str | None:
+    """Where session sid's transcript sits under a Claude config folder: the cwd's own folder first (cwd_transcript_path),
+    else any folder holding that uuid. None when the id is malformed or the file is not there."""
+    own = cwd_transcript_path(config_dir, cwd, sid)
+    if own is not None or not _valid(config_dir, cwd, sid):
+        return own
+    return _any_folder_path(config_dir, sid)
+
+
+def _newest_key(path: str) -> tuple[float, str]:
+    """Ranks a transcript by mtime, ties by path: the same order sessions_index lists by, so both pick the same copy."""
+    try:
+        return os.path.getmtime(path), path
+    except OSError:
+        return float("-inf"), path
 
 
 def strip_thinking_line(line: str) -> str:

@@ -38,6 +38,7 @@ only — no third-party Python packages.
 - The Claude Code CLI (`claude`) on `PATH`, logged in
 - Optional: the Codex CLI (`codex`) for Codex launchers
 - Optional: a Soniox API key for voice-note transcription
+- Optional: tmux, for `tg-bridge view`
 
 ## Setup
 
@@ -96,11 +97,79 @@ or a `{cmd, config_dir}` object; `agent_launchers` adds non-Claude backends:
 - `config_dir` is where that launcher keeps its session transcripts (`~/.claude` for Claude). Launchers that
   share a folder share sessions; switching to a launcher with a different folder copies the transcript across
   so the conversation continues.
+- `transport` is optional and only for Claude launchers. `print` (the default) runs one `claude -p` per turn over
+  stream-json. `tui` runs the interactive TUI in a pseudo-terminal, for services that refuse non-interactive use,
+  e.g. a team gateway that answers `claude -p` with `API Error: 403 Non-interactive use isn't supported`.
 - A Codex entry turns its name into a Codex launcher. `/launcher codex` switches a topic to it; a switch
   between Claude and Codex starts a fresh session with a summary of the earlier conversation. A Codex
   `config_dir` is the Codex home (default `$CODEX_HOME`, else `~/.codex`).
 - Auto-generated topic titles use `TG_TITLE_LAUNCHER` (env var, default `claude`); set it to a cheap seat or
   to an empty string to turn titles off.
+
+### The `tui` transport
+
+With `"transport": "tui"`, each turn runs the interactive Claude TUI in a pseudo-terminal:
+
+- One TUI process per turn. The message is typed into it, and when the turn ends the bridge closes it with `/exit`.
+- The live feed comes from the session transcript file, the same JSON lines the print transport reads.
+- Permission cards come from a `PermissionRequest` hook (`tg-bridge hook permission`) that talks to the bridge
+  over a per-session Unix socket.
+- The folder-trust dialog is accepted automatically.
+- Stop sends Esc to the TUI.
+
+tui limits:
+
+- `/mode` and `/model` apply from the next message. Typing `/model` inside the TUI would save your default model,
+  so the bridge passes the choice as a flag instead.
+- No cost in the footer, only token counts.
+- `AskUserQuestion` is disabled, so the model asks its questions in plain text.
+- Tool calls made by subagents are not in the live feed.
+- Auto titles use `TG_TITLE_LAUNCHER`, which must stay a print launcher (or be empty).
+- A service may cap how many sessions run at once.
+
+## Sessions in the terminal: `tg-bridge view`
+
+`tg-bridge view` attaches to a tmux session named `tg-bridge`. It has one window per Telegram topic. A window is
+named with a shortened, tmux-safe form of the topic name (dots and spaces become dashes, and long names are cut),
+so it may not match the topic name exactly. New topics get a window automatically. A window of a deleted topic
+closes, and a renamed topic's window gets the new name.
+
+Each tab is the topic's real Claude Code session. Enter opens it, using the same launcher Telegram uses for that
+topic (`iclaude`, `oclaude`, `claude` or another one you set), so the session you get is the one Telegram talks to:
+
+- Enter in a tab starts Claude Code in that topic's folder and resumes its session, so you continue the same
+  conversation in the terminal.
+- Exit Claude Code to give the session back to Telegram. The next Telegram message resumes it from where you left it.
+- While the session is open in the terminal, Telegram messages for that topic wait, and the bot posts a notice that
+  the session is open in the terminal. They run when you close Claude Code.
+- While Telegram runs a turn for the topic, or keeps the session for background work, the tab shows a busy screen
+  with the live output instead of opening Claude Code. Enter does nothing there; press Enter again once the bot is
+  idle.
+
+The ready screen lists the Claude launchers under the topic's details, numbered, with the current one marked. Press a
+number (1 to 9) to change the topic's launcher: it is the same change as Telegram's `/launcher`, so Telegram uses the new
+launcher too, and it is refused while the topic is busy.
+
+A right-click on a tab offers Delete topic, which deletes the topic here and in Telegram after a y/n confirmation; the conversation file stays on disk.
+
+Switching tabs: click a tab with the mouse, or use the tmux keys (prefix `Ctrl-b`):
+
+- `Ctrl-b n` / `Ctrl-b p`: next / previous topic tab
+- `Ctrl-b w`: pick a topic from the list
+- `Ctrl-b d`: leave the view; it keeps running in the background
+
+A window follows the size of the terminal you attach with, so it fills that terminal. The busy screen is drawn at
+`tui_size` (see the config reference): on a bigger terminal the rest of the window stays empty, and on a smaller one the
+lines wrap badly and part of the window is out of view (tmux pans to follow the cursor). Set `tui_size` to the size you
+usually use.
+
+The view files live in `<state>/view` (mode 0700, `<state>` is `~/.local/state/tg-bridge`):
+
+- `<thread>.pty`: the raw terminal mirror of a `tui` topic
+- `<thread>.feed`: plain lines of a `print` topic
+- `<thread>.json`: metadata: topic name, transport, state (`running`, `idle` or `lingering`), updated epoch, launcher
+- `<thread>.term`: the claim of an open Claude Code session (JSON with the pid of the pane that holds it)
+- `<thread>.lock`: a lock that keeps the claim and the start of a Telegram turn from racing
 
 ## Config reference
 
@@ -109,16 +178,25 @@ or a `{cmd, config_dir}` object; `agent_launchers` adds non-Claude backends:
 | `allow_user_ids` | `[]` | Telegram user ids allowed to use the bot (required) |
 | `topics` | `{}` | per-topic settings: `launcher`, `mode`, `model`, `cwd`, `allowed_tools`, `note` |
 | `default_topic` | — | same fields, used for topics with no entry |
-| `launchers` / `agent_launchers` | `claude` | see above |
+| `launchers` / `agent_launchers` | `claude` | see above; a Claude entry may set `transport` (`print` or `tui`) |
 | `default_mode` | `bypassPermissions` | mode for topics without one |
+| `tui_size` | `200x50` | terminal size for `tui` topics, as `COLSxROWS` (each side at most 1000); see `tg-bridge view` |
 | `models` | `opus, sonnet, haiku, fable, default` | the `/model` buttons |
 | `max_turn_seconds` / `hard_cap_seconds` | `1800` / `21600` | active-time cap and hard ceiling |
 | `poll_seconds` | `50` | Telegram long-poll timeout |
 | `progress_flush_seconds` / `idle_ping_seconds` | `3` / `60` | feed batching and idle ping |
 | `answer_doc_threshold` | `9000` | answer length that becomes a `.md` document |
+| `linger_seconds` | `1800` | seconds a session stays open after your turn while background work runs; `0` turns it off |
+| `linger_max_sessions` | `3` | how many sessions may be kept open for background work at once; `0` keeps none |
+| `topic_probe_seconds` | `600` | how often idle topics are checked for a topic you deleted in Telegram (it is then removed here too); `0` turns the check off |
 | `max_output_chunks` | `4` | max Telegram messages per answer |
 | `cwd_shortcuts` / `search_roots` | `~/workspace`, home | `/cwd` buttons and search roots |
 | `egress_proxy` | — | HTTP proxy for all Telegram calls |
+
+### Background work
+
+A Claude session stays open after your turn while a Monitor, a background command, a background agent or a scheduled wakeup is still running, so its result can reach the topic. Such a report starts with 🔔 background update. `/stop` closes a kept session. The `linger_seconds` countdown starts at your last message, not at the background work.
+It works on both Claude transports (`print` and `tui`); a Codex session is never kept open.
 
 Secrets never live in `config.json`: the bot token is `~/.local/state/tg-bridge/token`, the Soniox key is
 `soniox-key` next to it, both mode 600.

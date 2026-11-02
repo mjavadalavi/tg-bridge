@@ -1,0 +1,245 @@
+"""The per-topic message queue: the data behind the Dispatcher.
+
+It holds the placeholders, admissions and deliveries of a topic's messages, and the queue of each topic with its busy
+flag. Port of the live file's _queues, _queue_lk, QUEUE_MAX and _reserve_slot's queue part (tg-bridge.py:1983-2276).
+A topic runs one turn at a time. Messages that arrive while a turn runs wait in the topic's queue, in order, at most
+QUEUE_MAX of them. A media message reserves its place at once as a Placeholder; its download and transcription fill it
+later. The runner, in dispatcher.py, waits for an unfilled placeholder when it reaches the head of the queue.
+
+TopicQueues holds the queue data only. It starts no thread and sends nothing. Its lock guards the queues and the set of
+busy topics, and no caller of it ever holds that lock while calling another service.
+
+Threads: the inbound handler, the callback handlers and the runner threads of the Dispatcher all call TopicQueues. Each
+call takes the lock once for a short section, copies or returns a Delivery, and never waits for a turn or a download.
+Only the Dispatcher starts runner threads; this module starts none.
+"""
+
+import enum
+import os
+import threading
+from dataclasses import dataclass
+
+QUEUE_MAX = 5  # messages a topic may hold behind its running turn
+ID_BYTES = 5
+
+
+class Placeholder:
+    """A queue place reserved for a media message. Its worker fills text, images and sets ev; busy: a turn was running
+    when the place was reserved (the topic is then told where the message stands once it is filled)."""
+
+    __slots__ = ("ev", "text", "images", "busy")
+
+    def __init__(self, busy: bool) -> None:
+        self.ev = threading.Event()
+        self.text: str | None = None
+        self.images: tuple[str, ...] = ()
+        self.busy = busy
+
+
+class Admission(enum.Enum):
+    """What happened to a message handed to the queue."""
+
+    QUEUED = "queued"  # a text behind a running turn: the topic is told its position
+    STARTED = "started"  # the topic was idle: its runner was started with this message
+    HANDED = "handed"  # a quiet message behind a running turn of a kept idle session: no notice, no new runner
+    RESERVED = "reserved"  # a media placeholder behind a running turn: no notice until it is filled
+    FILLED = "filled"  # a placeholder was filled in place (its place in the order is kept)
+    FULL = "full"  # the queue already holds QUEUE_MAX messages: nothing was queued
+    DROPPED = "dropped"  # the topic is being removed: the message was dropped (its inbox row is done by the dispatcher)
+
+
+@dataclass(frozen=True)
+class Delivery:
+    """The outcome of one queue operation. nid is the id the Now/Next/Drop buttons carry; position is 1-based."""
+
+    admission: Admission
+    nid: str | None = None
+    position: int = 0
+    busy: bool = False  # FILLED: whether a turn was running when the placeholder was reserved
+
+    @property
+    def notify(self) -> bool:
+        """Whether the topic should be told where its message stands (the queued notice with its buttons)."""
+        return self.admission is Admission.QUEUED or (self.admission is Admission.FILLED and self.busy)
+
+
+@dataclass(frozen=True)
+class QueuedItem:
+    """A queued message as a copy: text is None while a media placeholder is not filled yet."""
+
+    nid: str
+    text: str | None
+    chat_id: int | str
+    sender: str
+    update_id: int | None
+
+
+@dataclass(frozen=True)
+class _Entry:
+    nid: str
+    body: str | Placeholder
+    chat_id: int | str
+    sender: str
+    update_id: int | None
+    images: tuple[str, ...] = ()  # local image paths of a text entry; a placeholder keeps its own (Placeholder.images)
+
+
+class _HeadKind(enum.Enum):
+    EMPTY = "empty"  # nothing left: the topic is no longer busy
+    WAIT = "wait"  # the head is a placeholder that is not filled yet
+    READY = "ready"  # the head was taken off the queue and carries its text
+
+
+@dataclass(frozen=True)
+class _Head:
+    kind: _HeadKind
+    entry: _Entry | None = None
+    text: str | None = None
+    images: tuple[str, ...] = ()
+
+
+def _new_id() -> str:
+    return os.urandom(ID_BYTES).hex()
+
+
+def _snapshot(entry: _Entry) -> QueuedItem:
+    text = entry.body if isinstance(entry.body, str) else entry.body.text
+    return QueuedItem(entry.nid, text, entry.chat_id, entry.sender, entry.update_id)
+
+
+class TopicQueues:
+    """The message queue of every topic. Thread-safe; holds data only, so it is tested without threads."""
+
+    def __init__(self, max_items: int = QUEUE_MAX) -> None:
+        self._max = max_items
+        self._lock = threading.Lock()  # guards _queues and _busy
+        self._queues: dict[int | str, list[_Entry]] = {}
+        self._busy: set[int | str] = set()  # topics whose runner is running (or about to run)
+
+    def busy(self, thread_id: int | str) -> bool:
+        with self._lock:
+            return thread_id in self._busy
+
+    def reserve(self, thread_id: int | str, chat_id: int | str, sender: str, update_id: int | None,
+                quiet: bool = False) -> Delivery:
+        """Put a placeholder at the back of the topic's queue, so a media message keeps its place while its download
+        and transcription run. An idle topic is marked busy here, and the caller starts its runner (STARTED). A quiet
+        place behind a running turn is not announced when it is filled, so its placeholder is not busy."""
+        nid = _new_id()
+        with self._lock:
+            queue = self._queues.setdefault(thread_id, [])
+            if len(queue) >= self._max:
+                return Delivery(Admission.FULL)
+            busy = thread_id in self._busy
+            queue.append(_Entry(nid, Placeholder(busy and not quiet), chat_id, sender, update_id))
+            if busy:
+                return Delivery(Admission.RESERVED, nid, len(queue))
+            self._busy.add(thread_id)
+            return Delivery(Admission.STARTED, nid, len(queue))
+
+    def deliver(self, thread_id: int | str, chat_id: int | str, sender: str, update_id: int | None, text: str,
+                reserved: str | None = None, images: tuple[str, ...] = (), quiet: bool = False) -> Delivery:
+        """Hand over a message's text and images. With reserved, the placeholder of that id is filled in place.
+        Otherwise the message joins the back of the queue: behind a running turn (QUEUED, or FULL at QUEUE_MAX), or as
+        the first message of an idle topic (STARTED). A quiet message behind a running turn is HANDED instead of QUEUED:
+        the caller tells nobody and starts no runner, because the kept session will take it. A reserved id that is no
+        longer queued (its place was released) is queued as new."""
+        nid = _new_id()
+        with self._lock:
+            queue = self._queues.setdefault(thread_id, [])
+            idx = self._index_of(queue, reserved) if reserved is not None else None
+            if idx is not None:
+                entry = queue[idx]
+                if isinstance(entry.body, Placeholder):
+                    entry.body.text = text
+                    entry.body.images = images
+                    entry.body.ev.set()
+                    return Delivery(Admission.FILLED, entry.nid, idx + 1, entry.body.busy)
+            if thread_id in self._busy:
+                if len(queue) >= self._max:
+                    return Delivery(Admission.FULL)
+                queue.append(_Entry(nid, text, chat_id, sender, update_id, images))
+                if quiet:
+                    return Delivery(Admission.HANDED, nid, len(queue))
+                return Delivery(Admission.QUEUED, nid, len(queue))
+            queue.append(_Entry(nid, text, chat_id, sender, update_id, images))
+            self._busy.add(thread_id)
+            return Delivery(Admission.STARTED, nid, len(queue))
+
+    def unreserve(self, thread_id: int | str, nid: str | None) -> bool:
+        """Remove a placeholder that will never be filled (its download failed, or it timed out). Wakes a runner that
+        waits on it. True when this call removed it; False for None, an unknown id or one already filled."""
+        if nid is None:
+            return False
+        with self._lock:
+            queue = self._queues.get(thread_id) or []
+            for i, entry in enumerate(queue):
+                if entry.nid == nid and isinstance(entry.body, Placeholder) and entry.body.text is None:
+                    queue.pop(i)
+                    entry.body.ev.set()
+                    return True
+        return False
+
+    def to_front(self, thread_id: int | str, nid: str) -> bool:
+        """Move a queued message to the front (⏭ Now and ⏩ Next). False when it is not queued."""
+        with self._lock:
+            queue = self._queues.get(thread_id) or []
+            idx = self._index_of(queue, nid)
+            if idx is None:
+                return False
+            queue.insert(0, queue.pop(idx))
+            return True
+
+    def drop(self, thread_id: int | str, nid: str) -> QueuedItem | None:
+        """Remove a queued message (❌ Drop) and return it, or None when it is not queued. A placeholder is woken so
+        the runner does not wait for it."""
+        with self._lock:
+            queue = self._queues.get(thread_id) or []
+            idx = self._index_of(queue, nid)
+            if idx is None:
+                return None
+            entry = queue.pop(idx)
+            if isinstance(entry.body, Placeholder):
+                entry.body.ev.set()
+            return _snapshot(entry)
+
+    def drain(self, thread_id: int | str) -> tuple[QueuedItem, ...]:
+        """Removes every queued message of a topic (a topic removal) and returns copies of them, in queue order.
+        Placeholders are woken so no runner waits on them."""
+        with self._lock:
+            queue = self._queues.pop(thread_id, None) or []
+            for entry in queue:
+                if isinstance(entry.body, Placeholder):
+                    entry.body.ev.set()
+            return tuple(_snapshot(entry) for entry in queue)
+
+    def clear(self, thread_id: int | str) -> int:
+        """Removes every queued message of a topic. Returns how many were removed."""
+        return len(self.drain(thread_id))
+
+    def snapshot(self, thread_id: int | str) -> tuple[QueuedItem, ...]:
+        """Copies of the queued messages of a topic, in queue order."""
+        with self._lock:
+            return tuple(_snapshot(entry) for entry in self._queues.get(thread_id) or [])
+
+    def take_head(self, thread_id: int | str, keep_busy: bool = False) -> _Head:
+        """The next message for the runner. An unfilled placeholder at the head is left in place (WAIT). Otherwise the
+        head is removed and returned (READY). An empty queue ends the topic's busy state (EMPTY), unless keep_busy is
+        set: the runner then hands the topic to a kept idle session, which stays busy until its next turn ends."""
+        with self._lock:
+            queue = self._queues.get(thread_id) or []
+            if not queue:
+                if not keep_busy:
+                    self._busy.discard(thread_id)
+                return _Head(_HeadKind.EMPTY)
+            entry = queue[0]
+            if isinstance(entry.body, Placeholder) and entry.body.text is None:
+                return _Head(_HeadKind.WAIT, entry)
+            queue.pop(0)
+            if isinstance(entry.body, str):
+                return _Head(_HeadKind.READY, entry, entry.body, entry.images)
+            return _Head(_HeadKind.READY, entry, entry.body.text, entry.body.images)
+
+    @staticmethod
+    def _index_of(queue: list[_Entry], nid: str | None) -> int | None:
+        return next((i for i, entry in enumerate(queue) if entry.nid == nid), None)

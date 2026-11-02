@@ -213,6 +213,8 @@ class TurnState:
                 raise RuntimeError("the turn was started twice")
             self._t0 = self._clock.monotonic()
             self._active.start()
+            if self._phase is TurnPhase.WAITING_APPROVAL:  # a card arrived before the start: the timer waits for it too
+                self._active.pause()
 
     def mark_running(self) -> None:
         """After send_user(). Only moves STARTING to RUNNING: a card that arrived first has already moved the turn on."""

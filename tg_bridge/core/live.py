@@ -1,8 +1,9 @@
-"""LiveRegistry: sessions, feeds, aborted, stop_taps, shutting_down (one lock).
+"""LiveRegistry: sessions, feeds, aborted, stop_taps, lingering, shutting_down (one lock).
 
 Port of the live registries of tg-bridge.py (old _popen_lk and the sets and maps it guards): thread id -> the live
 agent session, thread id -> the turn's progress feed, the threads whose turn was stopped on purpose, the threads
-stopped by a feed Stop button, and the shutdown flag.
+stopped by a feed Stop button, and the shutdown flag. The lingering map holds the sessions kept open after a turn for
+background work (one per topic, counted against the session cap); it is part of the shutdown snapshot.
 
 Lock rule: every read and write of these maps happens under self._lock. The lock is never held across a call into
 another service (a session stop, a Telegram send): callers copy what they need and act after the lock is released.
@@ -41,6 +42,7 @@ class LiveRegistry:
         self._feeds: dict[int, Any] = {}
         self._aborted: set[int] = set()
         self._stop_taps: set[int] = set()
+        self._lingering: dict[int, AgentSession] = {}
         self._shutting_down = threading.Event()
 
     def begin_turn(self, thread_id: int, session: AgentSession, feed: Any) -> bool:
@@ -96,12 +98,42 @@ class LiveRegistry:
             self._stop_taps.discard(thread_id)
             return flags
 
+    def begin_linger(self, thread_id: int, session: AgentSession, limit: int) -> bool:
+        """Keep a session open for a topic after its turn. False (nothing stored) once shutdown has begun, or when
+        limit other topics already keep a session. A topic that lingers again replaces its own entry."""
+        with self._lock:
+            if self._shutting_down.is_set():
+                return False
+            others = sum(1 for held in self._lingering if held != thread_id)
+            if others >= limit:
+                return False
+            self._lingering[thread_id] = session
+            return True
+
+    def end_linger(self, thread_id: int, session: AgentSession) -> None:
+        """Forget a kept session. Removed only when the entry still holds this exact session."""
+        with self._lock:
+            if self._lingering.get(thread_id) is session:
+                del self._lingering[thread_id]
+
+    def lingering(self, thread_id: int) -> AgentSession | None:
+        """The session kept open for a topic, or None."""
+        with self._lock:
+            return self._lingering.get(thread_id)
+
+    def lingering_count(self) -> int:
+        with self._lock:
+            return len(self._lingering)
+
     def is_shutting_down(self) -> bool:
         return self._shutting_down.is_set()
 
     def begin_shutdown(self) -> list[AgentSession]:
-        """Set the shutdown flag and return the sessions live at this moment. Under the same lock as begin_turn, so no
-        session can start after the snapshot is taken."""
+        """Set the shutdown flag and return the sessions live at this moment, running and lingering ones, each once
+        (by identity). Under the same lock as begin_turn, so no session can start after the snapshot is taken."""
         with self._lock:
             self._shutting_down.set()
-            return list(self._sessions.values())
+            by_identity: dict[int, AgentSession] = {}
+            for session in list(self._sessions.values()) + list(self._lingering.values()):
+                by_identity.setdefault(id(session), session)
+            return list(by_identity.values())

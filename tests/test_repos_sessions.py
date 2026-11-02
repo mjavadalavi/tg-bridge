@@ -183,6 +183,28 @@ class ThreadOfNameTests(RepoCase):
         self.assertIsNone(self.sessions.thread_of(None))
 
 
+class BoundUuidsTests(RepoCase):
+    """bound_uuids: the current uuids of the other topics, for the /resume list (one query)."""
+
+    def test_bound_uuids_are_the_current_uuids_of_the_other_topics(self) -> None:
+        self.sessions.ensure(7, "a", CLAUDE_CMD, "")
+        self.sessions.ensure(8, "b", CLAUDE_CMD, "")
+        self.sessions.ensure(9, "c", CLAUDE_CMD, "")
+        self.sessions.set_uuid(7, "uuid-7")
+        self.sessions.set_uuid(8, "uuid-8")
+        self.assertEqual(self.sessions.bound_uuids(7), {"uuid-8"})
+        self.assertEqual(self.sessions.bound_uuids(8), {"uuid-7"})
+        self.assertEqual(self.sessions.bound_uuids(9), {"uuid-7", "uuid-8"})
+
+    def test_a_previous_uuid_and_an_empty_uuid_are_not_bound(self) -> None:
+        self.sessions.ensure(7, "a", CLAUDE_CMD, "")
+        self.sessions.ensure(8, "b", CLAUDE_CMD, "")
+        self.sessions.set_uuid(8, "uuid-8")
+        self.sessions.new_session(8)
+        self.assertEqual(self.sessions.bound_uuids(7), set())
+        self.assertEqual(self.sessions.bound_uuids(0), set())
+
+
 class SessionSettersTests(RepoCase):
     def setUp(self) -> None:
         super().setUp()
@@ -347,8 +369,48 @@ class NestedTransactionTests(RepoCase):
         self.assertIsNone(self.history.find(7, "u1"))
 
 
-if __name__ == "__main__":
-    unittest.main()
+class HistoryRememberDiskFillTests(RepoCase):
+    """remember_disk fills a blank folder or launcher on an existing row and changes nothing else on it."""
+
+    def test_a_blank_launcher_and_folder_on_an_existing_row_are_filled_from_disk(self) -> None:
+        self.history.note_session(7, "s1", "from a turn")
+        self.history.remember_disk(7, "s1", started=STAMP, first_text="disk title", cwd="/work/a",
+                                   launcher=CLAUDE_CMD, backend="claude")
+        row = self.history.find(7, "s1")
+        self.assertEqual((row.launcher, row.cwd), (CLAUDE_CMD, os.path.realpath("/work/a")))
+        self.assertEqual((row.first_text, row.started), ("from a turn", utc_stamp(DEFAULT_START)))
+
+    def test_a_folder_and_launcher_already_recorded_are_not_overwritten(self) -> None:
+        self.history.note_session(7, "s2", "from a turn", cwd="/work/x", launcher=CLAUDE_CMD)
+        self.history.remember_disk(7, "s2", started=STAMP, first_text="disk", cwd="/work/y", launcher="other run",
+                                   backend="claude")
+        row = self.history.find(7, "s2")
+        self.assertEqual((row.launcher, row.cwd), (CLAUDE_CMD, os.path.realpath("/work/x")))
+
+
+class HistoryListNewestTests(RepoCase):
+    """list_newest: one bounded query, newest start first (id breaks a tie), one backend and one topic."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.history.remember_disk(7, "a", started="2026-03-01T00:00:00+00:00", first_text="", cwd="/w",
+                                   launcher=CLAUDE_CMD, backend="claude")
+        self.history.remember_disk(7, "b", started="2026-01-01T00:00:00+00:00", first_text="", cwd="/w",
+                                   launcher=CLAUDE_CMD, backend="claude")
+        self.history.remember_disk(7, "c", started="2026-03-01T00:00:00+00:00", first_text="", cwd="/w",
+                                   launcher=CLAUDE_CMD, backend="claude")
+        self.history.remember_disk(7, "d", started="2026-06-01T00:00:00+00:00", first_text="", cwd="/w",
+                                   launcher="codex", backend="codex")
+        self.history.remember_disk(8, "e", started="2026-07-01T00:00:00+00:00", first_text="", cwd="/w",
+                                   launcher=CLAUDE_CMD, backend="claude")
+
+    def test_list_newest_orders_by_start_then_id_for_one_backend_and_topic(self) -> None:
+        self.assertEqual([r.uuid for r in self.history.list_newest(7, "claude", 10)], ["c", "a", "b"])
+        self.assertEqual([r.uuid for r in self.history.list_newest(7, "codex", 10)], ["d"])
+        self.assertEqual([r.uuid for r in self.history.list_newest(9, "claude", 10)], [])
+
+    def test_list_newest_is_bounded_by_its_limit(self) -> None:
+        self.assertEqual([r.uuid for r in self.history.list_newest(7, "claude", 2)], ["c", "a"])
 
 
 if __name__ == "__main__":

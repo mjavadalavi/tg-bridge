@@ -17,11 +17,23 @@ arg is the live one: every kind but mo expects a number.
 """
 
 import os
+from collections.abc import Callable
 
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.bot.callbacks.router import CallbackRouter, Tap
 from tg_bridge.bot.commands.info import launcher_state
 from tg_bridge.bot.commands.session import SessionCommands
+from tg_bridge.bot.keep_guard import (
+    KEEP_TOAST_TEXT,
+    WHAT_FOLDER,
+    WHAT_LAUNCHER,
+    WHAT_MODE,
+    WHAT_MODEL,
+    ApplyResult,
+    KeepGuard,
+    applies,
+    same_folder,
+)
 from tg_bridge.bot.live_actions import apply_model, spawn
 from tg_bridge.bot.pickers import (
     KIND_LAUNCHER,
@@ -38,10 +50,10 @@ from tg_bridge.bot.pickers import (
 from tg_bridge.config import Config, tilde
 from tg_bridge.core.cwd import BUSY_TEXT as FOLDER_BUSY_TEXT
 from tg_bridge.core.cwd import KEEP_KIND, PICKER_KIND, SEARCH_KIND, CwdService, cwd_reply
-from tg_bridge.core.launcher_switch import KIND_BUSY, LauncherSwitch
+from tg_bridge.core.launcher_switch import KIND_BUSY, KIND_CHANGED, LauncherSwitch
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.permissions import PermissionService
-from tg_bridge.core.topic_backend import topic_backend, topic_models
+from tg_bridge.core.topic_backend import topic_backend, topic_capabilities, topic_models
 from tg_bridge.logging_ import Logger
 from tg_bridge.store.rules import RuleRepo
 from tg_bridge.store.sessions import SessionRecord, SessionRepo
@@ -63,7 +75,7 @@ class PickerTaps:
 
     def __init__(self, *, config: Config, sessions: SessionRepo, live: LiveRegistry, backends: BackendRegistry,
                  permissions: PermissionService, launchers: LauncherSwitch, stops: SessionCommands,
-                 rules: RuleRepo, folders: CwdService, logger: Logger) -> None:
+                 rules: RuleRepo, folders: CwdService, logger: Logger, keep: KeepGuard | None = None) -> None:
         self._config = config
         self._sessions = sessions
         self._live = live
@@ -74,6 +86,7 @@ class PickerTaps:
         self._rules = rules
         self._folders = folders
         self._logger = logger
+        self._keep = keep  # None: no change waits for a confirm card (section 5 D1)
 
     def register(self, router: CallbackRouter) -> None:
         """Adds the picker kinds to the router: model, mode, launcher, resume, rules (one and all), and the three folder kinds."""
@@ -112,6 +125,38 @@ class PickerTaps:
         picker = rules_picker(thread, self._rules.for_thread(thread))
         tap.edit(picker.text, picker.rows)
 
+    def _held(self, tap: Tap, thread: int, what: str, apply: Callable[[], ApplyResult], same: bool = False) -> bool:
+        """True when the change waits for the confirm card (section 5 D1); the card replaces the picker here then."""
+        card = self._keep.hold(thread, what, apply, same) if self._keep is not None else None
+        if card is None:
+            return False
+        tap.edit(card.text, card.rows)
+        tap.toast(KEEP_TOAST_TEXT)
+        return True
+
+    def _store_model(self, thread: int, stored: str) -> None:
+        """Stores the topic's model and sends it to a running session."""
+        self._sessions.set_model(thread, stored)
+        running = self._live.running(thread)
+        if running is not None:
+            spawn(apply_model, running.session, stored or DEFAULT_MODEL, self._logger)
+
+    def _store_mode(self, thread: int, key: str) -> None:
+        """Stores the topic's mode and sends it to a running turn."""
+        self._sessions.set_mode(thread, key)
+        if self._live.running(thread) is not None:
+            spawn(self._permissions.set_live_mode, thread, key, by=MODE_TAP_BY)
+
+    def _change_launcher(self, thread: int, name: str, target: str) -> tuple[str, str]:
+        """Switches the topic to launcher target; LauncherSwitch returns (kind, reply)."""
+        running = self._live.running(thread)
+        return self._launchers.set(thread, name, running.session if running is not None else None, target)
+
+    def _launcher_change(self, thread: int, name: str, target: str) -> ApplyResult:
+        """The launcher change a card waits for: applied only when the topic changed, else the switch's own reply."""
+        kind, reply = self._change_launcher(thread, name, target)
+        return ApplyResult(kind == KIND_CHANGED, reply)
+
     # --- /model and /mode
 
     def _model(self, tap: Tap) -> None:
@@ -119,16 +164,16 @@ class PickerTaps:
         row = self._row(tap, thread)
         if row is None:
             return
-        backend, models = topic_models(self._config, self._backends, row, row.name)
+        _, models = topic_models(self._config, self._backends, row, row.name)
         if arg not in models:
             tap.toast(NOT_IN_LIST_TEXT)
             return
         stored = "" if arg.lower() == DEFAULT_MODEL else arg
-        self._sessions.set_model(thread, stored)
-        running = self._live.running(thread)
-        if running is not None:
-            spawn(apply_model, running.session, stored or DEFAULT_MODEL, self._logger)
-        picker = model_picker(thread, models, stored or None, backend.capabilities.live_model)
+        if self._held(tap, thread, WHAT_MODEL, applies(lambda: self._store_model(thread, stored)), stored == row.model):
+            return
+        self._store_model(thread, stored)
+        caps = topic_capabilities(self._config, self._backends, row, row.name)
+        picker = model_picker(thread, models, stored or None, caps.live_model)
         tap.toast(MODEL_SET_TEXT.format(model=stored or DEFAULT_MODEL))
         tap.edit(picker.text, picker.rows)
 
@@ -143,10 +188,11 @@ class PickerTaps:
             tap.toast(NOT_IN_LIST_TEXT)
             return
         key = modes[index].key
-        self._sessions.set_mode(thread, key)
-        if self._live.running(thread) is not None:
-            spawn(self._permissions.set_live_mode, thread, key, by=MODE_TAP_BY)
-        picker = mode_picker(thread, modes, key, backend.capabilities.live_mode)
+        if self._held(tap, thread, WHAT_MODE, applies(lambda: self._store_mode(thread, key)), key == row.mode):
+            return
+        self._store_mode(thread, key)
+        caps = topic_capabilities(self._config, self._backends, row, row.name)
+        picker = mode_picker(thread, modes, key, caps.live_mode)
         tap.toast(MODE_SET_TEXT.format(mode=key))
         tap.edit(picker.text, picker.rows)
 
@@ -161,9 +207,13 @@ class PickerTaps:
         if index is None or index >= len(specs):
             tap.toast(NOT_IN_LIST_TEXT)
             return
-        running = self._live.running(thread)
-        kind, reply = self._launchers.set(thread, row.name, running.session if running is not None else None,
-                                          specs[index].name)
+        target = specs[index].name
+        # With a turn running, LauncherSwitch refuses (KIND_BUSY) and the tap shows that at once, so no card is posted.
+        # The card's apply returns the reply, which the card shows under its result.
+        if self._live.running(thread) is None and self._held(
+                tap, thread, WHAT_LAUNCHER, lambda: self._launcher_change(thread, row.name, target)):
+            return
+        kind, reply = self._change_launcher(thread, row.name, target)
         tap.toast(reply)
         if kind != KIND_BUSY:  # the same message now shows the launcher in use, with its check mark
             current = self._sessions.get(thread) or row
@@ -201,7 +251,10 @@ class PickerTaps:
 
     def _folder(self, tap: Tap) -> None:
         thread, path_id = self._thread(tap), self._number(tap)
-        if path_id is None or self._row(tap, thread) is None:
+        if path_id is None:
+            return
+        row = self._row(tap, thread)
+        if row is None:
             return
         path = self._folders.path_of(path_id)
         if path is None or not os.path.isdir(path):
@@ -209,6 +262,9 @@ class PickerTaps:
             return
         if self._live.running(thread) is not None:
             tap.toast(FOLDER_BUSY_TEXT)
+            return
+        if self._held(tap, thread, WHAT_FOLDER, lambda: ApplyResult(self._folders.apply(thread, path)),
+                      same_folder(row.cwd, path)):
             return
         changed = self._folders.apply(thread, path)
         tap.toast(cwd_reply(tilde(path, self._config.home), changed))
@@ -219,10 +275,32 @@ class PickerTaps:
         thread, index = self._thread(tap), self._number(tap)
         if index is None:
             return
+        if self._held_search(tap, thread, index):
+            return
         outcome = self._folders.search_tap(self._config, thread, tap.message_id, index)
         tap.toast(outcome.toast)
         if outcome.card_text is not None:
             tap.edit(outcome.card_text)
+
+    def _held_search(self, tap: Tap, thread: int, index: int) -> bool:
+        """True when a search button waits for the confirm card (section 5 D1). Only a button whose folder exists, in a
+        topic that has a session and no running turn, can wait: the others are answered by search_tap as before (no
+        session keeps the folder for the first message, a running turn is refused, a stale button expires). The card's
+        apply runs search_tap later, and that reads the folder list the card's message still has."""
+        found = self._folders.found_list(thread, tap.message_id)
+        if found is None or index >= len(found) or not os.path.isdir(found[index]):
+            return False
+        row = self._sessions.get(thread)
+        if row is None or self._live.running(thread) is not None:
+            return False
+        return self._held(tap, thread, WHAT_FOLDER,
+                          lambda: self._search_change(thread, tap.message_id, index),
+                          same_folder(row.cwd, found[index]))
+
+    def _search_change(self, thread: int, mid: int | None, index: int) -> ApplyResult:
+        """The search-card folder change a card waits for: applied as its outcome says, its toast the reply."""
+        outcome = self._folders.search_tap(self._config, thread, mid, index)
+        return ApplyResult(outcome.applied, outcome.toast)
 
     def _folder_keep(self, tap: Tap) -> None:
         thread = self._thread(tap)

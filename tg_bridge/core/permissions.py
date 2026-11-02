@@ -143,6 +143,12 @@ class PermissionService:
         with self._lock:
             binding.session = session
 
+    def open_asks(self, binding: TurnBinding) -> int:
+        """How many asks of the turn are open now: the count its waiting state follows (a card posted while the session
+        was idle stays open into the next turn of a kept session)."""
+        with self._lock:
+            return binding.waiting
+
     # approval events (called by the turn listener, on the backend reader thread: never blocks on a backend reply)
 
     def handle_request(self, binding: TurnBinding, req: ApprovalRequest) -> None:
@@ -324,9 +330,16 @@ class PermissionService:
                                request_id=req.approval_id, tool_name=req.tool, input=req.input)
         ask = _Ask(nonce=nonce, binding=binding, request=req, session=session, always_rule=always)
         with self._lock:
-            self._asks[nonce] = ask
-            binding.waiting += 1
-            became_waiting = binding.waiting == 1
+            # the turn may have ended during the insert; void_all cannot see this ask then
+            closed = binding.closed
+            if not closed:
+                self._asks[nonce] = ask
+                binding.waiting += 1
+                became_waiting = binding.waiting == 1
+        if closed:
+            self._logger.log(f"ask {nonce}: turn closed during the insert, voided without a card")
+            self._asks_repo.answer(nonce, VOID)
+            return
         if became_waiting:
             self._notify(binding.thread_id, True)
         self._workers.submit(self._post, ask)

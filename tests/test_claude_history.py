@@ -3,7 +3,8 @@
 Scenarios: the transcript is found under the cwd's encoded folder and, failing that, by a scan of every folder; a
 malformed session id finds nothing; thinking blocks are stripped and a message left empty gets a placeholder text;
 an existing destination is replaced only when it is shorter; a failing write leaves no temp file; a failure is logged
-and never raised.
+and never raised. Card F1-index: with a symlinked cwd, the newer of the two cwd-folder copies is returned, and on an equal
+mtime the copy the session listing shows is the one returned.
 """
 
 import json
@@ -12,10 +13,12 @@ import unittest
 from unittest import mock
 
 from tests.support import TempHome
+from tg_bridge.agents.claude import sessions_index
 from tg_bridge.agents.claude.backend import ClaudeBackend
 from tg_bridge.agents.claude.history import (
     carry_history,
     copy_transcript,
+    cwd_transcript_path,
     encoded_cwd,
     strip_thinking_line,
     transcript_path,
@@ -294,6 +297,45 @@ class CarryHistoryTests(HistoryTestCase):
         self.assertIn("history copy for " + SID + " failed: boom", self.log_text())
 
 
+class NewestCopyTests(HistoryTestCase):
+    """Card F1-index (b): when the realpath and the abspath (symlink) folder both hold the id, the newer copy is the one
+    transcript_path returns, and the copy the session listing shows is the same file."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.link = os.path.join(self.real_home, "link-to-work")
+        os.symlink(self.cwd, self.link)
+        self.real_folder = encoded_cwd(self.cwd)
+        self.link_folder = encoded_cwd(self.link)
+
+    def put_copy(self, folder: str, prompt_text: str, mtime: float) -> str:
+        line = {"type": "user", "message": {"role": "user", "content": prompt_text}}
+        path = self.put_transcript(self.cfg_a, folder, text=json.dumps(line) + "\n")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def test_newer_copy_in_the_symlink_folder_is_returned(self) -> None:
+        self.put_copy(self.real_folder, "old real copy", 1000.0)
+        link_copy = self.put_copy(self.link_folder, "new link copy", 2000.0)
+        self.assertEqual(transcript_path(self.cfg_a, self.link, SID), link_copy)
+
+    def test_newer_copy_in_the_realpath_folder_is_returned(self) -> None:
+        real_copy = self.put_copy(self.real_folder, "new real copy", 2000.0)
+        self.put_copy(self.link_folder, "old link copy", 1000.0)
+        self.assertEqual(transcript_path(self.cfg_a, self.link, SID), real_copy)
+
+    def test_equal_mtime_picks_the_copy_the_listing_shows(self) -> None:
+        real_copy = self.put_copy(self.real_folder, "copy in the real folder", 1500.0)
+        link_copy = self.put_copy(self.link_folder, "copy in the link folder", 1500.0)
+        picked = transcript_path(self.cfg_a, self.link, SID)
+        self.assertEqual(picked, max(real_copy, link_copy))
+        listed = sessions_index.list_sessions(self.cfg_a, self.link, 5)
+        self.assertEqual([s.uuid for s in listed], [SID])
+        with open(picked, encoding="utf-8") as handle:
+            shown = json.loads(handle.readline())["message"]["content"]
+        self.assertEqual(listed[0].title, shown)
+
+
 class ClaudeBackendCarryTests(HistoryTestCase):
     def spec(self, name: str, config_dir: str) -> LauncherSpec:
         return LauncherSpec(name=name, backend="claude", command=name, argv=(name,), config_dir=config_dir)
@@ -309,6 +351,33 @@ class ClaudeBackendCarryTests(HistoryTestCase):
         backend = ClaudeBackend(logger=self.logger, clock=FakeClock())
         self.assertFalse(backend.carry_history(self.spec("a", self.cfg_a), self.spec("b", self.cfg_b),
                                                self.cwd, SID, dst_cwd=self.cwd))
+
+
+class CwdOnlyHasTranscriptTests(HistoryTestCase):
+    """has_transcript answers for the cwd's own folder only; the fallback scan of transcript_path does not count."""
+
+    def spec(self) -> LauncherSpec:
+        return LauncherSpec(name="a", backend="claude", command="a", argv=("a",), config_dir=self.cfg_a)
+
+    def test_transcript_under_another_cwds_folder_of_the_same_config_dir_is_not_held(self) -> None:
+        self.put_transcript(self.cfg_a, "-some-other-cwd")
+        backend = ClaudeBackend(logger=self.logger, clock=FakeClock())
+        self.assertIsNotNone(transcript_path(self.cfg_a, self.cwd, SID), "the fallback scan still finds it")
+        self.assertIsNone(cwd_transcript_path(self.cfg_a, self.cwd, SID))
+        self.assertFalse(backend.has_transcript(self.spec(), self.cwd, SID))
+
+    def test_transcript_in_the_cwds_own_folder_is_held(self) -> None:
+        self.put_transcript(self.cfg_a, encoded_cwd(self.cwd))
+        backend = ClaudeBackend(logger=self.logger, clock=FakeClock())
+        self.assertTrue(backend.has_transcript(self.spec(), self.cwd, SID))
+
+    def test_nothing_held_for_a_malformed_id_or_a_missing_config_dir(self) -> None:
+        self.put_transcript(self.cfg_a, encoded_cwd(self.cwd), sid="bad")
+        backend = ClaudeBackend(logger=self.logger, clock=FakeClock())
+        self.assertFalse(backend.has_transcript(self.spec(), self.cwd, "../" + SID))
+        self.assertFalse(backend.has_transcript(self.spec(), self.cwd, SID))
+        self.assertFalse(backend.has_transcript(LauncherSpec(name="a", backend="claude", command="a", argv=("a",),
+                                                             config_dir=""), self.cwd, SID))
 
 
 if __name__ == "__main__":

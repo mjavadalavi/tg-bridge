@@ -111,6 +111,17 @@ class Slot:
         self._held = True
         return True
 
+    def take_for(self, timeout: float) -> bool:
+        """Wait up to timeout seconds for a permit, as one blocking slice. True: held (also when already held). False:
+        no permit came within timeout and none was taken. Unlike take() it does not announce the queue and does not
+        check shutdown, so the caller owns those between slices."""
+        if self._held:
+            return True
+        if self._pool.acquire_permit(timeout=timeout):
+            self._held = True
+            return True
+        return False
+
     def give_back(self) -> None:
         """Release the permit while the turn waits for a person (a permission card). No-op when not held."""
         if self._held:

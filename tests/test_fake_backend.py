@@ -4,9 +4,13 @@ These tests pin the fake that every turn-level test (TurnRunner, permissions, fe
 means the fake is wrong, not the service under test.
 """
 
+import threading
+import time
 import unittest
+from unittest import mock
 
-from tests.fakes.backend import FakeBackend, RecordingSink, WaitForInterrupt, fake_spec
+from tests.fakes import backend as fake_backend
+from tests.fakes.backend import FakeBackend, Later, RecordingSink, WaitForInterrupt, fake_spec
 from tg_bridge.agents.events import (
     ApprovalRequest,
     Decision,
@@ -14,6 +18,7 @@ from tg_bridge.agents.events import (
     TextEvent,
     ToolEnd,
     ToolStart,
+    TurnBegan,
     TurnResult,
     TurnStatus,
 )
@@ -210,6 +215,133 @@ class InterruptAndStopTests(unittest.TestCase):
         self.assertTrue(session.set_mode("plan"))
         self.assertTrue(session.set_model("m2"))
         self.assertEqual(session.calls[-2:], [("set_mode", "plan"), ("set_model", "m2")])
+
+
+class LaterTests(unittest.TestCase):
+    def test_later_waits_for_its_gate_then_emits_turn_began_and_items(self) -> None:
+        gate = threading.Event()
+        later = Later(gate=gate, items=(TextEvent(text="background done"), TurnResult(TurnStatus.OK, answer="bg")))
+        backend = FakeBackend([[TextEvent(text="user"), TurnResult(TurnStatus.OK, answer="user answer"), later]])
+        sink = RecordingSink()
+        session = _started_session(backend, sink)
+        session.send_user("start")
+        self.assertTrue(session.wait_idle())
+        self.assertFalse(sink.wait_for(lambda e: isinstance(e, TurnBegan), timeout=0.2),
+                         "the gate is not set, so the self turn must not begin")
+        gate.set()
+        self.assertTrue(sink.wait_for(lambda e: isinstance(e, TurnBegan)))
+        self.assertTrue(session.wait_idle())
+        self.assertEqual(sink.events[1:], [
+            TextEvent(text="user"),
+            TurnResult(TurnStatus.OK, answer="user answer"),
+            TurnBegan(origin="task-notification"),
+            TextEvent(text="background done"),
+            TurnResult(TurnStatus.OK, answer="bg"),
+        ])
+
+    def test_stop_before_the_gate_plays_nothing(self) -> None:
+        for ending in ("stop", "end_gracefully"):
+            with self.subTest(ending=ending):
+                gate = threading.Event()
+                later = Later(gate=gate, items=(TextEvent(text="late"), TurnResult(TurnStatus.OK, answer="late")))
+                backend = FakeBackend([[TurnResult(TurnStatus.OK, answer="user"), later]])
+                sink = RecordingSink()
+                session = _started_session(backend, sink)
+                session.send_user("start")
+                self.assertTrue(session.wait_idle())
+                if ending == "stop":
+                    session.stop(grace=2.0)
+                else:
+                    session.end_gracefully(1.0)
+                gate.set()
+                # wait_idle() is true while the Later waits, so give the Later time to notice the gate first
+                self.assertFalse(sink.wait_for(lambda e: isinstance(e, TurnBegan), timeout=0.3),
+                                 "a closed session must not start the Later's turn")
+                self.assertTrue(session.wait_idle())
+                self.assertEqual(sink.events[1:], [TurnResult(TurnStatus.OK, answer="user")])
+
+    def test_a_timed_out_later_leaves_a_user_turn_busy(self) -> None:
+        # the Later's wait ends (WAIT_SECONDS) while a user turn started after it still runs: that turn keeps its busy flag
+        with mock.patch.object(fake_backend, "WAIT_SECONDS", 3.0):
+            later = Later(gate=threading.Event(), items=(TurnResult(TurnStatus.OK, answer="never"),))
+            backend = FakeBackend([[TurnResult(TurnStatus.OK, answer="user one"), later],
+                                   [WaitForInterrupt(), TurnResult(TurnStatus.OK, answer="never")]])
+            sink = RecordingSink()
+            session = _started_session(backend, sink)
+            session.send_user("one")
+            self.assertTrue(session.wait_idle())
+            time.sleep(1.0)  # the Later's deadline (3 s from the wait's start) falls after this line
+            session.send_user("two")
+            self.assertTrue(sink.wait_for(lambda e: isinstance(e, TurnResult) and e.status is TurnStatus.ERROR,
+                                          timeout=6.0), "the Later must time out")
+            with self.assertRaisesRegex(RuntimeError, "already has a turn running"):
+                session.send_user("three")
+            self.assertTrue(session.interrupt())
+            self.assertTrue(session.wait_idle())
+        self.assertEqual(sink.events[-1].status, TurnStatus.INTERRUPTED)
+
+    def test_send_user_during_a_later_turn_raises(self) -> None:
+        gate = threading.Event()
+        later = Later(gate=gate, items=(WaitForInterrupt(), TurnResult(TurnStatus.OK, answer="never")))
+        backend = FakeBackend([[TurnResult(TurnStatus.OK, answer="user"), later]])
+        sink = RecordingSink()
+        session = _started_session(backend, sink)
+        session.send_user("start")
+        self.assertTrue(session.wait_idle())
+        gate.set()
+        self.assertTrue(sink.wait_for(lambda e: isinstance(e, TurnBegan)))
+        with self.assertRaises(RuntimeError):
+            session.send_user("while the self turn runs")
+        self.assertTrue(session.interrupt())
+        self.assertTrue(session.wait_idle())
+        self.assertEqual(sink.events[-1].status, TurnStatus.INTERRUPTED)
+
+    def test_session_is_idle_between_the_turn_and_its_later(self) -> None:
+        gate = threading.Event()
+        later = Later(gate=gate, items=(TurnResult(TurnStatus.OK, answer="later"),))
+        backend = FakeBackend([[TurnResult(TurnStatus.OK, answer="user one"), later],
+                               [TurnResult(TurnStatus.OK, answer="user two")]])
+        sink = RecordingSink()
+        session = _started_session(backend, sink)
+        session.send_user("one")
+        self.assertTrue(session.wait_idle())
+        self.assertEqual(backend.turns_left(), 1, "the Later is not a scripted turn of its own")
+        session.send_user("two")  # idle, so a user turn may start while the Later waits for its gate
+        self.assertTrue(session.wait_idle())
+        gate.set()
+        self.assertTrue(sink.wait_for(lambda e: isinstance(e, TurnBegan)))
+        self.assertTrue(session.wait_idle())
+        self.assertEqual(sink.events[1:], [
+            TurnResult(TurnStatus.OK, answer="user one"),
+            TurnResult(TurnStatus.OK, answer="user two"),
+            TurnBegan(origin="task-notification"),
+            TurnResult(TurnStatus.OK, answer="later"),
+        ])
+
+    def test_chained_later_waits_for_each_gate(self) -> None:
+        first_gate, second_gate = threading.Event(), threading.Event()
+        second = Later(gate=second_gate, items=(TurnResult(TurnStatus.OK, answer="second"),), origin="scheduled")
+        first = Later(gate=first_gate, items=(TurnResult(TurnStatus.OK, answer="first"), second))
+        backend = FakeBackend([[TurnResult(TurnStatus.OK, answer="user"), first]])
+        sink = RecordingSink()
+        session = _started_session(backend, sink)
+        session.send_user("start")
+        self.assertTrue(session.wait_idle())
+        first_gate.set()
+        self.assertTrue(sink.wait_for(lambda e: isinstance(e, TurnResult) and e.answer == "first"))
+        self.assertTrue(session.wait_idle())
+        self.assertFalse(sink.wait_for(lambda e: isinstance(e, TurnBegan) and e.origin == "scheduled", timeout=0.2))
+        second_gate.set()
+        self.assertTrue(sink.wait_for(lambda e: isinstance(e, TurnBegan) and e.origin == "scheduled"))
+        self.assertTrue(session.wait_idle())
+        self.assertEqual(sink.events[-1], TurnResult(TurnStatus.OK, answer="second"))
+
+    def test_later_must_be_the_last_item_of_its_turn(self) -> None:
+        gate = threading.Event()
+        with self.assertRaises(ValueError):
+            FakeBackend([[Later(gate=gate, items=()), TurnResult(TurnStatus.OK, answer="after")]])
+        with self.assertRaises(ValueError):
+            FakeBackend([[Later(gate=gate, items=(Later(gate=gate, items=()), TextEvent(text="after")))]])
 
 
 if __name__ == "__main__":

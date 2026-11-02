@@ -1,9 +1,14 @@
 {
   "allow_user_ids": [123456789],
   "default_mode": "bypassPermissions",
+  "linger_seconds": 1800,
+  "linger_max_sessions": 3,
+  "topic_probe_seconds": 600,
+  "tui_size": "200x50",
   "launchers": {
     "claude": {"cmd": "claude", "config_dir": "~/.claude"},
-    "fast": {"cmd": "claude --model haiku", "config_dir": "~/.claude"}
+    "fast": {"cmd": "claude --model haiku", "config_dir": "~/.claude"},
+    "teamclaude": {"cmd": "teamclaude run", "config_dir": "~/.claude-team", "transport": "tui"}
   },
   "agent_launchers": {
     "codex": {"backend": "codex", "command": "codex", "config_dir": "~/.codex"}

@@ -12,24 +12,37 @@ and the /cwd branch with apply_cwd). The reply texts are the live ones. The rule
 - /launcher is settled by LauncherSwitch (carry-over, handoff or a fresh session). This module only checks the name.
 - /cwd is refused while a turn runs. A folder that exists becomes the topic's folder through CwdService.apply; a path
   that is not a folder is said aloud, never searched; a bare name starts a folder search through CwdService.
+- With a kept session that has background work pending (section 5 D1), a change that would close it (mode, model,
+  launcher, folder) posts the confirm card through KeepGuard instead and is applied only when the card says yes.
 
 The commands run on the poll thread, so every reply goes through CommandContext (the ordered out-worker).
 """
 
 import os
+from collections.abc import Callable
 
 from tg_bridge.agents.base import AgentBackend
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.bot.commands.base import Command, CommandContext, CommandRegistry
 from tg_bridge.bot.commands.info import launcher_state
+from tg_bridge.bot.keep_guard import (
+    WHAT_FOLDER,
+    WHAT_LAUNCHER,
+    WHAT_MODE,
+    WHAT_MODEL,
+    ApplyResult,
+    KeepGuard,
+    applies,
+    same_folder,
+)
 from tg_bridge.bot.live_actions import apply_model, spawn
 from tg_bridge.bot.pickers import launcher_picker, mode_picker, model_picker
 from tg_bridge.config import Config
 from tg_bridge.core.cwd import CwdService, cwd_reply
-from tg_bridge.core.launcher_switch import LauncherSwitch
+from tg_bridge.core.launcher_switch import KIND_CHANGED, LauncherSwitch
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.permissions import PermissionService
-from tg_bridge.core.topic_backend import topic_backend, topic_models
+from tg_bridge.core.topic_backend import topic_backend, topic_capabilities, topic_models
 from tg_bridge.logging_ import Logger
 from tg_bridge.store.sessions import SessionRecord, SessionRepo
 
@@ -56,7 +69,7 @@ class SettingsCommands:
 
     def __init__(self, *, config: Config, sessions: SessionRepo, live: LiveRegistry, backends: BackendRegistry,
                  permissions: PermissionService, launchers: LauncherSwitch, cwd: CwdService,
-                 logger: Logger) -> None:
+                 logger: Logger, keep: KeepGuard | None = None) -> None:
         self._config = config
         self._sessions = sessions
         self._live = live
@@ -65,6 +78,7 @@ class SettingsCommands:
         self._launchers = launchers
         self._folders = cwd
         self._logger = logger
+        self._keep = keep  # None: no session is kept by this bridge, so no change waits for a card
 
     def register(self, registry: CommandRegistry) -> None:
         """Adds /mode, /model, /launcher and /cwd to the registry."""
@@ -95,6 +109,28 @@ class SettingsCommands:
                 return choice.key
         return None
 
+    def _held(self, ctx: CommandContext, what: str, apply: Callable[[], ApplyResult], same: bool = False) -> bool:
+        """True when the change waits for the confirm card (section 5 D1); the card is posted here then."""
+        card = self._keep.hold(ctx.thread_id, what, apply, same) if self._keep is not None else None
+        if card is None:
+            return False
+        ctx.say_buttons(card.text, card.rows)
+        return True
+
+    def _store_mode(self, thread: int, mode: str) -> None:
+        """Stores the topic's mode and sends it to a running turn (the change the card waits for, or applies at once)."""
+        self._sessions.set_mode(thread, mode)
+        if self._live.running(thread) is not None:
+            spawn(self._permissions.set_live_mode, thread, mode, by=MODE_LIVE_BY)
+
+    def _store_model(self, thread: int, model: str) -> bool:
+        """Stores the topic's model and sends it to a running session. True when a turn runs."""
+        self._sessions.set_model(thread, model)
+        running = self._live.running(thread)
+        if running is not None:
+            spawn(apply_model, running.session, model or DEFAULT_MODEL, self._logger)
+        return running is not None
+
     # --- /mode
 
     def _mode(self, ctx: CommandContext, args: str) -> None:
@@ -103,20 +139,21 @@ class SettingsCommands:
             ctx.say(NO_SESSION_TEXT)
             return
         backend = self._backend_of(row)
-        running = self._live.running(ctx.thread_id) is not None
+        caps = topic_capabilities(self._config, self._backends, row, row.name)
         if not args:
             current = row.mode or self._config.default_mode()
-            picker = mode_picker(ctx.thread_id, backend.modes(), current, backend.capabilities.live_mode)
+            picker = mode_picker(ctx.thread_id, backend.modes(), current, caps.live_mode)
             ctx.say_buttons(picker.text, picker.rows)
             return
         mode = self._mode_key(backend, args)
         if mode is None:
             ctx.say(MODE_USAGE_TEXT)
             return
-        self._sessions.set_mode(ctx.thread_id, mode)
-        if running:
-            spawn(self._permissions.set_live_mode, ctx.thread_id, mode, by=MODE_LIVE_BY)
-        suffix = self._live_suffix(running, backend.capabilities.live_mode)
+        if self._held(ctx, WHAT_MODE, applies(lambda: self._store_mode(ctx.thread_id, mode)), mode == row.mode):
+            return
+        running = self._live.running(ctx.thread_id) is not None
+        self._store_mode(ctx.thread_id, mode)
+        suffix = self._live_suffix(running, caps.live_mode)
         ctx.say(MODE_SET_TEXT.format(mode=mode) + suffix)
 
     # --- /model
@@ -126,20 +163,20 @@ class SettingsCommands:
         if row is None:
             ctx.say(NO_SESSION_TEXT)
             return
-        backend, models = topic_models(self._config, self._backends, row, row.name)
+        _, models = topic_models(self._config, self._backends, row, row.name)
+        caps = topic_capabilities(self._config, self._backends, row, row.name)
         if not args:
-            picker = model_picker(ctx.thread_id, models, row.model or None, backend.capabilities.live_model)
+            picker = model_picker(ctx.thread_id, models, row.model or None, caps.live_model)
             if picker.rows:
                 ctx.say_buttons(picker.text, picker.rows)
             else:
                 ctx.say(picker.text)
             return
         model = "" if args.lower() == CLEAR_WORD else args
-        self._sessions.set_model(ctx.thread_id, model)
-        running = self._live.running(ctx.thread_id)
-        if running is not None:
-            spawn(apply_model, running.session, model or DEFAULT_MODEL, self._logger)
-        suffix = self._live_suffix(running is not None, backend.capabilities.live_model)
+        if self._held(ctx, WHAT_MODEL, applies(lambda: self._store_model(ctx.thread_id, model)), model == row.model):
+            return
+        running = self._store_model(ctx.thread_id, model)
+        suffix = self._live_suffix(running, caps.live_model)
         ctx.say(MODEL_SET_TEXT.format(model=model or DEFAULT_MODEL) + suffix)
 
     # --- /launcher
@@ -159,10 +196,22 @@ class SettingsCommands:
         if args not in names:
             ctx.say(UNKNOWN_LAUNCHER_TEXT.format(name=args, names=", ".join(names)))
             return
-        running = self._live.running(ctx.thread_id)
+        # With a turn running, LauncherSwitch.set refuses (KIND_BUSY) and the reply says so at once: no card then.
+        if self._live.running(ctx.thread_id) is None and self._held(
+                ctx, WHAT_LAUNCHER, lambda: self._launcher_change(ctx.thread_id, ctx.topic, args)):
+            return
+        ctx.say(self._set_launcher(ctx.thread_id, ctx.topic, args)[1])
+
+    def _set_launcher(self, thread: int, topic: str, name: str) -> tuple[str, str]:
+        """Switches the topic to launcher name (LauncherSwitch decides the session); (kind, reply)."""
+        running = self._live.running(thread)
         session = running.session if running is not None else None
-        _, reply = self._launchers.set(ctx.thread_id, ctx.topic, session, args)
-        ctx.say(reply)
+        return self._launchers.set(thread, topic, session, name)
+
+    def _launcher_change(self, thread: int, topic: str, name: str) -> ApplyResult:
+        """The launcher change a card waits for: applied only when the topic changed, else the switch's own reply."""
+        kind, reply = self._set_launcher(thread, topic, name)
+        return ApplyResult(kind == KIND_CHANGED, reply)
 
     # --- /cwd
 
@@ -183,6 +232,9 @@ class SettingsCommands:
             return
         path = os.path.realpath(os.path.expanduser(args))
         if os.path.isdir(path):
+            if self._held(ctx, WHAT_FOLDER, lambda: ApplyResult(self._folders.apply(ctx.thread_id, path)),
+                          same_folder(row.cwd, path)):
+                return
             ctx.say(cwd_reply(path, self._folders.apply(ctx.thread_id, path)))
         elif args.startswith(("/", "~")):  # a path, not a name: say so instead of searching for it
             ctx.say(NOT_A_DIRECTORY_TEXT.format(path=path))

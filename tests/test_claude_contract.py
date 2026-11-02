@@ -21,9 +21,9 @@ from tests.contract import BackendContract
 from tests.fakes.backend import RecordingSink
 from tests.fakes.clock import FakeClock
 from tests.support import TempHome
-from tg_bridge.agents.claude.backend import CLAUDE_CAPABILITIES, ClaudeBackend
+from tg_bridge.agents.claude.backend import CLAUDE_CAPABILITIES, CLAUDE_TUI_CAPABILITIES, ClaudeBackend
 from tg_bridge.agents.events import ApprovalRequest, Decision, SessionStarted, TurnResult, TurnStatus
-from tg_bridge.config import MODEL_CHOICES, Config, LauncherSpec
+from tg_bridge.config import MODEL_CHOICES, TRANSPORT_PRINT, TRANSPORT_TUI, Config, LauncherSpec
 from tg_bridge.logging_ import Logger
 
 FAKE = os.path.join(os.path.dirname(os.path.abspath(fakes_package.__file__)), "fake_claude.py")
@@ -65,7 +65,7 @@ class ClaudeBackendTests(BackendContract, unittest.TestCase):
         result = next(e for e in sink.events if isinstance(e, TurnResult))
         self.assertEqual(result.answer, "ok:unanswered")
 
-    def test_interrupted_turn_carries_the_cli_subtype(self) -> None:
+    def test_interrupted_turn_is_interrupted_and_carries_the_cli_subtype(self) -> None:
         backend = self.contract_backend()
         session, sink, _ = self.contract_open(backend, "hang")
         session.start()
@@ -74,7 +74,8 @@ class ClaudeBackendTests(BackendContract, unittest.TestCase):
         self.assertTrue(session.interrupt())
         self.assertTrue(sink.wait_for(lambda e: isinstance(e, TurnResult), timeout=10))
         result = next(e for e in sink.events if isinstance(e, TurnResult))
-        self.assertIs(result.status, TurnStatus.ERROR)
+        self.assertIs(result.status, TurnStatus.INTERRUPTED)
+        self.assertIsNone(result.error)
         self.assertEqual(result.subtype, "error_during_execution")
 
     def test_always_rule_and_permission_update_come_from_the_suggestion(self) -> None:
@@ -114,6 +115,21 @@ class ClaudeBackendTests(BackendContract, unittest.TestCase):
         self.assertTrue(backend.capabilities.live_mode and backend.capabilities.live_model)
         self.assertTrue(backend.capabilities.preassigned_id)
         self.assertFalse(backend.capabilities.images)
+        self.assertTrue(backend.capabilities.linger)  # both transports keep a session for background work (C9c)
+
+    def test_capabilities_per_launcher_follow_the_transport(self) -> None:
+        """A print launcher has the print flags; a tui launcher has the tui flags, with no live mode or model switch."""
+        backend = self.contract_backend()
+        launcher = self.contract_launcher()
+        print_spec = dataclasses.replace(launcher, transport=TRANSPORT_PRINT)
+        tui_spec = dataclasses.replace(launcher, transport=TRANSPORT_TUI)
+        self.assertIs(backend.capabilities_for(print_spec), CLAUDE_CAPABILITIES)
+        self.assertIs(backend.capabilities_for(tui_spec), CLAUDE_TUI_CAPABILITIES)
+        self.assertFalse(backend.capabilities_for(tui_spec).live_mode)
+        self.assertFalse(backend.capabilities_for(tui_spec).live_model)
+        self.assertTrue(backend.capabilities_for(tui_spec).preassigned_id)
+        self.assertTrue(backend.capabilities_for(print_spec).linger)
+        self.assertTrue(backend.capabilities_for(tui_spec).linger)
 
     def test_modes_are_the_four_claude_permission_modes_in_picker_order(self) -> None:
         keys = tuple(mode.key for mode in self.contract_backend().modes())
@@ -138,6 +154,16 @@ class ClaudeBackendTests(BackendContract, unittest.TestCase):
             title = self.contract_backend().one_shot("prompt", timeout=WAIT)
         self.assertIsNotNone(title)
         self.assertLessEqual(len(title), 60)
+
+    def test_one_shot_argv_asks_for_one_turn_and_saves_no_transcript(self) -> None:
+        """The title call must not leave a transcript: /resume would list its prompt as a session."""
+        backend = self.contract_backend()
+        with mock.patch("tg_bridge.agents.claude.backend.subprocess.Popen") as popen:
+            popen.return_value.communicate.return_value = ("A title\n", None)
+            self.assertEqual(backend.one_shot("the prompt", timeout=WAIT), "A title")
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv, [sys.executable, "-I", FAKE, "-p", "the prompt",
+                                "--max-turns", "1", "--no-session-persistence"])
 
     def test_one_shot_timeout_returns_none_and_kills_the_whole_group(self) -> None:
         """Ported labels:

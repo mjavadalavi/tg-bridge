@@ -14,6 +14,9 @@ The EventSink receives ProcessExited when the stream ends. A sink or _on_line ex
 the stream. An exception from reading stdout itself is logged and ends the reader, and ProcessExited still follows.
 Deadlines for process waits use real time, because a child process cannot be driven by a fake clock; the Clock is
 used only to stamp the stderr file name.
+
+ChildGroup holds what does not depend on the channel: the child's process group, the kill ladder, the per-session
+stderr file and the sink. PtyProcess (agents/pty_process.py) builds on it too, so the signal rules exist only once.
 """
 
 import json
@@ -47,23 +50,110 @@ def _group_alive(pgid: int) -> bool:
         return False
 
 
-class ProcessSession(ABC):
-    """One child process bound to one session. Subclasses implement _argv() and _on_line()."""
+class ChildGroup:
+    """The channel-independent part of a child-process session. start() of a subclass sets _proc and _pgid.
 
-    def __init__(self, *, name: str, cwd: str, env: Mapping[str, str], errfile_dir: str,
-                 sink: EventSink, logger: Logger, clock: Clock) -> None:
+    Spawn in a new session, so the group id equals the pid. The kill ladder then sends SIGINT, SIGTERM and SIGKILL to
+    the leader and sweeps the group, so no straggler outlives stop().
+    """
+
+    def __init__(self, *, name: str, errfile_dir: str, sink: EventSink, logger: Logger, clock: Clock) -> None:
         self._name = name
-        self._cwd = cwd
-        self._env = dict(env)
         self._errfile_dir = errfile_dir
         self._sink = sink
         self._logger = logger
         self._clock = clock
-        self._wlock = threading.Lock()
-        self._proc: subprocess.Popen[str] | None = None
+        self._proc: subprocess.Popen | None = None
         self._pgid: int | None = None
         self._reader_thread: threading.Thread | None = None
         self._errfile: str | None = None
+
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def pgid(self) -> int | None:
+        return self._pgid
+
+    def _emit(self, event: object) -> None:
+        try:
+            self._sink(event)  # type: ignore[arg-type]
+        except Exception as e:
+            self._log(f"sink: {e!r}")
+
+    def _log(self, msg: str) -> None:
+        self._logger.log(f"session {self._name}: {msg}")
+
+    # ---- kill ladder ----------------------------------------------------------------------------------
+
+    def _wait(self, proc: subprocess.Popen, timeout: float) -> bool:
+        try:
+            proc.wait(timeout=timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
+    def _killpg(self, sig: signal.Signals) -> None:
+        if self._pgid is None:
+            return
+        try:
+            os.killpg(self._pgid, sig)
+        except ProcessLookupError:
+            pass
+
+    def _signal_ladder(self, proc: subprocess.Popen) -> None:
+        for sig, wait in ((signal.SIGINT, SIGNAL_STEP), (signal.SIGTERM, SIGNAL_STEP), (signal.SIGKILL, KILL_WAIT)):
+            self._killpg(sig)
+            if self._wait(proc, wait):
+                return
+        self._log("child survived SIGKILL")
+
+    def _sweep_group(self) -> None:
+        """Stragglers such as a child's own children may outlive the leader; the group must end up empty."""
+        if self._pgid is None:
+            return
+        self._killpg(signal.SIGTERM)
+        if self._wait_group_gone():
+            return
+        self._killpg(signal.SIGKILL)
+        self._wait_group_gone()
+
+    def _wait_group_gone(self) -> bool:
+        deadline = time.monotonic() + GROUP_WAIT
+        while self._pgid is not None and _group_alive(self._pgid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return self._pgid is None or not _group_alive(self._pgid)
+
+    # ---- stderr file ----------------------------------------------------------------------------------
+
+    def _new_errfile(self) -> str:
+        """Create the per-session stderr file and drop the oldest ones so at most KEEP_ERRFILES remain."""
+        d = self._errfile_dir
+        os.makedirs(d, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+        paths = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".err")]
+        paths.sort(key=_mtime)
+        for old in paths[: max(0, len(paths) - (KEEP_ERRFILES - 1))]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        safe = _UNSAFE_NAME.sub("_", self._name)
+        return os.path.join(d, f"{safe}-{int(self._clock.now())}.err")
+
+
+class ProcessSession(ChildGroup, ABC):
+    """One child process bound to one session. Subclasses implement _argv() and _on_line()."""
+
+    def __init__(self, *, name: str, cwd: str, env: Mapping[str, str], errfile_dir: str,
+                 sink: EventSink, logger: Logger, clock: Clock) -> None:
+        super().__init__(name=name, errfile_dir=errfile_dir, sink=sink, logger=logger, clock=clock)
+        self._cwd = cwd
+        self._env = dict(env)
+        self._wlock = threading.Lock()
 
     # ---- hooks for subclasses -------------------------------------------------------------------------
 
@@ -110,9 +200,6 @@ class ProcessSession(ABC):
         self._reader_thread = threading.Thread(target=self._reader, args=(proc,), daemon=True)
         self._reader_thread.start()
         self._on_spawned()
-
-    def alive(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
 
     def stop(self, grace: float = 5.0) -> int | None:
         """Graceful close, then wait grace seconds, then SIGINT, SIGTERM and SIGKILL, then empty the group.
@@ -172,10 +259,6 @@ class ProcessSession(ABC):
         except OSError:
             return ""
 
-    @property
-    def pgid(self) -> int | None:
-        return self._pgid
-
     def on_reader_thread(self) -> bool:
         """True when called on the reader thread (so inside _on_line). Waiting for a reply from there would deadlock."""
         return self._reader_thread is not None and threading.current_thread() is self._reader_thread
@@ -201,75 +284,6 @@ class ProcessSession(ABC):
                 self._on_exited(rc)
             except Exception as e:
                 self._log(f"exit callback: {e!r}")
-
-    def _emit(self, event: object) -> None:
-        try:
-            self._sink(event)  # type: ignore[arg-type]
-        except Exception as e:
-            self._log(f"sink: {e!r}")
-
-    # ---- kill ladder ----------------------------------------------------------------------------------
-
-    def _wait(self, proc: subprocess.Popen[str], timeout: float) -> bool:
-        try:
-            proc.wait(timeout=timeout)
-            return True
-        except subprocess.TimeoutExpired:
-            return False
-
-    def _killpg(self, sig: signal.Signals) -> None:
-        if self._pgid is None:
-            return
-        try:
-            os.killpg(self._pgid, sig)
-        except ProcessLookupError:
-            pass
-
-    def _signal_ladder(self, proc: subprocess.Popen[str]) -> None:
-        for sig, wait in ((signal.SIGINT, SIGNAL_STEP), (signal.SIGTERM, SIGNAL_STEP), (signal.SIGKILL, KILL_WAIT)):
-            self._killpg(sig)
-            if self._wait(proc, wait):
-                return
-        self._log("child survived SIGKILL")
-
-    def _sweep_group(self) -> None:
-        """Stragglers such as a child's own children may outlive the leader; the group must end up empty."""
-        if self._pgid is None:
-            return
-        self._killpg(signal.SIGTERM)
-        if self._wait_group_gone():
-            return
-        self._killpg(signal.SIGKILL)
-        self._wait_group_gone()
-
-    def _wait_group_gone(self) -> bool:
-        deadline = time.monotonic() + GROUP_WAIT
-        while self._pgid is not None and _group_alive(self._pgid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        return self._pgid is None or not _group_alive(self._pgid)
-
-    # ---- helpers --------------------------------------------------------------------------------------
-
-    def _new_errfile(self) -> str:
-        """Create the per-session stderr file and drop the oldest ones so at most KEEP_ERRFILES remain."""
-        d = self._errfile_dir
-        os.makedirs(d, exist_ok=True)
-        try:
-            os.chmod(d, 0o700)
-        except OSError:
-            pass
-        paths = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".err")]
-        paths.sort(key=_mtime)
-        for old in paths[: max(0, len(paths) - (KEEP_ERRFILES - 1))]:
-            try:
-                os.remove(old)
-            except OSError:
-                pass
-        safe = _UNSAFE_NAME.sub("_", self._name)
-        return os.path.join(d, f"{safe}-{int(self._clock.now())}.err")
-
-    def _log(self, msg: str) -> None:
-        self._logger.log(f"session {self._name}: {msg}")
 
 
 def _mtime(path: str) -> float:

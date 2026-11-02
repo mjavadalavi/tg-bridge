@@ -2,7 +2,8 @@
 
 Everything that is specific to the Claude CLI and is not inside a session lives here: the capability flags, the
 permission modes the /mode picker offers, the rule matcher (the shared grammar plus the Claude 'always' mapper), and
-the one-shot call that titles a topic. Sessions are built by ClaudeSession; this class never parses a stream line.
+the one-shot call that titles a topic. Sessions are built by ClaudeSession (print) or ClaudeTuiSession (tui);
+this class never parses a stream line.
 
 The one-shot title call runs the launcher named by TG_TITLE_LAUNCHER (a cheap model seat), in its own process group,
 and the whole group is killed when the call times out, as the live file does. The argv is passed in by the caller
@@ -14,15 +15,16 @@ import signal
 import subprocess
 from collections.abc import Sequence
 
-from tg_bridge.agents.base import AgentBackend, AgentSession, Capabilities, EventSink, ModeChoice, SessionSpec
-from tg_bridge.agents.claude import history
+from tg_bridge.agents.base import AgentBackend, AgentSession, Capabilities, DiskSession, EventSink, ModeChoice, SessionSpec
+from tg_bridge.agents.claude import history, sessions_index
 from tg_bridge.agents.claude.handoff import read_entries
 from tg_bridge.agents.claude.rules import ClaudeRuleMapper
 from tg_bridge.agents.claude.session import ClaudeSession
+from tg_bridge.agents.claude.tui_session import ClaudeTuiSession
 from tg_bridge.agents.events import ApprovalRequest, HandoffEntry
 from tg_bridge.agents.rules import RuleGrammar
 from tg_bridge.clock import Clock
-from tg_bridge.config import BACKEND_CLAUDE, Config, LauncherSpec
+from tg_bridge.config import BACKEND_CLAUDE, TRANSPORT_TUI, Config, LauncherSpec
 from tg_bridge.logging_ import Logger
 
 CLAUDE_CAPABILITIES = Capabilities(
@@ -32,6 +34,19 @@ CLAUDE_CAPABILITIES = Capabilities(
     cost_usd=True,             # total_cost_usd on the result
     images=False,              # photos reach Claude as a '[photo saved ...]' text line
     preassigned_id=True,       # --session-id lets the bridge store the id before the process starts
+    linger=True,               # stream-json reports background work and the self turns it starts (C3b)
+)
+# The tui transport drives the interactive CLI through a PTY, so some print-only features do not exist there.
+CLAUDE_TUI_CAPABILITIES = Capabilities(
+    live_mode=False,           # no set_permission_mode in the TUI: the mode applies from the next turn, via the
+                               # CLI flag
+    live_model=False,          # typing /model in the TUI saves the user's default model, so the model applies from the
+                               # next turn, through the CLI flag instead
+    questions=False,           # AskUserQuestion is disallowed in tui, so no question cards
+    cost_usd=False,            # the transcript carries no total_cost_usd, so there is no cost to show
+    images=False,              # photos reach Claude as a '[photo saved ...]' text line, as in print
+    preassigned_id=True,       # --session-id works in the TUI, so the id is still stored before the process starts
+    linger=True,               # the transcript tail reports background work and the self turns it starts (C4)
 )
 # Labels are the /mode picker's button texts, in the live file's order (MODE_PICK).
 CLAUDE_MODES = (
@@ -40,7 +55,7 @@ CLAUDE_MODES = (
     ModeChoice(key="default", label="default"),
     ModeChoice(key="plan", label="plan"),
 )
-TITLE_FLAGS = ("--max-turns", "1")
+TITLE_FLAGS = ("--max-turns", "1", "--no-session-persistence")  # the title call writes no transcript for /resume
 TITLE_MAX_CHARS = 60       # the title is cut to this many characters, as the live file does
 TITLE_REAP_WAIT = 5.0      # seconds to wait for a killed title process to be reaped
 
@@ -75,6 +90,10 @@ class ClaudeBackend(AgentBackend):
         self._title_argv = tuple(title_argv)   # empty: no auto-titles
         self.rules = ClaudeRules()
 
+    def capabilities_for(self, spec: LauncherSpec) -> Capabilities:
+        """The tui transport has its own flags; every print launcher has the print flags."""
+        return CLAUDE_TUI_CAPABILITIES if spec.transport == TRANSPORT_TUI else CLAUDE_CAPABILITIES
+
     def modes(self) -> tuple[ModeChoice, ...]:
         return CLAUDE_MODES
 
@@ -83,6 +102,9 @@ class ClaudeBackend(AgentBackend):
         return cfg.models()
 
     def open_session(self, spec: SessionSpec, sink: EventSink) -> AgentSession:
+        """The tui transport runs the interactive TUI through a PTY; every other launcher runs the print session."""
+        if spec.launcher.transport == TRANSPORT_TUI:
+            return ClaudeTuiSession(spec, sink, logger=self._logger, clock=self._clock)
         return ClaudeSession(spec, sink, logger=self._logger, clock=self._clock)
 
     def one_shot(self, prompt: str, timeout: float) -> str | None:
@@ -122,6 +144,17 @@ class ClaudeBackend(AgentBackend):
         """The conversation of a finished Claude session, read from its transcript (empty when there is none)."""
         path = history.transcript_path(spec.config_dir, cwd, session_id)
         return read_entries(path, cwd)
+
+    def list_sessions(self, spec: LauncherSpec, cwd: str, limit: int,
+                      exclude: frozenset[str] = frozenset()) -> tuple[DiskSession, ...]:
+        """The Claude sessions on disk for this cwd under the launcher's config folder, newest first, without the ids in
+        exclude."""
+        return sessions_index.list_sessions(spec.config_dir, cwd, limit, exclude)
+
+    def has_transcript(self, spec: LauncherSpec, cwd: str, sid: str) -> bool:
+        """True when the launcher's config folder holds the transcript of session sid under this cwd's own folder. Other
+        folders of the config dir do not count: claude --resume only looks in the cwd's folder."""
+        return history.cwd_transcript_path(spec.config_dir, cwd, sid) is not None
 
 
 def _kill_group(pgid: int) -> None:

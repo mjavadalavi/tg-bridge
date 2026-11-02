@@ -9,7 +9,7 @@ When no launcher resolves at all (LauncherError) or the launcher's backend is no
 the stored backend column, so a display never fails where it used to work. TurnRunner still refuses such a turn.
 """
 
-from tg_bridge.agents.base import AgentBackend
+from tg_bridge.agents.base import AgentBackend, Capabilities
 from tg_bridge.agents.registry import BackendRegistry, UnknownBackend
 from tg_bridge.config import BACKEND_CLAUDE, Config, LauncherError, LauncherSpec
 from tg_bridge.store.sessions import SessionRecord
@@ -33,6 +33,16 @@ def topic_backend(config: Config, backends: BackendRegistry, row: SessionRecord,
         except UnknownBackend:
             pass
     return backends.get(row.backend or BACKEND_CLAUDE)
+
+
+def topic_capabilities(config: Config, backends: BackendRegistry, row: SessionRecord, topic: str) -> Capabilities:
+    """The capability flags of the topic's turns: the resolved backend's flags for the resolved launcher (a tui
+    launcher has its own), or the backend's plain flags when no launcher resolves."""
+    backend = topic_backend(config, backends, row, topic)
+    spec = topic_launcher(config, row, topic)
+    if spec is None:
+        return backend.capabilities
+    return backend.capabilities_for(spec)
 
 
 def topic_models(config: Config, backends: BackendRegistry, row: SessionRecord,

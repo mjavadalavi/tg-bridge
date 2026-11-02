@@ -43,10 +43,13 @@ STATUS_MODE = "sm"
 STATUS_MODEL = "so"
 STATUS_COST = "sc"
 STATUS_LAUNCHER = "sl"
+STOP_CHOICE_KIND = "sq"         # the D2 card: stop the background update only, or close the session
+CHOICE_UPDATE = "u"
+CHOICE_CLOSE = "c"
 
 DEFAULT_MODEL = "default"
 NOT_LIVE_NOTE = "applies from your next message"
-RESUME_LIMIT = 8                  # the /resume picker shows the newest sessions of the topic
+RESUME_LIMIT = 10                 # the /resume picker shows the newest sessions of the topic
 RULES_PER_ROW = 4
 OWNER_TIMEZONE = "Asia/Tehran"    # session start times on the buttons are shown on the owner's clock
 NO_RULES_TEXT = "no always-allow rules in this topic."
@@ -54,6 +57,9 @@ RULES_HINT = "remove one with its 🗑 button, /forget <number> or /forget all"
 RESUME_LIVE_TEXT = "↩️ the next message resumes the ✓ session"
 RESUME_FRESH_TEXT = "↩️ the next message starts a fresh session"
 RESUME_AWAY_TEXT = "⚠ = made by another launcher: tapping it switches the launcher to that one"
+STOP_CHOICE_TEXT = "⏹ a background update is running. Stop what?"
+STOP_CHOICE_UPDATE_BUTTON = "⏹ this update only"
+STOP_CHOICE_CLOSE_BUTTON = "🛑 close the session"
 
 
 @dataclass(frozen=True)
@@ -142,9 +148,9 @@ def resume_picker(
 ) -> Picker:
     """The /resume picker: the topic's newest sessions (RESUME_LIMIT), the one in use marked ✓.
 
-    history is newest first, as HistoryRepo returns it. A session made by another launcher is marked ⚠ with that
-    launcher's name (names maps launcher command -> launcher name); tapping it switches the launcher. Each button
-    carries its session_history id (cm:<thread>:rs:<id>).
+    history is newest first, as the command sorts it. Every button names its session's launcher (names maps launcher
+    command -> launcher name). A session made by another launcher is marked ⚠ instead, and tapping it switches the
+    launcher. Each button carries its session_history id (cm:<thread>:rs:<id>).
     """
     rows: ButtonRows = []
     away_any = False
@@ -153,7 +159,11 @@ def resume_picker(
         mark = "✓ " if current_uuid and record.uuid == current_uuid else ""
         away = bool(record.launcher) and record.launcher != current_command
         away_any = away_any or away
-        tag = f"⚠ {names.get(record.launcher) or 'other launcher'} · " if away else ""
+        name = names.get(record.launcher, "")
+        if away:
+            tag = f"⚠ {name or 'other launcher'} · "
+        else:
+            tag = f"{name} · " if name else ""
         label = f"{mark}{tag}{started_label(record.started)} · {what}"
         rows.append([(label, _cb(thread, KIND_RESUME, record.id))])
     text = RESUME_LIVE_TEXT if current_uuid else RESUME_FRESH_TEXT
@@ -175,6 +185,20 @@ def rules_picker(thread: int, rules: Sequence[RuleRecord]) -> Picker:
     rows: ButtonRows = [buttons[i : i + RULES_PER_ROW] for i in range(0, len(buttons), RULES_PER_ROW)]
     rows.append([("🗑 all", _cb(thread, KIND_RULE_ALL, 0))])
     return Picker(text, rows)
+
+
+def stop_choice_picker(thread: int, hold_id: int, self_seq: int) -> Picker:
+    """The card that asks which stop a running background update gets (section 5 D2): this update only, or the session.
+    Each button names the hold and the self turn it was posted for (K9), so a tap after that update ended expires."""
+    update = _cb(thread, STOP_CHOICE_KIND, _choice(CHOICE_UPDATE, hold_id, self_seq))
+    close = _cb(thread, STOP_CHOICE_KIND, _choice(CHOICE_CLOSE, hold_id, self_seq))
+    rows: ButtonRows = [[(STOP_CHOICE_UPDATE_BUTTON, update), (STOP_CHOICE_CLOSE_BUTTON, close)]]
+    return Picker(STOP_CHOICE_TEXT, rows)
+
+
+def _choice(choice: str, hold_id: int, self_seq: int) -> str:
+    """The argument of a stop-choice button: the choice, the hold id and the self turn number (u:<hold>:<seq>)."""
+    return f"{choice}:{hold_id}:{self_seq}"
 
 
 def status_rows(thread: int, running: bool) -> ButtonRows:

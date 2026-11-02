@@ -1,8 +1,10 @@
 """Queue, stop and /status-shortcut taps (C20 now/jump/drop, st, and the cm: status kinds).
 
 - now / jump / drop: the buttons under a queued message (callback now:<thread>:<nid> and so on). Now moves the item to
-  the front and interrupts the running turn on a thread of its own; Next only moves it; Drop removes it.
-- st: the ⏹ Stop button on a progress message. It calls SessionCommands.stop_turn, the same method /stop calls.
+  the front and interrupts the running turn on a thread of its own; during a background update it interrupts that
+  update only and the item runs on the same session (section 5 D2). Next only moves it; Drop removes it.
+- st: the ⏹ Stop button on a progress message. It calls SessionCommands.stop_turn, the same method /stop calls. While a
+  background update runs, the topic gets the choice card instead (sq: this update only, or close the session).
 - cm:<thread>:<kind>:<arg> status kinds: st (Stop, the same method again), nw (stop and start fresh), sn (New) and sc
   (Cost), which run the typed command through the CommandRegistry, and sm / so / sl, which send the mode, model or
   launcher picker as a new message.
@@ -15,12 +17,33 @@ import threading
 from tg_bridge.bot.callbacks.router import CallbackRouter, Tap
 from tg_bridge.bot.commands.base import CommandDeps, CommandRegistry
 from tg_bridge.bot.commands.info import launcher_state
-from tg_bridge.bot.commands.session import STOP_BUTTON_KIND, SessionCommands
-from tg_bridge.bot.pickers import STATUS_COST, STATUS_LAUNCHER, STATUS_MODE, STATUS_MODEL, STATUS_NEW, STATUS_STOP
-from tg_bridge.bot.pickers import launcher_picker, mode_picker, model_picker
+from tg_bridge.bot.commands.session import (
+    STOP_BUTTON_KIND,
+    UPDATE_CLOSED_TEXT,
+    UPDATE_GONE_TEXT,
+    UPDATE_INTERRUPTED_TEXT,
+    SessionCommands,
+)
+from tg_bridge.bot.commands.stop_types import StopKind, StopResult
+from tg_bridge.bot.pickers import (
+    CHOICE_CLOSE,
+    CHOICE_UPDATE,
+    STATUS_COST,
+    STATUS_LAUNCHER,
+    STATUS_MODE,
+    STATUS_MODEL,
+    STATUS_NEW,
+    STATUS_STOP,
+    STOP_CHOICE_KIND,
+    launcher_picker,
+    mode_picker,
+    model_picker,
+    stop_choice_picker,
+)
 from tg_bridge.core.dispatcher import Dispatcher
+from tg_bridge.core.linger import LingerService
 from tg_bridge.core.live import LiveRegistry
-from tg_bridge.core.topic_backend import topic_backend, topic_models
+from tg_bridge.core.topic_backend import topic_backend, topic_capabilities, topic_models
 from tg_bridge.store.sessions import SessionRecord
 
 NOT_QUEUED_TEXT = "not queued anymore"
@@ -31,6 +54,7 @@ JUMP_NOTE = "📥 ⏩ runs next after the current turn"
 DROP_TOAST = "Dropped 🗑"
 DROP_NOTE = "📥 ❌ dropped from the queue"
 STOP_TOAST = "Stopping ⏹"
+CHOOSE_TOAST = "Choose what to stop ⏹"
 NOTHING_RUNNING_TEXT = "nothing is running in this topic"
 NO_SESSION_TEXT = "no session in this topic"
 NEW_TOAST = "🆕 fresh session next"
@@ -39,6 +63,8 @@ MODE_TOAST = "🛡 mode"
 MODEL_TOAST = "🧠 model"
 LAUNCHER_TOAST = "🚀 launcher"
 STOP_PREFIX = "st"
+INTERRUPT_TOAST = "Interrupting this update ⏹"
+CHOICE_EXPIRED_TOAST = "this choice has expired"
 
 
 def _thread_arg(tap: Tap, count: int) -> int | None:
@@ -51,9 +77,10 @@ def _thread_arg(tap: Tap, count: int) -> int | None:
 class QueueTaps:
     """The now / jump / drop buttons of a queued message. The queue itself is the Dispatcher's."""
 
-    def __init__(self, *, dispatcher: Dispatcher, live: LiveRegistry) -> None:
+    def __init__(self, *, dispatcher: Dispatcher, live: LiveRegistry, linger: LingerService | None = None) -> None:
         self._dispatcher = dispatcher
         self._live = live
+        self._linger = linger  # None: no session is kept, so a running turn is always stopped whole
 
     def register(self, router: CallbackRouter) -> None:
         router.on("now", self._now)
@@ -72,7 +99,9 @@ class QueueTaps:
         if not self._dispatcher.to_front(thread, nid):
             tap.toast(NOT_QUEUED_TEXT)
             return
-        running = self._live.request_abort(thread, stop_tap=False)
+        # a background update is interrupted alone (section 5 D2): the item then runs on the same kept session
+        interrupted = self._linger is not None and self._linger.request_interrupt(thread)
+        running = None if interrupted else self._live.request_abort(thread, stop_tap=False)
         if running is not None:  # stop() can take ~20 s: the tap answers at once, the stop runs on its own thread
             threading.Thread(target=running.session.stop, daemon=True).start()
         tap.toast(NOW_TOAST)
@@ -99,6 +128,27 @@ class QueueTaps:
         tap.edit(DROP_NOTE)
 
 
+def _choice_arg(arg: str) -> tuple[str, int, int] | None:
+    """The choice, hold id and self turn number of a choice-card tap (u:<hold_id>:<self_seq>), or None when malformed."""
+    parts = arg.split(":")
+    if len(parts) != 3 or parts[0] not in (CHOICE_UPDATE, CHOICE_CLOSE):
+        return None
+    if not parts[1].isdigit() or not parts[2].isdigit():
+        return None
+    return parts[0], int(parts[1]), int(parts[2])
+
+
+def _stop_or_ask(tap: Tap, stops: SessionCommands, thread: int) -> None:
+    """The shared stop of the ⏹ buttons: stops at once, or posts the choice card while a background update runs."""
+    result: StopResult = stops.stop_turn(thread)
+    if result.kind is StopKind.CHOOSE:
+        picker = stop_choice_picker(thread, result.hold_id, result.self_seq)
+        tap.send_buttons(thread, picker.text, picker.rows)
+        tap.toast(CHOOSE_TOAST)
+        return
+    tap.toast(STOP_TOAST if result else NOTHING_RUNNING_TEXT)
+
+
 class StopTap:
     """The ⏹ Stop button of a progress message (callback st:<thread>): the /stop path, nothing else."""
 
@@ -112,8 +162,42 @@ class StopTap:
         thread = _thread_arg(tap, 1)
         if thread is None:
             return
-        stopped = self._stops.stop_turn(thread)
-        tap.toast(STOP_TOAST if stopped else NOTHING_RUNNING_TEXT)
+        _stop_or_ask(tap, self._stops, thread)
+
+
+class StopChoiceTaps:
+    """The buttons of the choice card (picker kind sq, arg u or c, then the hold id and self turn it was posted for):
+    this update only, or close the session (D2). A tap acts only while that same self turn still runs (K9); otherwise it
+    is expired and changes nothing."""
+
+    def __init__(self, *, stops: SessionCommands) -> None:
+        self._stops = stops
+
+    def register(self, router: CallbackRouter) -> None:
+        router.on_picker(STOP_CHOICE_KIND, self._choose)
+
+    def _choose(self, tap: Tap) -> None:
+        thread = _thread_arg(tap, 3)
+        if thread is None:
+            return
+        choice = _choice_arg(tap.args[2])
+        if choice is None or not self._stops.choice_current(thread, choice[1], choice[2]):
+            tap.toast(CHOICE_EXPIRED_TOAST)
+            return
+        if choice[0] == CHOICE_UPDATE:
+            if self._stops.interrupt_update(thread):
+                tap.toast(INTERRUPT_TOAST)
+                tap.edit(UPDATE_INTERRUPTED_TEXT)
+            else:
+                tap.toast(UPDATE_GONE_TEXT)
+                tap.edit(UPDATE_GONE_TEXT)
+        else:
+            if self._stops.stop_now(thread):
+                tap.toast(STOP_TOAST)
+                tap.edit(UPDATE_CLOSED_TEXT)
+            else:
+                tap.toast(NOTHING_RUNNING_TEXT)
+                tap.edit(UPDATE_GONE_TEXT)
 
 
 class StatusTaps:
@@ -152,8 +236,7 @@ class StatusTaps:
         opened = self._open(tap)
         if opened is None:
             return
-        stopped = self._stops.stop_turn(opened[0])
-        tap.toast(STOP_TOAST if stopped else NOTHING_RUNNING_TEXT)
+        _stop_or_ask(tap, self._stops, opened[0])
 
     def _stop_and_new(self, tap: Tap) -> None:
         opened = self._open(tap)
@@ -184,8 +267,8 @@ class StatusTaps:
             return
         thread, row = opened
         backend = self._backend(row)
-        picker = mode_picker(thread, backend.modes(), row.mode or self._deps.config.default_mode(),
-                             backend.capabilities.live_mode)
+        caps = topic_capabilities(self._deps.config, self._deps.backends, row, row.name)
+        picker = mode_picker(thread, backend.modes(), row.mode or self._deps.config.default_mode(), caps.live_mode)
         tap.send_buttons(thread, picker.text, picker.rows)
         tap.toast(MODE_TOAST)
 
@@ -194,8 +277,9 @@ class StatusTaps:
         if opened is None:
             return
         thread, row = opened
-        backend, models = topic_models(self._deps.config, self._deps.backends, row, row.name)
-        picker = model_picker(thread, models, row.model or None, backend.capabilities.live_model)
+        _, models = topic_models(self._deps.config, self._deps.backends, row, row.name)
+        caps = topic_capabilities(self._deps.config, self._deps.backends, row, row.name)
+        picker = model_picker(thread, models, row.model or None, caps.live_model)
         tap.send_buttons(thread, picker.text, picker.rows)
         tap.toast(MODEL_TOAST)
 

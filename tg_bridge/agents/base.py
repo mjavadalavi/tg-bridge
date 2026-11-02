@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from tg_bridge.agents.events import AgentEvent, ApprovalRequest, Decision, HandoffEntry
-from tg_bridge.config import Config, LauncherSpec
+from tg_bridge.config import DEFAULT_TUI_SIZE, Config, LauncherSpec
 
 EventSink = Callable[[AgentEvent], None]   # called on the session reader thread; must not block
 
@@ -26,6 +26,8 @@ class Capabilities:
     cost_usd: bool
     images: bool                     # native image input (else the '[photo saved for you at <path>]' text)
     preassigned_id: bool             # Claude --session-id; Codex False (the id is learned from thread/start)
+    linger: bool = False             # the session may be kept open after a turn while background work is pending
+                                     # (needs the BackgroundWork and TurnBegan events)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +35,15 @@ class ModeChoice:
     key: str                         # stored in sessions.mode: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'
     label: str
     note: str = ""                   # e.g. Codex: 'applies from next message'
+
+
+@dataclass(frozen=True, slots=True)
+class DiskSession:
+    """One session the CLI left on disk for a folder: its id, a short title and the file's modification time."""
+
+    uuid: str
+    title: str
+    modified: float                  # seconds since the epoch
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +62,8 @@ class SessionSpec:
     system_rules: str                # formatted RULES text (+ a pending handoff digest on a fresh session)
     env: dict[str, str]
     errfile_dir: str
+    view_dir: str = ""              # tui sessions mirror their raw output to <view_dir>/<thread>.pty; '' = none
+    tui_size: tuple[int, int] = DEFAULT_TUI_SIZE  # (rows, cols) of the TUI's pseudo-terminal
 
 
 class RuleMatcher(Protocol):
@@ -129,6 +142,11 @@ class AgentBackend(ABC):
     @abstractmethod
     def open_session(self, spec: SessionSpec, sink: EventSink) -> AgentSession: ...
 
+    def capabilities_for(self, spec: LauncherSpec) -> Capabilities:
+        """The flags of one launcher. They can differ per launcher, e.g. Claude's tui transport has no live mode or
+        model switch; the default is the backend's own flags."""
+        return self.capabilities
+
     def one_shot(self, prompt: str, timeout: float) -> str | None:
         """Used for topic titles. The default None means unsupported."""
         return None
@@ -145,3 +163,14 @@ class AgentBackend(ABC):
     def handoff_entries(self, session_id: str, cwd: str, spec: LauncherSpec) -> tuple[HandoffEntry, ...]:
         """Cross-backend handoff source. The default () means there is nothing to carry."""
         return ()
+
+    def list_sessions(self, spec: LauncherSpec, cwd: str, limit: int,
+                      exclude: frozenset[str] = frozenset()) -> tuple[DiskSession, ...]:
+        """The sessions on disk for this folder, newest first, at most limit of them, leaving out the ids in exclude.
+        The default () means the backend cannot list them."""
+        return ()
+
+    def has_transcript(self, spec: LauncherSpec, cwd: str, sid: str) -> bool:
+        """True when this launcher's own folder holds the transcript of session sid for cwd. The default False means the
+        backend keeps no transcript a launcher could be asked about."""
+        return False

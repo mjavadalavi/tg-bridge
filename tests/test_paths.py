@@ -22,6 +22,7 @@ class PathsTests(unittest.TestCase):
             self.assertEqual(paths.log, os.path.join(home.state, "bridge.log"))
             self.assertEqual(paths.lock, os.path.join(home.state, "lock"))
             self.assertEqual(paths.turns, os.path.join(home.state, "turns"))
+            self.assertEqual(paths.view, os.path.join(home.state, "view"))
 
     def test_from_environment_follows_home_at_call_time(self) -> None:
         with TempHome() as home:

@@ -37,6 +37,7 @@ from tg_bridge.agents.events import (
     TurnStatus,
     UsageEvent,
 )
+from tg_bridge.core.session_router import SessionRouter
 from tg_bridge.core.turn_listeners import EndGate
 from tg_bridge.core.turn_runner import active_key
 from tg_bridge.core.turn_state import TurnOutcome
@@ -551,6 +552,28 @@ class SlotRetryTests(RunnerCase):
         join_turn(self.h.clock, thread)
         slot.give_back()
         busy[1].give_back()
+
+
+class RouterSinkTests(RunnerCase):
+    def test_the_session_sink_is_a_router_that_is_closed_when_the_turn_ends(self) -> None:
+        # the session talks to a SessionRouter for its whole life; once the turn is over the router is closed, so an
+        # event that arrives later is dropped with the router's own note (not the turn's "turn ended" note)
+        self.start([[OK]])
+        opened: list[object] = []
+        original = self.backend.open_session
+
+        def spy(spec, sink):
+            opened.append(sink)
+            return original(spec, sink)
+
+        self.backend.open_session = spy
+        self.assertEqual(self.turn().answer, "ok:allow")
+        self.assertEqual(len(opened), 1)
+        self.assertIsInstance(opened[0], SessionRouter)
+        opened[0](TextEvent(text="a late text", final=True))
+        lines = self.h.log_lines()
+        self.assertTrue(any("session router closed: dropping a later TextEvent" in line for line in lines), lines)
+
 
 if __name__ == "__main__":
     unittest.main()

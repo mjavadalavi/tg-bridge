@@ -11,18 +11,30 @@ FakeTelegram after the ordered out-worker has drained.
 
 import json
 import os
+import subprocess
+import sys
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from tests.fakes.clock import FakeClock
 from tests.fakes.telegram import FakeTelegram
+from tests.linger_stub import StubKeptLinger
 from tests.support import TempHome
 from tg_bridge.agents.defaults import build_default_registry
 from tg_bridge.bot.commands.base import Alias, Command, CommandDeps, CommandRegistry
-from tg_bridge.bot.commands.info import launcher_state, register_info_commands
+from tg_bridge.bot.commands.info import (
+    LINGER_QUIET_STATUS_TEXT,
+    LINGER_STATUS_TEXT,
+    SELF_TURN_STATUS_TEXT,
+    launcher_state,
+    register_info_commands,
+)
 from tg_bridge.config import Config
-from tg_bridge.core.dispatcher import Admission, TopicQueues
+from tg_bridge.core.linger import LingerStatus
+from tg_bridge.core import terminal_claim
 from tg_bridge.core.live import LiveRegistry
+from tg_bridge.core.topic_queues import Admission, TopicQueues
 from tg_bridge.core.turn_listeners import slash_key
 from tg_bridge.core.workers import WorkerPool
 from tg_bridge.logging_ import Logger
@@ -187,6 +199,52 @@ class StatusTests(InfoCase):
         self.assertIn("backend: codex", text)
         self.assertIn(f"session: {UUID}", text)
         self.assertNotIn("in a terminal", text, "the Codex backend has no resume hint in this step")
+
+
+class TerminalStatusTests(InfoCase):
+    """/status and the terminal claim (spec: the Lock section). A live claim of tg-bridge view shows 'open in the
+    terminal'; a stale claim is removed and ignored; with views off, or a view folder that cannot be read, the claim is
+    not a claim and /status still answers."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.view = Paths.from_home(self.base).view
+        os.makedirs(self.view, mode=0o700, exist_ok=True)
+        self.deps = replace(self.deps, view_dir=self.view)
+
+    def write_claim(self, pid: int) -> None:
+        with open(terminal_claim.claim_path(self.view, THREAD), "w", encoding="utf-8") as handle:
+            json.dump({"pid": pid, "started": 1.0}, handle)
+
+    def test_a_live_claim_shows_the_turn_open_in_the_terminal(self) -> None:
+        self.write_claim(os.getpid())
+        self.assertTrue(self.run_cmd("/status"))
+        self.assertIn("turn: open in the terminal", self.last())
+
+    def test_no_claim_shows_idle(self) -> None:
+        self.assertTrue(self.run_cmd("/status"))
+        self.assertIn("turn: idle", self.last())
+        self.assertNotIn("open in the terminal", self.last())
+
+    def test_a_stale_claim_is_removed_and_shows_idle(self) -> None:
+        proc = subprocess.Popen([sys.executable, "-I", "-c", "pass"])
+        proc.wait()  # reaped: no process has its pid now
+        self.write_claim(proc.pid)
+        self.assertTrue(self.run_cmd("/status"))
+        self.assertIn("turn: idle", self.last())
+        self.assertFalse(os.path.exists(terminal_claim.claim_path(self.view, THREAD)), "stale claim not removed")
+
+    def test_views_off_never_reads_the_view_folder(self) -> None:
+        self.write_claim(os.getpid())
+        self.deps = replace(self.deps, view_dir="")
+        self.assertTrue(self.run_cmd("/status"))
+        self.assertIn("turn: idle", self.last())
+        self.assertTrue(os.path.exists(terminal_claim.claim_path(self.view, THREAD)), "claim touched with views off")
+
+    def test_an_unreadable_view_folder_is_no_claim_and_status_still_answers(self) -> None:
+        self.deps = replace(self.deps, view_dir=os.path.join(self.base, "missing-view"))
+        self.assertTrue(self.run_cmd("/status"))
+        self.assertIn("turn: idle", self.last())
 
 
 class SharedPickerTests(InfoCase):
@@ -404,6 +462,62 @@ class RegistryTests(InfoCase):
             with self.subTest(text=text):
                 self.assertFalse(self.run_cmd(text))
         self.assertEqual(self.telegram.texts(THREAD), [], "nothing was sent for text the bridge does not handle")
+
+
+class KeptStatusTests(InfoCase):
+    """/status of a topic whose session is kept open for background work (C9a): the turn line, the stop button."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.linger = StubKeptLinger()
+        self.deps = replace(self.deps, linger=self.linger)
+        self.sessions.set_uuid(THREAD, UUID)
+
+    def test_status_shows_kept_session_with_pending_and_minutes(self) -> None:
+        """Background work is pending: the turn line says how many tasks run and the minutes left (rounded up)."""
+        self.linger.status_value = LingerStatus(pending=2, seconds_left=1000.0, self_turn=False)
+        self.run_cmd("/status")
+        expected = LINGER_STATUS_TEXT.format(pending=2, minutes=17)
+        self.assertIn(expected, self.last().split("\n"))
+        self.assertIn("turn: idle — session kept open for background work (2 running, closes in 17 min; /stop closes it)",
+                      self.last())
+
+    def test_status_shows_quiet_kept_session(self) -> None:
+        """No background work is pending any more: the line says the session closes in a few seconds."""
+        self.linger.status_value = LingerStatus(pending=0, seconds_left=300.0, self_turn=False)
+        self.run_cmd("/status")
+        self.assertIn(LINGER_QUIET_STATUS_TEXT, self.last().split("\n"))
+        self.assertNotIn("turn: idle", self.last().split("\n"))
+
+    def test_status_shows_background_update_running(self) -> None:
+        """A self turn of the kept session runs: the turn line names it as a background update, with its tool count."""
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=300.0, self_turn=True)
+        self.live.begin_turn(THREAD, object(), FakeFeed())
+        self.run_cmd("/status")
+        self.assertIn(SELF_TURN_STATUS_TEXT.format(tools=3), self.last().split("\n"))
+        self.assertNotIn("turn: running, 3 tool calls so far", self.last())
+
+    def test_status_of_a_user_turn_on_a_kept_session_is_a_plain_running_turn(self) -> None:
+        """A user turn on the kept session is a running turn like any other, not a background update."""
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=300.0, self_turn=False)
+        self.live.begin_turn(THREAD, object(), FakeFeed())
+        self.run_cmd("/status")
+        self.assertIn("turn: running, 3 tool calls so far", self.last().split("\n"))
+        self.assertNotIn(SELF_TURN_STATUS_TEXT.format(tools=3), self.last())
+
+    def test_status_has_stop_button_while_kept(self) -> None:
+        """A kept session with nothing running still gets the ⏹ Stop button, which closes it (/stop does the same)."""
+        self.linger.status_value = LingerStatus(pending=0, seconds_left=300.0, self_turn=False)
+        self.run_cmd("/status")
+        self.assertIn("⏹ Stop", self.button_labels())
+        self.assertIn(f"cm:{THREAD}:st:0", self.button_callbacks())
+
+    def test_status_without_a_kept_session_is_as_before(self) -> None:
+        """Nothing kept and nothing running: the line is 'turn: idle' and there is no stop button."""
+        self.linger.status_value = None
+        self.run_cmd("/status")
+        self.assertIn("turn: idle", self.last().split("\n"))
+        self.assertNotIn("⏹ Stop", self.button_labels())
 
 
 if __name__ == "__main__":

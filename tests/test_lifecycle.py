@@ -22,9 +22,11 @@ from tests.turn_support import TurnHarness
 from tg_bridge.agents.base import AgentSession
 from tg_bridge.agents.events import AgentEvent
 from tg_bridge.bot.commands.base import Alias, Command, CommandRegistry
+from tg_bridge.core.linger import linger_key
 from tg_bridge.core.turn_runner import active_key
 from tg_bridge.daemon.lifecycle import (
     ALREADY_RUNNING,
+    LINGER_RESTART_NOTICE,
     RESTART_NOTICE,
     Lifecycle,
     acquire_lock,
@@ -178,8 +180,57 @@ class RecoverTests(LifecycleCase):
         self.assertEqual(self.h.tg.texts(THREAD), [RESTART_NOTICE])
         self.assertEqual((second.markers, second.notices, second.asks), (0, 0, 0))
 
+    def test_linger_marker_gets_a_notice_and_is_removed(self) -> None:
+        """recover: a kept-session marker (linger:<thread>) -> linger restart notice in its topic; the marker is removed."""
+        self.h.kv.set(linger_key(THREAD), _marker())
+        recovery = self.lifecycle.recover()
+        self.assertEqual(self.h.tg.texts(THREAD), [LINGER_RESTART_NOTICE])
+        self.assertEqual(self.h.kv.items_with_prefix("linger:"), [])
+        self.assertEqual((recovery.markers, recovery.notices, recovery.lingers), (0, 1, 1))
+
+    def test_active_and_linger_markers_give_one_notice(self) -> None:
+        """recover: a topic with both an active and a linger marker gets the turn notice only; both markers go."""
+        self.h.kv.set(active_key(THREAD), _marker())
+        self.h.kv.set(linger_key(THREAD), _marker())
+        recovery = self.lifecycle.recover()
+        self.assertEqual(self.h.tg.texts(THREAD), [RESTART_NOTICE])
+        self.assertEqual(self.h.kv.items_with_prefix("linger:"), [])
+        self.assertIsNone(self.h.kv.get(active_key(THREAD)))
+        self.assertEqual((recovery.markers, recovery.notices, recovery.lingers), (1, 1, 1))
+
+    def test_active_marker_without_chat_does_not_suppress_the_linger_notice(self) -> None:
+        """recover: an active marker that names no chat sends nothing, so the topic's kept-session marker still gets
+        the linger notice (the notified set only holds topics that were actually told)."""
+        self.h.kv.set(active_key(THREAD), _marker(chat_id=None))
+        self.h.kv.set(linger_key(THREAD), _marker())
+        recovery = self.lifecycle.recover()
+        self.assertEqual(self.h.tg.texts(THREAD), [LINGER_RESTART_NOTICE])
+        self.assertIsNone(self.h.kv.get(active_key(THREAD)))
+        self.assertEqual(self.h.kv.items_with_prefix("linger:"), [])
+        self.assertEqual((recovery.markers, recovery.notices, recovery.lingers), (1, 1, 1))
+
+    def test_bad_linger_marker_is_removed_without_notice(self) -> None:
+        """recover: a linger marker with no topic id, a value that is not JSON, or no chat is removed and sends nothing."""
+        self.h.kv.set("linger:abc", _marker())
+        self.h.kv.set(linger_key(THREAD), "not json")
+        self.h.kv.set("linger:9002", _marker(chat_id=None))
+        recovery = self.lifecycle.recover()
+        self.assertEqual([c for c in self.h.tg.calls if c.method == "sendMessage"], [])
+        self.assertEqual(self.h.kv.items_with_prefix("linger:"), [])
+        self.assertEqual((recovery.lingers, recovery.notices), (3, 0))
+
 
 class ShutdownTests(LifecycleCase):
+    def test_shutdown_stops_kept_sessions(self) -> None:
+        """shutdown_sessions: a kept session (lingering, not running a turn) is stopped like a running one."""
+        spec = fake_spec(thread_id=THREAD, chat_id=CHAT, topic="t", cwd=self._home.home, errfile_dir=self._home.home)
+        session = FakeSession(self.backend, spec, lambda event: None)
+        self.assertTrue(self.h.live.begin_linger(THREAD, session, limit=3))
+        count = self.lifecycle.shutdown_sessions(budget=BUDGET_SECONDS, grace=STOP_SECONDS)
+        self.assertEqual(count, 1)
+        self.assertFalse(session.alive())
+        self.assertIn(("stop", STOP_SECONDS), session.calls)
+
     def test_shutdown_sessions_stops_the_live_session_and_keeps_its_marker(self) -> None:
         """shutdown_sessions: the live session is stopped with the grace; its active marker is kept on purpose.
 

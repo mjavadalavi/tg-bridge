@@ -222,7 +222,7 @@ class LauncherCommandPort(LauncherCwdPortCase):
     # --- K3: the /resume picker marks sessions made by another launcher
 
     def _history_rows(self) -> None:
-        """The stored history of the old suite, in insertion order (the picker lists the newest id first). Times are
+        """The stored history of the old suite, in insertion order (the picker lists the newest start first). Times are
         the owner's clock: 10-24 19:50 is 16:20 UTC, 10-01 00:00 is 20:30 UTC of the day before, 10-02 00:00 the 1st."""
         rows = [
             (U_OLD, "2026-10-24T16:20:00+00:00", "old wrap chat", "wrap run"),
@@ -238,18 +238,20 @@ class LauncherCommandPort(LauncherCwdPortCase):
 
     def test_the_picker_marks_only_sessions_of_other_launchers(self) -> None:
         """Ported labels:
-        K3: a session of another launcher is marked with its name (['⚠ other launcher · 10-02 00:00 · orphan chat…', '10-01 00:00 · legacy chat…', '10-24 19:50 · claude chat…', '⚠ wrap · 10-24 19:50 · old wrap chat…'])
-        K3: sessions of this launcher or unknown launcher are not marked
+        K3: a session of another launcher is marked with its name ('⚠ wrap · 10-24 19:50 · old wrap chat…')
+        K3: a session of an unknown launcher is marked 'other launcher'
         K3: the picker explains the mark
+
+        Every row now names its launcher, and the rows are sorted by start time (the two 16:20 UTC rows keep id order).
         """
         self.set_row(launcher="claude")
         self._history_rows()
         self.run_cmd("/resume")
         self.assertEqual(self.card_labels(), [
+            "claude · 10-24 19:50 · claude chat…",
+            "⚠ wrap · 10-24 19:50 · old wrap chat…",
             "⚠ other launcher · 10-02 00:00 · orphan chat…",
             "10-01 00:00 · legacy chat…",
-            "10-24 19:50 · claude chat…",
-            "⚠ wrap · 10-24 19:50 · old wrap chat…",
         ])
         self.assertIn("⚠ = made by another launcher", self.sent_buttons()[-1]["text"])
 

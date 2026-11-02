@@ -12,6 +12,10 @@ nothing more is emitted, as a stopped process sends nothing. A blocked wait give
 TurnResult(ERROR), so a broken test fails instead of hanging. When no turn is left, the fake emits
 TurnResult(ERROR, error='fake script exhausted').
 
+A Later item (last in a turn) models a background wakeup: once the turn's items are played the session is idle, and
+when the test sets the Later's gate the fake emits TurnBegan and plays the Later's items as a self turn. A Later may
+be followed by another Later (chained wakeups).
+
 Callers must call wait_idle() before the next send_user(): the worker clears its busy flag after the last item.
 Each session records what was asked of it in `calls`; the backend records opened specs in `specs`.
 """
@@ -36,12 +40,14 @@ from tg_bridge.agents.events import (
     ApprovalRequest,
     Decision,
     SessionStarted,
+    TurnBegan,
     TurnResult,
     TurnStatus,
 )
 from tg_bridge.config import Config, LauncherSpec
 
 WAIT_SECONDS = 10.0
+GATE_POLL_SECONDS = 0.05  # how often a waiting Later re-checks its gate (Event.set() does not wake the session's condition)
 DEFAULT_MODELS = ("fake-model",)
 FAKE_CAPABILITIES = Capabilities(
     live_mode=True,
@@ -58,7 +64,26 @@ class WaitForInterrupt:
     """Script item: stop here until interrupt() or stop() arrives."""
 
 
-ScriptItem = AgentEvent | WaitForInterrupt
+@dataclass(frozen=True)
+class Later:
+    """Script item, last in a turn: after the turn's items, wait for gate (bounded by WAIT_SECONDS), then emit
+    TurnBegan(origin) and play items as a self turn. Nothing is played when the session was stopped first."""
+
+    gate: threading.Event
+    items: tuple["ScriptItem", ...]
+    origin: str = "task-notification"
+
+
+ScriptItem = AgentEvent | WaitForInterrupt | Later
+
+
+def _check_turn(turn: tuple[ScriptItem, ...]) -> None:
+    """A Later ends its turn: an item after it would never play, so a script like that is refused at once."""
+    for index, item in enumerate(turn):
+        if isinstance(item, Later):
+            if index != len(turn) - 1:
+                raise ValueError("a Later must be the last item of its turn")
+            _check_turn(item.items)
 
 
 class FakeRules:
@@ -85,7 +110,10 @@ class FakeBackend(AgentBackend):
         self.sessions: list["FakeSession"] = []
         self._models = tuple(models)
         self.stderr = stderr
-        self._turns: deque[tuple[ScriptItem, ...]] = deque(tuple(turn) for turn in scripts)
+        turns = tuple(tuple(turn) for turn in scripts)
+        for turn in turns:
+            _check_turn(turn)
+        self._turns: deque[tuple[ScriptItem, ...]] = deque(turns)
         self._lock = threading.Lock()
         self._counter = 0
 
@@ -245,29 +273,74 @@ class FakeSession(AgentSession):
     # worker thread
 
     def _play(self, items: tuple[ScriptItem, ...]) -> None:
-        result_seen = False
+        # owns_busy: this thread set the busy flag and must clear it. A waiting Later does not own it (a user turn may
+        # run meanwhile), so its timeout or stop must not clear the flag of that other turn.
+        owns_busy = True
         try:
             self._emit_started()
-            for item in items:
-                if isinstance(item, WaitForInterrupt):
-                    self._block(self._ended)
-                else:
-                    self._sink(item)
-                    result_seen = result_seen or isinstance(item, TurnResult)
-                    if isinstance(item, ApprovalRequest):
-                        approval_id = item.approval_id
-                        self._block(lambda: approval_id in self._answered or self._ended())
-                if self._ended():
-                    break
-            if not result_seen and self._interrupted and not self._closed:
-                self._sink(TurnResult(TurnStatus.INTERRUPTED, answer=None, subtype="interrupted"))
+            while True:
+                later = self._play_turn(items)
+                self._mark_idle()
+                owns_busy = False
+                if later is None or not self._await_later(later):
+                    return
+                owns_busy = True
+                items = later.items
         except TimeoutError as exc:
             if not self._closed:
                 self._sink(TurnResult(TurnStatus.ERROR, answer=None, error=str(exc)))
         finally:
-            with self._cond:
-                self._busy = False
-                self._cond.notify_all()
+            if owns_busy:
+                self._mark_idle()
+
+    def _play_turn(self, items: tuple[ScriptItem, ...]) -> Later | None:
+        """Plays one turn's items. Returns the trailing Later when the turn ended normally, else None."""
+        result_seen = False
+        later = None
+        for item in items:
+            if isinstance(item, Later):
+                later = item
+                break
+            if isinstance(item, WaitForInterrupt):
+                self._block(self._ended)
+            else:
+                self._sink(item)
+                result_seen = result_seen or isinstance(item, TurnResult)
+                if isinstance(item, ApprovalRequest):
+                    approval_id = item.approval_id
+                    self._block(lambda: approval_id in self._answered or self._ended())
+            if self._ended():
+                break
+        if not result_seen and self._interrupted and not self._closed:
+            self._sink(TurnResult(TurnStatus.INTERRUPTED, answer=None, subtype="interrupted"))
+        return None if self._ended() else later
+
+    def _await_later(self, later: Later) -> bool:
+        """Waits until the gate is set and no user turn runs, then marks the session busy and emits TurnBegan.
+        False when the session was stopped first (nothing plays). Raises TimeoutError after WAIT_SECONDS.
+
+        A gate that is never set ends the wait with an ERROR TurnResult that has no TurnBegan before it, while the
+        session is idle. The real session has no such result; a test that forgets to set its gate sees it instead of
+        hanging. Only the thread that set busy clears it (see _play), so a timed-out or stopped Later leaves the busy
+        flag of a user turn that started meanwhile alone."""
+        deadline = time.monotonic() + WAIT_SECONDS
+        with self._cond:
+            while not self._closed and (not later.gate.is_set() or self._busy):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"fake session waited more than {WAIT_SECONDS:g}s for a later turn")
+                self._cond.wait(min(remaining, GATE_POLL_SECONDS))
+            if self._closed:
+                return False
+            self._busy = True
+            self._interrupted = False
+        self._sink(TurnBegan(origin=later.origin))
+        return True
+
+    def _mark_idle(self) -> None:
+        with self._cond:
+            self._busy = False
+            self._cond.notify_all()
 
     def _ended(self) -> bool:
         return self._interrupted or self._closed

@@ -77,6 +77,7 @@ class InboxHarness:
         self.home = home
         self.paths = Paths.from_home(home.home)
         self.clock = FakeClock()
+        self.allowed: list[int] = [USER]  # the allowlist the service reads; a test may change it
         self.db = Database(self.paths)
         self.kv = kv_class(self.db)
         self.sessions = SessionRepo(self.db, self.clock)
@@ -97,6 +98,7 @@ class InboxHarness:
             spool_dir=self.paths.spool,
             clock=self.clock,
             logger=self.logger,
+            allowed_user_ids=lambda: self.allowed,
         )
 
     def close(self) -> None:

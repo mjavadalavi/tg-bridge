@@ -74,7 +74,10 @@ class StubRunners:
             return call
 
         return cli.Runners(daemon=lambda: self.calls.append(("daemon", ())), send=record("send"),
-                           sendfile=record("sendfile"), type_text=record("type"), spawn=record("spawn"))
+                           sendfile=record("sendfile"), type_text=record("type"), spawn=record("spawn"),
+                           hook_permission=record("hook"), view=record("view"),
+                           view_sync=record("view-sync"), view_pane=record("view-pane"),
+                           view_delete=record("view-delete"))
 
 
 def _run_quietly(action: Callable[[], Any]) -> tuple[Any, str, str]:
@@ -145,11 +148,84 @@ class RouteTests(unittest.TestCase):
         stub = StubRunners(status=1)
         self.assertEqual(cli.route(["type", "%3", "x"], stub.runners()), 1)
 
+    def test_hook_permission_runs_the_permission_client_without_arguments(self) -> None:
+        self.assertEqual(cli.route(["hook", "permission"], self.runners), 0)
+        self.assertEqual(self.stub.calls, [("hook", ())])
+
+    def test_hook_with_another_kind_or_none_is_usage_and_1(self) -> None:
+        for args in (["hook"], ["hook", "other"]):
+            status, _, err = _run_quietly(lambda args=args: cli.route(args, self.runners))
+            self.assertEqual((status, err.strip()), (1, cli.USAGE["hook"]), args)
+        self.assertEqual(self.stub.calls, [])
+
+    def test_view_runs_the_viewer_without_arguments(self) -> None:
+        self.assertEqual(cli.route(["view"], self.runners), 0)
+        self.assertEqual(self.stub.calls, [("view", ())])
+
+    def test_view_sync_runs_the_sync_loop(self) -> None:
+        self.assertEqual(cli.route(["view-sync", "extra"], self.runners), 0)
+        self.assertEqual(self.stub.calls, [("view-sync", ())])
+
+    def test_view_pane_passes_the_thread(self) -> None:
+        self.assertEqual(cli.route(["view-pane", "9201"], self.runners), 0)
+        self.assertEqual(self.stub.calls, [("view-pane", ("9201",))])
+
+    def test_view_pane_without_a_thread_is_usage_and_1(self) -> None:
+        status, _, err = _run_quietly(lambda: cli.route(["view-pane"], self.runners))
+        self.assertEqual((status, err.strip()), (1, cli.USAGE["view-pane"]))
+        self.assertEqual(self.stub.calls, [])
+
+    def test_view_delete_routes_its_thread_and_refuses_a_missing_one(self) -> None:
+        self.assertEqual(cli.route(["view-delete", "9"], self.runners), 0)
+        self.assertEqual(self.stub.calls, [("view-delete", ("9",))])
+        status, _, err = _run_quietly(lambda: cli.route(["view-delete"], self.runners))
+        self.assertEqual((status, err.strip()), (1, cli.USAGE["view-delete"]))
+        self.assertEqual(len(self.stub.calls), 1)
+
+    def test_view_pane_refuses_a_thread_that_is_not_a_number(self) -> None:
+        with TempHome() as home:
+            status, _, err = _run_quietly(lambda: cli.view_topic_pane(Paths.from_home(home.home), "9x"))
+        self.assertEqual(status, 1)
+        self.assertIn("'9x'", err)
+
+    def test_help_lists_the_view_commands(self) -> None:
+        for word in ("view ", "view-sync", "view-pane <thread>", "view-delete <thread>"):
+            self.assertIn(word, tg_bridge.__doc__)
+
     def test_help_and_unknown_words_print_the_spec_and_exit_0(self) -> None:
         for word in ("help", "no-such-command"):
             status, out, _ = _run_quietly(lambda word=word: cli.route([word], self.runners))
             self.assertEqual((status, out), (0, tg_bridge.__doc__), word)
         self.assertEqual(self.stub.calls, [])
+
+
+class OpenViewTests(unittest.TestCase):
+    def test_view_makes_the_session_and_attaches_and_leaves_the_windows_to_the_sync_window(self) -> None:
+        with TempHome() as home:
+            with mock.patch.object(cli, "Viewer") as viewer_class, mock.patch.object(cli, "attach") as attach:
+                self.assertEqual(cli.open_view(Paths.from_home(home.home)), 0)
+        viewer = viewer_class.return_value
+        viewer.ensure_session.assert_called_once_with()
+        viewer.sync_windows.assert_not_called()
+        attach.assert_called_once_with()
+
+
+class HookPermissionProcessTests(unittest.TestCase):
+    """`tg-bridge hook permission` as the TUI runs it: a real child process, no App, no lock, no bridge log."""
+
+    def test_without_a_bridge_it_denies_on_stdout_and_touches_no_state(self) -> None:
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        with TempHome() as home:
+            env = {"HOME": home.home, "PATH": os.environ.get("PATH", "")}
+            proc = subprocess.run([sys.executable, ENTRY, "hook", "permission"], input=payload, capture_output=True,
+                                  text=True, env=env, timeout=30, check=False)
+            paths = Paths.from_home(home.home)
+            self.assertFalse(os.path.exists(paths.lock))
+            self.assertFalse(os.path.exists(paths.log))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        decision = json.loads(proc.stdout)["hookSpecificOutput"]["decision"]
+        self.assertEqual(decision["behavior"], "deny")
+        self.assertTrue(decision["message"].startswith("tg-bridge is not reachable: "), decision)
 
 
 class ConfigLogTests(unittest.TestCase):
@@ -163,6 +239,20 @@ class ConfigLogTests(unittest.TestCase):
             with open(paths.log, encoding="utf-8") as handle:
                 hidden = [line for line in handle if "hidden" in line]
             self.assertEqual(len(hidden), 1, hidden)
+
+
+class DaemonStartupTests(unittest.TestCase):
+    """run_daemon builds the App with the view start-up sweep: only the daemon may clear the 'running' state of the views."""
+
+    def test_run_daemon_builds_the_app_with_the_view_sweep(self) -> None:
+        with TempHome() as home:
+            paths = Paths.from_home(home.home)
+            with mock.patch.object(cli, "App") as app_cls, \
+                    mock.patch.object(cli, "_serve", side_effect=SystemExit(0)), \
+                    mock.patch.object(cli, "ignore_stop_signals"):
+                with self.assertRaises(SystemExit):
+                    cli.run_daemon(paths)
+        self.assertIs(app_cls.build.call_args.kwargs.get("sweep_stale_views"), True)
 
 
 class HelpTextTests(unittest.TestCase):

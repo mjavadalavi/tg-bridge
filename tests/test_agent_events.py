@@ -8,6 +8,7 @@ from tg_bridge.agents.base import AgentBackend, Capabilities, ModeChoice, Sessio
 from tg_bridge.agents.events import (
     ApprovalRequest,
     ApprovalWithdrawn,
+    BackgroundWork,
     Decision,
     HandoffEntry,
     ProcessExited,
@@ -18,6 +19,7 @@ from tg_bridge.agents.events import (
     ToolEnd,
     ToolStart,
     TurnResult,
+    TurnBegan,
     TurnStatus,
     UsageEvent,
 )
@@ -116,6 +118,26 @@ class EventDefaultsTests(unittest.TestCase):
     def test_handoff_entry_holds_role_and_text(self) -> None:
         entry = HandoffEntry(role="tool", text="$ git status")
         self.assertEqual((entry.role, entry.text), ("tool", "$ git status"))
+
+
+class BackgroundEventsTests(unittest.TestCase):
+    def test_background_work_and_turn_began_are_frozen_events(self) -> None:
+        work = BackgroundWork(pending=2)
+        began = TurnBegan(origin="scheduled")
+        self.assertEqual(work, BackgroundWork(pending=2))
+        self.assertEqual(began, TurnBegan(origin="scheduled"))
+        self.assertEqual(TurnBegan().origin, "")
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            work.pending = 3  # type: ignore[misc]
+        from tg_bridge.agents.events import AgentEvent
+
+        self.assertIn(BackgroundWork, AgentEvent.__args__)
+        self.assertIn(TurnBegan, AgentEvent.__args__)
+
+    def test_capabilities_linger_defaults_false(self) -> None:
+        caps = Capabilities(live_mode=True, live_model=True, questions=True, cost_usd=True, images=True,
+                            preassigned_id=True)
+        self.assertIs(caps.linger, False)
 
 
 class _MinimalBackend(AgentBackend):

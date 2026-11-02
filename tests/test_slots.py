@@ -241,6 +241,44 @@ class ParkedTurnTests(unittest.TestCase):
             self.assertEqual(h.pool.free(), SLOT_COUNT - 1)
 
 
+class TimedTakeTests(unittest.TestCase):
+    """take_for: one timed slice of the wait. It neither announces the queue nor checks shutdown; the caller does."""
+
+    def test_take_for_gives_up_after_its_slice_when_every_permit_is_busy(self) -> None:
+        with TempHome() as home:
+            h = Harness(home)
+            holders = [h.slot(TOPIC_B), h.slot(TOPIC_C)]
+            for holder in holders:
+                holder.take()
+            waiter = h.slot(TOPIC_A)
+            self.assertFalse(waiter.take_for(POLL))
+            self.assertFalse(waiter.held)
+            self.assertEqual(h.pool.free(), 0)
+            self.assertEqual(h.notices(TOPIC_A), [], "a timed slice must not announce the queue")
+
+    def test_take_for_gets_a_permit_released_during_its_slice(self) -> None:
+        with TempHome() as home:
+            h = Harness(home)
+            holders = [h.slot(TOPIC_B), h.slot(TOPIC_C)]
+            for holder in holders:
+                holder.take()
+            waiter = h.slot(TOPIC_A)
+            releaser = threading.Timer(POLL / 2, holders[0].give_back)
+            releaser.start()
+            self.assertTrue(waiter.take_for(WAIT))
+            releaser.join()
+            self.assertTrue(waiter.held)
+            self.assertEqual(h.pool.free(), 0)
+
+    def test_take_for_while_holding_takes_no_second_permit(self) -> None:
+        with TempHome() as home:
+            h = Harness(home)
+            slot = h.slot(TOPIC_A)
+            slot.take()
+            self.assertTrue(slot.take_for(POLL))
+            self.assertEqual(h.pool.free(), SLOT_COUNT - 1)
+
+
 class BalanceTests(unittest.TestCase):
     def test_permits_balanced_after_many_cycles(self) -> None:
         with TempHome() as home:

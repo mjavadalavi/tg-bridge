@@ -18,7 +18,8 @@ from typing import Any
 from tg_bridge.agents.defaults import build_default_registry, title_launcher_from_env
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.bot.callbacks.approvals import ApprovalTaps
-from tg_bridge.bot.callbacks.handlers import QueueTaps, StatusTaps, StopTap
+from tg_bridge.bot.callbacks.handlers import QueueTaps, StatusTaps, StopChoiceTaps, StopTap
+from tg_bridge.bot.callbacks.keep_taps import KeepTaps
 from tg_bridge.bot.callbacks.picker_taps import PickerTaps
 from tg_bridge.bot.callbacks.router import CallbackRouter
 from tg_bridge.bot.commands.base import CommandDeps, CommandRegistry
@@ -26,6 +27,7 @@ from tg_bridge.bot.commands.info import register_info_commands
 from tg_bridge.bot.commands.session import SessionCommands
 from tg_bridge.bot.commands.settings import SettingsCommands
 from tg_bridge.bot.inbound import MessageHandler
+from tg_bridge.bot.keep_guard import KeepGuard
 from tg_bridge.clock import Clock, SystemClock
 from tg_bridge.config import BACKEND_CLAUDE, Config
 from tg_bridge.core.cards import ApprovalCards
@@ -33,16 +35,24 @@ from tg_bridge.core.cwd import CwdService
 from tg_bridge.core.dispatcher import Dispatcher
 from tg_bridge.core.handoff import HandoffService
 from tg_bridge.core.launcher_switch import LauncherSwitch
+from tg_bridge.core.linger import LingerService
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.media import MediaService, SonioxTranscriber
+from tg_bridge.core.removals import Removals
 from tg_bridge.core.permissions import PermissionService
+from tg_bridge.core.self_turn import SelfTurns
 from tg_bridge.core.slots import SLOT_COUNT, SlotPool
+from tg_bridge.core.terminal_claim import clear_turn_marks
 from tg_bridge.core.titles import TitleService
 from tg_bridge.core.topics import TopicResolver
 from tg_bridge.core.turn_listeners import WaitRouter
+from tg_bridge.core.delete_requests import DeleteRequests
+from tg_bridge.core.topic_probe import TopicProbe
+from tg_bridge.core.topic_remover import TopicRemover
 from tg_bridge.core.turn_runner import TurnRunner
+from tg_bridge.core.view_recorder import ViewRecorder, mark_stale_views
 from tg_bridge.core.workers import WorkerPool
-from tg_bridge.daemon.inbox import InboxService
+from tg_bridge.daemon.inbox import GROUP_KEY, InboxService
 from tg_bridge.daemon.lifecycle import Lifecycle
 from tg_bridge.daemon.panes import Panes
 from tg_bridge.daemon.poller import Poller
@@ -50,6 +60,7 @@ from tg_bridge.feed.feed import TurnFeed
 from tg_bridge.logging_ import Logger
 from tg_bridge.paths import Paths
 from tg_bridge.store.asks import AskRepo
+from tg_bridge.store.forget import TopicForget
 from tg_bridge.store.db import Database
 from tg_bridge.store.inbox import CwdRepo, InboxRepo
 from tg_bridge.store.kv import KvRepo
@@ -90,6 +101,17 @@ def fake_telegram_requested(paths: Paths, env: Mapping[str, str], log: Callable[
     real = real_home()
     if not real or home == os.path.realpath(real):
         log(FAKE_TELEGRAM_IGNORED_LOG.format(env=FAKE_TELEGRAM_ENV))
+        return False
+    return True
+
+
+def ensure_view_dir(path: str, logger: Logger) -> bool:
+    """Creates the view folder (mode 0700). When it cannot be created the daemon runs with the views off: one warning
+    line in the log, and no error."""
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except OSError as exc:
+        logger.log(f"warning: view folder {path} cannot be created, views are off: {exc!r}")
         return False
     return True
 
@@ -140,20 +162,31 @@ class App:
     panes: Panes
     messenger: Messenger
     uploader: Uploader
+    linger: LingerService  # the one kept-session service, shared by the turn runner and the dispatcher
+    remover: TopicRemover  # forgets a topic completely (session, queue, rows, kv keys, view files, Telegram)
+    probe: TopicProbe  # finds the topics deleted in Telegram and removes them (started by the daemon, see cli)
+    delete_requests: DeleteRequests  # answers the view's delete requests (view-delete), started by the daemon
+    topics: TopicResolver  # topic resolution and the thread name learning
 
     @classmethod
     def build(cls, paths: Paths, config: Config, telegram: TelegramClient | None = None,
               clock: Clock | None = None, registry: BackendRegistry | None = None,
-              env: Mapping[str, str] | None = None) -> "App":
+              env: Mapping[str, str] | None = None, sweep_stale_views: bool = False) -> "App":
         """Creates every service once and wires it. env (os.environ when omitted) supplies the child environment,
-        the proxy settings and TG_TITLE_LAUNCHER; the caller owns the App and must close() it."""
+        the proxy settings and TG_TITLE_LAUNCHER; the caller owns the App and must close() it. sweep_stale_views is
+        True only at the daemon's start-up (it clears the 'running' state a killed daemon left in the view files, so
+        a short command must never pass it). A view folder that cannot be created turns the views off, not the App."""
         environ: Mapping[str, str] = os.environ if env is None else env
         clock = SystemClock() if clock is None else clock
         logger = Logger(paths.log)
         os.makedirs(paths.turns, mode=0o700, exist_ok=True)
+        views_on = ensure_view_dir(paths.view, logger)
+        if views_on and sweep_stale_views:
+            mark_stale_views(paths.view, clock, logger)
+            clear_turn_marks(paths.view, logger)
         db = Database(paths)
         try:
-            return cls._wire(paths, config, logger, clock, db, environ, telegram, registry)
+            return cls._wire(paths, config, logger, clock, db, environ, telegram, registry, views_on)
         except BaseException:
             db.close()
             raise
@@ -161,7 +194,7 @@ class App:
     @classmethod
     def _wire(cls, paths: Paths, config: Config, logger: Logger, clock: Clock, db: Database,
               environ: Mapping[str, str], telegram: TelegramClient | None,
-              registry: BackendRegistry | None) -> "App":
+              registry: BackendRegistry | None, views_on: bool) -> "App":
         openers = OpenerCache(lambda: proxy_url(paths, environ, logger.log))
         if telegram is None and fake_telegram_requested(paths, environ, logger.log):
             telegram = _new_fake_telegram(clock)
@@ -198,53 +231,83 @@ class App:
         def feeds(chat_id: int | str, thread_id: int, parked: Callable[[], bool]) -> TurnFeed:
             return TurnFeed(telegram, logger, clock, chat_id, thread_id, parked=parked)
 
+        def views(thread_id: int, topic: str, transport: str, launcher: str) -> ViewRecorder:
+            return ViewRecorder(paths.view, thread_id, topic, transport, launcher, clock, logger)
+
+        uploader = Uploader(paths, openers, logger)
+        answers = AnswerSender(telegram, uploader, messenger, logger, clock)
+        self_turns = SelfTurns(
+            config=config, clock=clock, logger=logger, feeds=feeds, views=views if views_on else None,
+            permissions=permissions, handoff=handoff, waits=waits, live=live, turns=turns, answers=answers,
+            messenger=messenger)
+        linger = LingerService(
+            config=config, sessions=sessions, kv=kv, live=live, permissions=permissions, self_turns=self_turns,
+            clock=clock, logger=logger)
         runner = TurnRunner(
             config=config, registry=registry, live=live, permissions=permissions, waits=waits, sessions=sessions,
             history=history, rules=rules, turns=turns, kv=kv, handoff=handoff, feeds=feeds, clock=clock,
-            logger=logger, base_env=dict(environ), errfile_dir=paths.turns)
+            logger=logger, base_env=dict(environ), errfile_dir=paths.turns,
+            views=views if views_on else None, view_dir=paths.view if views_on else "", linger=linger)
         titles = TitleService(backend=registry.get(BACKEND_CLAUDE), sessions=sessions, messenger=messenger,
                               pool=title_pool, logger=logger)
-        uploader = Uploader(paths, openers, logger)
-        answers = AnswerSender(telegram, uploader, messenger, logger, clock)
+        removals = Removals(clock)  # the marks of the topics being removed: the dispatcher and the remover share them
         dispatcher = Dispatcher(
             turns=runner, slots=slots, inbox=inbox_rows, messenger=messenger, answers=answers, titles=titles,
-            client=telegram, live=live, config=config, logger=logger)
+            client=telegram, live=live, config=config, logger=logger, linger=linger,
+            view_dir=paths.view if views_on else "", removals=removals)
+        remover = TopicRemover(
+            live=live, linger=linger, dispatcher=dispatcher,
+            forget=TopicForget(db=db, sessions=sessions, history=history, rules=rules, asks=asks, inbox=inbox_rows,
+                               kv=kv),
+            client=telegram, kv=kv, group_key=GROUP_KEY, view_dir=paths.view if views_on else "", logger=logger,
+            clock=clock, removals=removals)
+        probe = TopicProbe(
+            sessions=sessions, kv=kv, live=live, linger=linger, remover=remover, client=telegram, group_key=GROUP_KEY,
+            view_dir=paths.view if views_on else "", logger=logger, clock=clock,
+            interval=config.topic_probe_seconds())
+        delete_requests = DeleteRequests(view_dir=paths.view, sessions=sessions, remover=remover, logger=logger)
 
         # bot: topics, folders, launchers, commands and taps
         topics = TopicResolver(config=config, kv=kv, sessions=sessions, logger=logger)
         cwd = CwdService(sessions=sessions, kv=kv, paths=cwd_paths, messenger=messenger, live=live,
                          search_pool=search_pool, out_pool=out, logger=logger, clock=clock, handoff=handoff)
         launchers = LauncherSwitch(config, sessions, history, handoff, registry)
+        keep = KeepGuard(linger=linger, live=live)  # one guard: its cards are answered by the taps below
         stops = SessionCommands(config=config, sessions=sessions, history=history, live=live, backends=registry,
-                                messenger=messenger, clock=clock, logger=logger, handoff=handoff)
+                                messenger=messenger, clock=clock, logger=logger, handoff=handoff, linger=linger,
+                                keep=keep)
         settings = SettingsCommands(config=config, sessions=sessions, live=live, backends=registry,
-                                    permissions=permissions, launchers=launchers, cwd=cwd, logger=logger)
+                                    permissions=permissions, launchers=launchers, cwd=cwd, logger=logger, keep=keep)
         commands = CommandRegistry()
         register_info_commands(commands)
         stops.register(commands)
         settings.register(commands)
         commands.set_menu_order(LIVE_MENU_ORDER)
         deps = CommandDeps(config=config, sessions=sessions, turns=turns, rules=rules, kv=kv, live=live,
-                           queues=_QueueView(dispatcher), backends=registry, messenger=messenger, out=out)
+                           queues=_QueueView(dispatcher), backends=registry, messenger=messenger, out=out,
+                           linger=linger, view_dir=paths.view if views_on else "")
         router = CallbackRouter(config=config, client=telegram, messenger=messenger, out=out, logger=logger)
         for tap in (ApprovalTaps(permissions=permissions),
-                    QueueTaps(dispatcher=dispatcher, live=live),
+                    QueueTaps(dispatcher=dispatcher, live=live, linger=linger),
                     StopTap(stops=stops),
+                    StopChoiceTaps(stops=stops),
                     StatusTaps(deps=deps, registry=commands, stops=stops),
                     PickerTaps(config=config, sessions=sessions, live=live, backends=registry,
                                permissions=permissions, launchers=launchers, stops=stops, rules=rules,
-                               folders=cwd, logger=logger)):
+                               folders=cwd, logger=logger, keep=keep),
+                    KeepTaps(keep=keep)):
             tap.register(router)
         panes = Panes(clock=clock)
         media = MediaService(paths, telegram, messenger, openers, SonioxTranscriber(paths, openers, clock), clock)
         handler = MessageHandler(
             config=config, topics=topics, sessions=sessions, kv=kv, inbox=inbox_rows, dispatcher=dispatcher,
             permissions=permissions, live=live, cwd=cwd, commands=commands, command_deps=deps, backends=registry,
-            messenger=messenger, out=out, media=media, media_pool=media_pool, seats=panes, logger=logger)
+            messenger=messenger, out=out, media=media, media_pool=media_pool, seats=panes, logger=logger, keep=keep)
 
         # daemon: inbox, poller, lifecycle
         inbox = InboxService(inbox=inbox_rows, kv=kv, sessions=sessions, messenger=messenger, messages=handler,
-                             callbacks=router, spool_dir=paths.spool, clock=clock, logger=logger)
+                             callbacks=router, spool_dir=paths.spool, clock=clock, logger=logger,
+                             allowed_user_ids=config.allow_user_ids)
         poller = Poller(telegram=telegram, inbox=inbox, kv=kv, sessions=sessions, messenger=messenger,
                         config=config, clock=clock, logger=logger)
         lifecycle = Lifecycle(live=live, permissions=permissions, kv=kv, messenger=messenger, telegram=telegram,
@@ -252,10 +315,13 @@ class App:
         return cls(paths=paths, config=config, logger=logger, clock=clock, db=db, client=telegram,
                    registry=registry, kv=kv, sessions=sessions, live=live, permissions=permissions,
                    dispatcher=dispatcher, commands=commands, handler=handler, router=router, inbox=inbox,
-                   poller=poller, lifecycle=lifecycle, panes=panes, messenger=messenger, uploader=uploader)
+                   poller=poller, lifecycle=lifecycle, panes=panes, messenger=messenger, uploader=uploader,
+                   linger=linger, remover=remover, probe=probe, delete_requests=delete_requests, topics=topics)
 
     def shutdown_sessions(self) -> int:
         """Stops every live session (no new turn can start from here on). Returns how many were signalled."""
+        self.delete_requests.stop()  # no view delete starts after this; one in progress ends at its next step
+        self.probe.stop()  # no removal round starts after this; a round in progress ends at its next step
         return self.lifecycle.shutdown_sessions()
 
     def close(self) -> None:

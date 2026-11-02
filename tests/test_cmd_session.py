@@ -13,18 +13,22 @@ that made it; a launcher that is not in config refuses the resume; the resume bu
 Every test runs against a migrated database in a TempHome, with a FakeClock and FakeTelegram; no subprocess starts.
 """
 
+import json
 import os
 import threading
 import unittest
 
 from tests.fakes.clock import FakeClock
 from tests.fakes.telegram import FakeTelegram
+from tests.linger_stub import StubKeptLinger
 from tests.support import TempHome
 from tests.turn_support import wait_until
 from tg_bridge.agents.claude.history import encoded_cwd
 from tg_bridge.agents.defaults import build_default_registry
 from tg_bridge.bot.commands.base import CommandDeps, CommandRegistry
 from tg_bridge.bot.commands.session import (
+    BOUND_ELSEWHERE_TEXT,
+    LINGER_STOPPED_TEXT,
     NEW_BUSY_TEXT,
     NEW_DONE_TEXT,
     NEW_TEXT,
@@ -35,11 +39,15 @@ from tg_bridge.bot.commands.session import (
     STILL_STOPPING_TEXT,
     STOP_NEW_TOAST,
     SessionCommands,
+    StopKind,
 )
+from tg_bridge.bot.pickers import STOP_CHOICE_TEXT, started_label
+from tg_bridge.clock import utc_stamp
 from tg_bridge.config import Config
-from tg_bridge.core.dispatcher import TopicQueues
 from tg_bridge.core.handoff import HandoffService
+from tg_bridge.core.linger import LingerStatus
 from tg_bridge.core.live import LiveRegistry
+from tg_bridge.core.topic_queues import TopicQueues
 from tg_bridge.core.workers import WorkerPool
 from tg_bridge.logging_ import Logger
 from tg_bridge.paths import Paths
@@ -57,6 +65,8 @@ TOPIC = "SX"
 CLAUDE_CMD = "wrap run"
 SHARED_CMD = "shared-cmd"
 OTHER_CMD = "plain run"
+HOME_CMD = "home run"
+RAW_CMD = "raw run"
 CODEX_CMD = "codex"
 GONE_CMD = "retired-cmd"
 U1 = "1f2e3d4c-aaaa-4bbb-8ccc-000000000001"
@@ -479,6 +489,54 @@ class ResumeLauncherTests(SessionCase):
                                       "run here")
         self.assertEqual(self.row().uuid, "", "a refused resume changes nothing")
 
+    def reconfigure(self, data: dict) -> None:
+        """Rebuilds the config, the backends and the commands on new config data (the wiring of setUp)."""
+        self.config = Config(data, home=self.base, env={})
+        self.backends = build_default_registry(self.config, self.logger, self.clock, title_launcher="")
+        self.commands = self.build_commands(self.clock)
+
+    def test_an_unnamed_launcher_sharing_the_claude_folder_keeps_its_own_session(self) -> None:
+        """The topic runs a command that is not in config (an unnamed launcher on ~/.claude), and the named launcher
+        'home' uses that same folder. The transcript is in that folder, so resuming it switches nothing."""
+        data = config_data(self.project, os.path.join(self.base, "codex"))
+        data["launchers"]["home"] = {"cmd": HOME_CMD, "config_dir": os.path.join(self.base, ".claude")}
+        data["topics"][TOPIC]["launcher"] = RAW_CMD
+        self.reconfigure(data)
+        folder = os.path.join(self.base, ".claude", "projects", encoded_cwd(os.path.realpath(self.project)))
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, U1 + ".jsonl"), "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "ai-title", "aiTitle": "own"}) + "\n")
+        self.note(U1, RAW_CMD)
+        self.assertEqual(self.commands.resume_session(THREAD, U1), (True, ""))
+        self.assertEqual((self.row().uuid, self.row().launcher_pick), (U1, ""),
+                         "the topic keeps its unnamed launcher, not 'home'")
+
+    def test_a_transcript_in_the_current_folder_is_not_switched_by_the_history_row(self) -> None:
+        """The current launcher's own folder holds the transcript while the history row names launcher 'plain'. Nothing
+        is copied or switched: the topic is bound to the session under its current launcher, and the row follows it."""
+        folder = os.path.join(self.project, "cfg-a", "projects", encoded_cwd(os.path.realpath(self.project)))
+        os.makedirs(folder, exist_ok=True)
+        with open(FIXTURE, encoding="utf-8") as handle, open(os.path.join(folder, U1 + ".jsonl"), "w",
+                                                             encoding="utf-8") as out:
+            out.write(handle.read())
+        self.note(U1, OTHER_CMD)
+        self.run_cmd(f"/resume {U1}")
+        self.assertEqual(self.last(), f"↩️ the next message resumes session {U1}")
+        self.assertEqual((self.row().uuid, self.row().launcher_pick, self.row().backend), (U1, "", "claude"))
+        self.assertEqual(self.history.find(THREAD, U1).launcher, CLAUDE_CMD, "the row is re-tagged to the current launcher")
+
+    def test_a_held_resume_without_a_history_row_creates_no_row(self) -> None:
+        """The current folder holds the transcript but no history row exists: the re-tag only re-labels an existing row,
+        so nothing is inserted into the history."""
+        folder = os.path.join(self.project, "cfg-a", "projects", encoded_cwd(os.path.realpath(self.project)))
+        os.makedirs(folder, exist_ok=True)
+        with open(FIXTURE, encoding="utf-8") as handle, open(os.path.join(folder, U1 + ".jsonl"), "w",
+                                                             encoding="utf-8") as out:
+            out.write(handle.read())
+        self.run_cmd(f"/resume {U1}")
+        self.assertEqual(self.row().uuid, U1)
+        self.assertIsNone(self.history.find(THREAD, U1))
+
     def test_the_picker_lists_both_backends_newest_first_with_the_launcher_mark(self) -> None:
         self.note(U1, CLAUDE_CMD, text="claude one")
         self.note(U2, CODEX_CMD, backend="codex", text="codex two")
@@ -488,6 +546,232 @@ class ResumeLauncherTests(SessionCase):
         self.assertIn("codex two", labels[0], "newest first")
         self.assertIn("⚠ codex · ", labels[0])
         self.assertNotIn("⚠", labels[1])
+
+
+class DiskSessionsTests(SessionCase):
+    """Sessions the CLI left on disk for the topic's folder show in /resume, tagged with their launcher."""
+
+    def write_transcript(self, cfg: str, sid: str, mtime: float, title: str = "") -> str:
+        """A transcript under a config folder for the topic's cwd, with its modification time set. Returns its path."""
+        folder = os.path.join(cfg, "projects", encoded_cwd(os.path.realpath(self.project)))
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, sid + ".jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "ai-title", "aiTitle": title}) + "\n")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def labels(self) -> list[str]:
+        return [b["text"] for keyboard in self.telegram.buttons(THREAD) for row in keyboard for b in row]
+
+    def cfg_a(self) -> str:
+        return os.path.join(self.project, "cfg-a")
+
+    def cfg_b(self) -> str:
+        return os.path.join(self.project, "cfg-b")
+
+    def test_a_transcript_on_disk_under_the_current_launcher_is_listed_once(self) -> None:
+        """A transcript in the folder of 'wrap' (and 'shared', which uses the same folder) is listed once, under 'wrap'."""
+        stamp = self.clock.now() + 100
+        self.write_transcript(self.cfg_a(), U1, stamp, "fix login")
+        self.run_cmd("/resume")
+        self.assertEqual(self.labels(), [f"wrap · {started_label(utc_stamp(stamp))} · fix login…"])
+        self.assertEqual(self.button_callbacks(), [f"cm:{THREAD}:rs:{self.history.find(THREAD, U1).id}"])
+        self.assertEqual(self.history.find(THREAD, U1).cwd, os.path.realpath(self.project))
+
+    def test_a_shared_folder_is_attributed_to_the_launcher_in_use(self) -> None:
+        self.sessions.set_launcher_pick(THREAD, "shared")
+        self.write_transcript(self.cfg_a(), U1, self.clock.now() + 100, "fix login")
+        picker = self.commands.resume_picker(THREAD)
+        self.assertEqual(picker.rows[0][0][0], f"shared · {started_label(utc_stamp(self.clock.now() + 100))} · fix login…")
+        self.assertEqual(self.history.find(THREAD, U1).launcher, SHARED_CMD)
+
+    def test_a_transcript_under_another_launcher_is_tagged_and_tapping_copies_it(self) -> None:
+        """A transcript under cfg-b shows with ⚠ and 'plain'; tapping it copies the transcript into cfg-a and binds it."""
+        stamp = self.clock.now() + 100
+        with open(FIXTURE, encoding="utf-8") as handle:
+            text = handle.read()
+        cfg_b_file = self.write_transcript(self.cfg_b(), U1, stamp)
+        with open(cfg_b_file, "w", encoding="utf-8") as out:
+            out.write(text)
+        os.utime(cfg_b_file, (stamp, stamp))
+        self.run_cmd("/resume")
+        self.assertEqual(self.labels(), [f"⚠ plain · {started_label(utc_stamp(stamp))} · Login fix…"])
+        outcome = self.commands.resume_tap(THREAD, self.history.find(THREAD, U1).id)
+        self.assertIn("history copied from launcher plain into wrap", outcome.toast)
+        copied = os.path.join(self.cfg_a(), "projects", encoded_cwd(os.path.realpath(self.project)), U1 + ".jsonl")
+        self.assertTrue(os.path.exists(copied), "the transcript was not copied into the current launcher's folder")
+        self.assertEqual((self.row().uuid, self.history.find(THREAD, U1).launcher), (U1, CLAUDE_CMD))
+
+    def test_a_session_already_in_history_is_not_duplicated(self) -> None:
+        """The history row keeps its text and start; the disk file adds no second row."""
+        self.note(U1, CLAUDE_CMD, text="from history")
+        self.write_transcript(self.cfg_a(), U1, self.clock.now() + 500, "disk title")
+        self.run_cmd("/resume")
+        rows = [r for r in self.history.list_for(THREAD, "claude", limit=None) if r.uuid == U1]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].first_text, rows[0].started), ("from history", utc_stamp(self.clock.now())))
+        self.assertEqual(len(self.button_callbacks()), 1)
+
+    def test_disk_sessions_sort_by_start_time_among_history_rows(self) -> None:
+        """Newest first by start time: a disk session newer than the history row leads, an older one comes last."""
+        now = self.clock.now()
+        self.note(U2, CLAUDE_CMD, text="history two")
+        self.write_transcript(self.cfg_a(), U1, now - 3600, "older on disk")
+        self.write_transcript(self.cfg_a(), U3, now + 3600, "newer on disk")
+        self.run_cmd("/resume")
+        expected = [self.history.find(THREAD, uuid).id for uuid in (U3, U2, U1)]
+        self.assertEqual(self.button_callbacks(), [f"cm:{THREAD}:rs:{rid}" for rid in expected])
+
+    def test_at_most_ten_disk_sessions_are_listed_newest_first(self) -> None:
+        sids = [f"1f2e3d4c-aaaa-4bbb-8ccc-0000000001{n:02d}" for n in range(12)]
+        for n, sid in enumerate(sids):
+            self.write_transcript(self.cfg_a(), sid, self.clock.now() + n * 10, f"disk {n}")
+        picker = self.commands.resume_picker(THREAD)
+        self.assertEqual(len(picker.rows), 10)
+        self.assertTrue(picker.rows[0][0][0].endswith("· disk 11…"))
+        self.assertIsNone(self.history.find(THREAD, sids[0]), "the two oldest are beyond the limit")
+
+    def test_a_session_bound_to_another_topic_is_not_offered(self) -> None:
+        """Another topic is bound to U1 right now: this topic must not list it, while its own U2 still shows."""
+        other = THREAD + 1
+        self.sessions.ensure(other, "other", CLAUDE_CMD, self.project)
+        self.sessions.set_uuid(other, U1)
+        self.write_transcript(self.cfg_a(), U1, self.clock.now() + 200, "bound elsewhere")
+        self.write_transcript(self.cfg_a(), U2, self.clock.now() + 100, "free one")
+        self.commands.resume_picker(THREAD)
+        self.assertIsNone(self.history.find(THREAD, U1), "a session another topic is bound to was offered")
+        self.assertIsNotNone(self.history.find(THREAD, U2))
+
+    def test_this_topics_own_session_is_still_offered(self) -> None:
+        self.sessions.set_uuid(THREAD, U1)
+        self.write_transcript(self.cfg_a(), U1, self.clock.now() + 100, "my own")
+        self.commands.resume_picker(THREAD)
+        self.assertIsNotNone(self.history.find(THREAD, U1))
+
+    def test_no_topic_row_means_no_disk_sessions_and_no_crash(self) -> None:
+        self.write_transcript(self.cfg_a(), U1, self.clock.now() + 100, "fix login")
+        self.db.execute("DELETE FROM sessions WHERE thread_id=?", (THREAD,))
+        self.assertEqual(self.commands.resume_picker(THREAD).rows, [])
+        self.assertIsNone(self.history.find(THREAD, U1))
+
+
+class DiskFixesTests(SessionCase):
+    """The /resume fixes: the launcher follows the transcript file, a session bound to another topic is neither listed nor
+    resumed, the picker is ordered by a listed file's mtime, and the disk listing skips the bound ids before its limit."""
+
+    def write_transcript(self, cfg: str, sid: str, mtime: float, title: str = "") -> str:
+        """A transcript under a config folder for the topic's cwd, with its modification time set. Returns its path."""
+        folder = os.path.join(cfg, "projects", encoded_cwd(os.path.realpath(self.project)))
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, sid + ".jsonl")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"type": "ai-title", "aiTitle": title}) + "\n")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def write_fixture(self, cfg: str, sid: str) -> None:
+        """Copies the handoff fixture transcript into a config folder for the topic's cwd, as session sid."""
+        folder = os.path.join(cfg, "projects", encoded_cwd(os.path.realpath(self.project)))
+        os.makedirs(folder, exist_ok=True)
+        with open(FIXTURE, encoding="utf-8") as handle, open(os.path.join(folder, sid + ".jsonl"), "w",
+                                                             encoding="utf-8") as out:
+            out.write(handle.read())
+
+    def cfg_a(self) -> str:
+        return os.path.join(self.project, "cfg-a")
+
+    def cfg_b(self) -> str:
+        return os.path.join(self.project, "cfg-b")
+
+    def bind_elsewhere(self, sid: str, thread: int = THREAD + 1) -> None:
+        """Another topic is bound to sid right now."""
+        self.sessions.ensure(thread, f"other {thread}", CLAUDE_CMD, self.project)
+        self.sessions.set_uuid(thread, sid)
+
+    def labels(self) -> list[str]:
+        return [b["text"] for keyboard in self.telegram.buttons(THREAD) for row in keyboard for b in row]
+
+    def test_a_blank_launcher_row_with_its_transcript_only_in_another_folder_is_copied_on_resume(self) -> None:
+        """An older history row has no launcher, and the transcript exists only under cfg-b: the resume looks in the
+        other folders, copies the transcript into the current one and binds the topic to it."""
+        self.write_fixture(self.cfg_b(), U1)
+        self.note(U1, "")
+        self.run_cmd(f"/resume {U1}")
+        self.assertEqual(self.last(), f"↩️ the next message resumes session {U1} — history copied from launcher plain "
+                                      "into wrap")
+        copied = os.path.join(self.cfg_a(), "projects", encoded_cwd(os.path.realpath(self.project)), U1 + ".jsonl")
+        self.assertTrue(os.path.exists(copied), "the transcript was not copied into the current launcher's folder")
+        self.assertEqual((self.row().uuid, self.history.find(THREAD, U1).launcher), (U1, CLAUDE_CMD))
+
+    def test_a_transcript_in_the_current_folder_is_not_copied_from_elsewhere(self) -> None:
+        """The current launcher's own folder holds the transcript: nothing is copied or switched, even when another folder
+        holds a copy too."""
+        self.write_fixture(self.cfg_a(), U1)
+        self.write_fixture(self.cfg_b(), U1)
+        self.note(U1, "")
+        self.run_cmd(f"/resume {U1}")
+        self.assertEqual(self.last(), f"↩️ the next message resumes session {U1}")
+        self.assertEqual(self.row().launcher_pick, "")
+
+    def test_a_session_bound_to_another_topic_is_refused_by_uuid(self) -> None:
+        self.bind_elsewhere(U1)
+        self.note(U1, CLAUDE_CMD)
+        self.run_cmd(f"/resume {U1}")
+        self.assertEqual(self.last(), BOUND_ELSEWHERE_TEXT.format(sid=U1))
+        self.assertEqual(self.row().uuid, "", "the refused session was bound anyway")
+
+    def test_a_history_row_of_a_session_bound_to_another_topic_is_not_listed(self) -> None:
+        self.bind_elsewhere(U1)
+        self.note(U1, CLAUDE_CMD, text="taken elsewhere")
+        self.note(U2, CLAUDE_CMD, text="free one")
+        self.run_cmd("/resume")
+        self.assertEqual(self.button_callbacks(), [f"cm:{THREAD}:rs:{self.history.find(THREAD, U2).id}"])
+
+    def test_this_topics_own_current_session_is_listed_even_when_another_topic_holds_it(self) -> None:
+        self.sessions.set_uuid(THREAD, U1)
+        self.bind_elsewhere(U1)
+        self.note(U1, CLAUDE_CMD, text="my own")
+        self.run_cmd("/resume")
+        self.assertEqual(self.button_callbacks(), [f"cm:{THREAD}:rs:{self.history.find(THREAD, U1).id}"])
+        self.assertTrue(self.labels()[0].startswith("✓ "), self.labels())
+
+    def test_a_recently_modified_disk_session_moves_to_the_top(self) -> None:
+        """U1 started first and U2 started later (so U2 leads by start time); U1's file was modified after both, so the
+        listing puts U1 first. The row still shows its own start time."""
+        now = self.clock.now()
+        self.note(U1, CLAUDE_CMD, text="older start")
+        self.note(U2, CLAUDE_CMD, text="newer start")
+        self.write_transcript(self.cfg_a(), U1, now + 500, "touched again")
+        self.run_cmd("/resume")
+        expected = [self.history.find(THREAD, U1).id, self.history.find(THREAD, U2).id]
+        self.assertEqual(self.button_callbacks(), [f"cm:{THREAD}:rs:{rid}" for rid in expected])
+        self.assertTrue(self.labels()[0].endswith("· older start…"), self.labels())  # the row keeps its own text and start
+
+    def test_a_session_found_on_disk_is_listed_even_when_its_old_row_is_outside_the_window(self) -> None:
+        """Ten later sessions fill the bounded history read; U1's row is older than all of them, but its file was
+        touched just now, so the listing still finds it and the picker puts it first."""
+        now = self.clock.now()
+        self.note(U1, CLAUDE_CMD, text="old row")
+        self.clock.advance(100)
+        for n in range(10):
+            self.note(f"1f2e3d4c-aaaa-4bbb-8ccc-0000000003{n:02d}", CLAUDE_CMD, text=f"later {n}")
+        self.write_transcript(self.cfg_a(), U1, now + 500, "touched")
+        self.run_cmd("/resume")
+        self.assertEqual(self.button_callbacks()[0], f"cm:{THREAD}:rs:{self.history.find(THREAD, U1).id}")
+        self.assertEqual(len(self.button_callbacks()), 10)
+
+    def test_the_eleventh_disk_session_is_listed_when_the_newest_ten_are_bound_elsewhere(self) -> None:
+        now = self.clock.now()
+        sids = [f"1f2e3d4c-aaaa-4bbb-8ccc-0000000002{n:02d}" for n in range(11)]
+        for n, sid in enumerate(sids):
+            self.write_transcript(self.cfg_a(), sid, now + n * 10, f"disk {n}")
+        for n in range(1, 11):
+            self.bind_elsewhere(sids[n], thread=THREAD + n)
+        picker = self.commands.resume_picker(THREAD)
+        self.assertEqual(len(picker.rows), 1)
+        self.assertIsNotNone(self.history.find(THREAD, sids[0]), "the eleventh session was cut by the limit")
+        self.assertTrue(picker.rows[0][0][0].endswith("· disk 0…"))
 
 
 class BackgroundStopTests(SessionCase):
@@ -515,6 +799,94 @@ class BackgroundStopTests(SessionCase):
         self.assertEqual(self.telegram.edits(MID)[-1], expected)
         self.assertEqual(self.row().uuid, U1)
         self.end_turn(session)
+
+
+class KeptStopTests(SessionCase):
+    """Stops with a kept session (linger, section 5 D2): /stop asks which stop during a background update, closes an
+    idle kept session at once, and stops a user turn as it always did."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.linger = StubKeptLinger()
+        self.commands = self.build_kept_commands(self.linger)
+        self.registry = CommandRegistry()
+        self.commands.register(self.registry)
+
+    def build_kept_commands(self, linger: StubKeptLinger) -> SessionCommands:
+        return SessionCommands(config=self.config, sessions=self.sessions, history=self.history, live=self.live,
+                               backends=self.backends, messenger=self.messenger, clock=self.clock, logger=self.logger,
+                               handoff=HandoffService(KvRepo(self.db), self.backends, self.logger), linger=linger)
+
+    def test_stop_closes_a_kept_session_and_says_so(self) -> None:
+        """Nothing runs but a session is kept: /stop asks it to close and says so."""
+        self.linger.release_answer = True
+        self.assertTrue(self.run_cmd("/stop"))
+        self.assertEqual(self.last(), LINGER_STOPPED_TEXT)
+        self.assertEqual(self.linger.requests, [("release", THREAD)])
+
+    def test_stop_with_nothing_kept_says_nothing_runs(self) -> None:
+        """Nothing runs and nothing is kept: /stop says so and asks for no release."""
+        self.linger.release_answer = False
+        self.assertTrue(self.run_cmd("/stop"))
+        self.assertEqual(self.last(), NOTHING_RUNNING_TEXT)
+        self.assertEqual(self.linger.requests, [("release", THREAD)])
+
+    def test_stop_during_a_self_turn_asks_which_stop(self) -> None:
+        """A background update runs: /stop posts the choice card and stops nothing yet."""
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=60.0, self_turn=True, hold_id=3, self_seq=2)
+        session = self.start_turn()
+        self.assertTrue(self.run_cmd("/stop"))
+        self.assertEqual(self.last(), STOP_CHOICE_TEXT)
+        self.assertIn(f"cm:{THREAD}:sq:u:3:2", self.button_callbacks())
+        self.assertIn(f"cm:{THREAD}:sq:c:3:2", self.button_callbacks())
+        self.assertFalse(session.stopped.is_set(), "the choice card must not stop the update before the tap")
+        self.assertEqual(self.linger.requests, [])
+
+    def test_stop_turn_during_a_self_turn_returns_choose(self) -> None:
+        """The shared stop path reports CHOOSE for a background update, and nothing was stopped."""
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=60.0, self_turn=True)
+        session = self.start_turn()
+        result = self.commands.stop_turn(THREAD)
+        self.assertEqual(result.kind, StopKind.CHOOSE)
+        self.assertTrue(result)
+        self.assertEqual(session.stops, 0)
+
+    def test_stop_during_a_user_turn_stops_it_as_before(self) -> None:
+        """A user turn on a kept session: /stop stops the turn and its session, with no card."""
+        self.linger.status_value = LingerStatus(pending=0, seconds_left=60.0, self_turn=False)
+        session = self.start_turn()
+        self.assertTrue(self.run_cmd("/stop"))
+        self.assertTrue(session.stopped.wait(2), "/stop did not stop the session")
+        self.assertEqual(self.telegram.texts(THREAD), [], "a stopped user turn sends no reply and no card")
+        self.assertEqual(self.linger.requests, [])
+
+    def test_interrupt_update_asks_the_session_to_interrupt_only(self) -> None:
+        """The card's update button interrupts the update through the linger service and stops nothing."""
+        session = self.start_turn()
+        self.linger.interrupt_answer = True
+        self.assertTrue(self.commands.interrupt_update(THREAD))
+        self.assertEqual(self.linger.requests, [("interrupt", THREAD)])
+        self.assertEqual(session.stops, 0)
+        self.linger.interrupt_answer = False
+        self.assertFalse(self.commands.interrupt_update(THREAD))
+
+    def test_stop_and_new_during_a_self_turn_stops_the_session_without_a_card(self) -> None:
+        """The stop-and-new button stops the update and its session at once: starting fresh drops both."""
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=60.0, self_turn=True)
+        session = self.start_turn()
+        session.on_stop = lambda: self.end_turn(session)
+        self.assertEqual(self.commands.stop_and_new(THREAD, CHAT, MID), STOP_NEW_TOAST)
+        self.assertTrue(session.stopped.wait(2), "stop-and-new did not stop the session")
+        self.assertEqual(session.stops, 1)
+        self.assertEqual(self.linger.requests, [])
+
+    def test_stop_now_during_a_self_turn_stops_the_session(self) -> None:
+        """The card's close button: the update and the session are stopped, as /stop did before D2."""
+        session = self.start_turn()
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=60.0, self_turn=True)
+        self.assertEqual(self.commands.stop_now(THREAD).kind, StopKind.STOPPED)
+        self.assertTrue(session.stopped.wait(2), "the close button did not stop the session")
+        self.assertEqual(session.stops, 1)
 
 
 if __name__ == "__main__":

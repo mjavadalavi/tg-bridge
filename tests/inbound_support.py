@@ -18,10 +18,12 @@ from tg_bridge.bot.commands.base import Command, CommandContext, CommandDeps, Co
 from tg_bridge.bot.inbound import MessageHandler
 from tg_bridge.config import Config
 from tg_bridge.core.cwd import CwdService
-from tg_bridge.core.dispatcher import Dispatcher, TopicQueues
+from tg_bridge.core.dispatcher import Dispatcher
 from tg_bridge.core.handoff import HandoffService
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.media import MediaOutcome
+from tg_bridge.core.removals import Removals
+from tg_bridge.core.topic_queues import TopicQueues
 from tg_bridge.core.topics import TopicResolver
 from tg_bridge.core.workers import WorkerPool
 from tg_bridge.logging_ import Logger
@@ -48,6 +50,8 @@ PANE_TOPIC = "seat"
 PANE = "%7"
 WAIT_PANE = "%9"
 SPAWN_CWD = "/spawn/cwd"
+TUI_TOPIC = "deck"
+TUI_CMD = "tui run"  # the command of a tui launcher in config, which a session row names
 
 
 class StartRecorder:
@@ -155,10 +159,11 @@ class InboundCase(unittest.TestCase):
         self.out = WorkerPool("out", 1, self.logger)
         self.media_pool = WorkerPool("media", 2, self.logger)
         self.starts = StartRecorder()
+        self.removals = Removals(self.clock)  # shared with the dispatcher, as the App shares it with TopicRemover
         self.dispatcher = Dispatcher(
             turns=object(), slots=object(), inbox=self.inbox, messenger=self.messenger, answers=object(),
             titles=object(), client=self.telegram, live=self.live, config=self.config, logger=self.logger,
-            start_thread=self.starts)
+            start_thread=self.starts, removals=self.removals)
         self.backends = build_default_registry(self.config, self.logger, self.clock, title_launcher="")
         self.topics = TopicResolver(config=self.config, kv=self.kv, sessions=self.sessions, logger=self.logger)
         self.permissions = StubPermissions()
@@ -188,6 +193,8 @@ class InboundCase(unittest.TestCase):
                 TOPIC: {"launcher": CLAUDE_CMD, "cwd": self.project},
                 PANE_TOPIC: {"type": "pane", "pane": PANE, "label": "seat-label"},
             },
+            "launchers": {"tui": {"cmd": TUI_CMD, "config_dir": os.path.join(self.project, "cfg-tui"),
+                                  "transport": "tui"}},
             "spawn": {"budget": SPAWN_CMD},
             "agent_launchers": {"codex": {"backend": "codex", "command": "codex",
                                           "config_dir": os.path.join(self.project, "cfg-codex")}},

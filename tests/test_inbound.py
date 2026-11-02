@@ -9,7 +9,7 @@ Every test runs on a migrated database in a TempHome with FakeTelegram and FakeC
 """
 
 from tg_bridge.bot.commands.info import register_info_commands
-from tg_bridge.bot.inbound import AUTO_OFF_TEXT, AUTO_ON_TEXT, Disposition
+from tg_bridge.bot.inbound import AUTO_OFF_NEXT_TEXT, AUTO_OFF_TEXT, AUTO_ON_TEXT, Disposition
 from tg_bridge.core.media import MediaOutcome
 from tg_bridge.core.permissions import BYPASS_MODE
 from tg_bridge.core.topics import GENERAL_TEXT, NO_TOPIC_TEXT
@@ -25,6 +25,8 @@ from tests.inbound_support import (
     THREAD,
     TIMEOUT,
     TOPIC,
+    TUI_CMD,
+    TUI_TOPIC,
     WAIT_PANE,
     InboundCase,
 )
@@ -278,6 +280,33 @@ class AutoModeTests(InboundCase):
         self.assertEqual(self.sent(), [])
 
 
+class AutoOffReplyTests(InboundCase):
+    """The 'auto off' reply names the next message when the running turn's CLI cannot switch its mode live."""
+
+    def test_tui_turn_running_says_approvals_return_from_the_next_message(self) -> None:
+        self.sessions.ensure(THREAD, TUI_TOPIC, TUI_CMD, self.project, "default")
+        self.sessions.set_mode(THREAD, BYPASS_MODE)
+        self.start_turn(THREAD)
+        self.handle(self.message("auto off"))
+        self.assertTrue(self.permissions.switched.wait(TIMEOUT))
+        self.assertEqual(self.permissions.live_modes, [(THREAD, "default", "auto off")])
+        self.assertEqual(self.sent(), [AUTO_OFF_NEXT_TEXT])
+
+    def test_tui_topic_without_a_running_turn_gets_the_plain_reply(self) -> None:
+        self.sessions.ensure(THREAD, TUI_TOPIC, TUI_CMD, self.project, "default")
+        self.sessions.set_mode(THREAD, BYPASS_MODE)
+        self.handle(self.message("auto off"))
+        self.assertEqual(self.sent(), [AUTO_OFF_TEXT])
+
+    def test_print_topic_with_a_running_turn_gets_the_plain_reply(self) -> None:
+        self.sessions.ensure(THREAD, TOPIC, CLAUDE_CMD, self.project, "default")
+        self.sessions.set_mode(THREAD, BYPASS_MODE)
+        self.start_turn(THREAD)
+        self.handle(self.message("auto off"))
+        self.assertTrue(self.permissions.switched.wait(TIMEOUT))
+        self.assertEqual(self.sent(), [AUTO_OFF_TEXT])
+
+
 class CommandTests(InboundCase):
     def test_registered_command_runs_now_and_is_never_queued(self) -> None:
         """Ported labels:
@@ -403,4 +432,3 @@ class MediaTests(InboundCase):
         self.assertEqual(self.seats.typed, [(PANE, "heard you")])
         self.assertEqual(self.queued(), [])
         self.assertEqual(self.starts.started, [])  # a pane is typed into, no turn runs
-

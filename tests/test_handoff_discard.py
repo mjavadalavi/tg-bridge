@@ -20,9 +20,9 @@ from tg_bridge.agents.events import TurnResult, TurnStatus
 from tg_bridge.bot.commands.base import CommandDeps, CommandRegistry
 from tg_bridge.bot.commands.session import SessionCommands
 from tg_bridge.core.cwd import CwdService
-from tg_bridge.core.dispatcher import TopicQueues
 from tg_bridge.core.handoff import HEADER, HandoffService, handoff_key
 from tg_bridge.core.launcher_switch import FRESH_TEXT, KIND_CHANGED, LauncherSwitch
+from tg_bridge.core.topic_queues import TopicQueues
 from tg_bridge.core.turn_text import format_rules
 from tg_bridge.core.workers import WorkerPool
 from tg_bridge.store.inbox import CwdRepo

@@ -16,21 +16,30 @@ from unittest import mock
 
 from tests.callback_support import CHAT, MID, THREAD, TOPIC, U1, CallbackCase
 from tests.fakes.backend import FakeBackend, RecordingSink, fake_spec
+from tests.linger_stub import StubKeptLinger
 from tests.turn_support import wait_until
 from tg_bridge.agents.claude.backend import ClaudeRules
 from tg_bridge.bot.callbacks.handlers import (
+    CHOICE_EXPIRED_TOAST,
+    CHOOSE_TOAST,
     DROP_NOTE,
+    INTERRUPT_TOAST,
     JUMP_NOTE,
     NOT_QUEUED_TEXT,
     NOW_NOTE,
     NOTHING_RUNNING_TEXT,
     STOP_TOAST,
+    StatusTaps,
+    StopChoiceTaps,
+    StopTap,
 )
 from tg_bridge.bot.callbacks.handlers import QueueTaps
 from tg_bridge.bot.callbacks.picker_taps import PickerTaps
 from tg_bridge.bot.callbacks.router import CallbackRouter, Tap
 from tg_bridge.config import Config
 from tg_bridge.core.cards import ApprovalCards
+from tg_bridge.core.handoff import HandoffService
+from tg_bridge.core.linger import LingerStatus
 from tg_bridge.core.permissions import PermissionService, TurnBinding
 from tg_bridge.paths import Paths
 from tg_bridge.store.asks import AskRepo
@@ -41,9 +50,13 @@ from tg_bridge.bot.commands.session import (
     NO_SESSION_TEXT,
     NOTHING_RUNNING_TEXT as STOP_REPLY_NOTHING,
     STOP_NEW_TOAST,
+    UPDATE_CLOSED_TEXT,
+    UPDATE_GONE_TEXT,
+    UPDATE_INTERRUPTED_TEXT,
+    SessionCommands,
 )
-from tg_bridge.bot.pickers import STATUS_STOP
-from tg_bridge.core.dispatcher import Admission
+from tg_bridge.bot.pickers import STATUS_STOP, STOP_CHOICE_TEXT
+from tg_bridge.core.topic_queues import Admission
 
 
 class RouterRules(CallbackCase):
@@ -437,6 +450,156 @@ class StatusTapTests(CallbackCase):
         self.tap(f"cm:{THREAD}:sn:0", tapper=7)
         self.assertEqual(self.sessions.get(THREAD).uuid, U1)
         self.assertEqual(self.answers(), ["not allowed"])
+
+
+class KeptStopTapTests(CallbackCase):
+    """The stop buttons of a topic with a kept session (section 5 D2): the feed's and the status ⏹ post the choice card
+    during a background update, and the card's two buttons interrupt the update or close the session."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.linger = StubKeptLinger()
+        self.stops = SessionCommands(config=self.config, sessions=self.sessions, history=self.history,
+                                     live=self.live, backends=self.backends, messenger=self.messenger,
+                                     clock=self.clock, logger=self.logger, stop_wait=0.6,
+                                     handoff=HandoffService(self.kv, self.backends, self.logger), linger=self.linger)
+        self.router = CallbackRouter(config=self.config, client=self.telegram, messenger=self.messenger,
+                                     out=self.out, logger=self.logger)
+        StopTap(stops=self.stops).register(self.router)
+        StopChoiceTaps(stops=self.stops).register(self.router)
+        StatusTaps(deps=self.deps, registry=self.commands, stops=self.stops).register(self.router)
+        QueueTaps(dispatcher=self.dispatcher, live=self.live, linger=self.linger).register(self.router)
+
+    def test_status_stop_button_closes_a_kept_session(self) -> None:
+        """Nothing runs but the session is kept: the status ⏹ asks it to close and answers 'Stopping ⏹'."""
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=60.0, self_turn=False)
+        self.linger.release_answer = True
+        self.tap(f"cm:{THREAD}:{STATUS_STOP}:0")
+        self.assertEqual(self.answers(), [STOP_TOAST])
+        self.assertEqual(self.linger.requests, [("release", THREAD)])
+
+    def test_status_stop_button_during_a_self_turn_posts_the_choice_card(self) -> None:
+        """The status ⏹ during a background update posts the same choice card as the feed's ⏹ and stops nothing."""
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=60.0, self_turn=True, hold_id=3, self_seq=2)
+        session = self.start_turn()
+        self.tap(f"cm:{THREAD}:{STATUS_STOP}:0")
+        self.assertEqual(self.answers(), [CHOOSE_TOAST])
+        cards = [p for p in self.sent_buttons() if p.get("text") == STOP_CHOICE_TEXT]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(session.stops, 0)
+        self.assertEqual(self.linger.requests, [])
+
+    def test_feed_stop_during_a_self_turn_posts_the_choice_card(self) -> None:
+        """The feed's ⏹ during a background update posts the card and stops nothing before a choice."""
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=60.0, self_turn=True, hold_id=3, self_seq=2)
+        session = self.start_turn()
+        self.tap(f"st:{THREAD}")
+        self.assertEqual(self.answers(), [CHOOSE_TOAST])
+        cards = [p for p in self.sent_buttons() if p.get("text") == STOP_CHOICE_TEXT]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(self.callbacks_of(cards[0]["reply_markup"]),
+                         [f"cm:{THREAD}:sq:u:3:2", f"cm:{THREAD}:sq:c:3:2"])
+        self.assertEqual(session.stops, 0)
+        self.assertEqual(self.linger.requests, [])
+
+    def test_choice_update_button_interrupts_the_update_only(self) -> None:
+        """'this update only' interrupts the update, edits the card and leaves the session running."""
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=60.0, self_turn=True, hold_id=3, self_seq=2)
+        self.linger.interrupt_answer = True
+        self.linger.self_turn_now = (3, 2)
+        session = self.start_turn()
+        self.tap(f"cm:{THREAD}:sq:u:3:2")
+        self.assertEqual(self.answers(), [INTERRUPT_TOAST])
+        self.assertEqual(self.edits()[-1]["text"], UPDATE_INTERRUPTED_TEXT)
+        self.assertEqual(self.linger.requests, [("interrupt", THREAD)])
+        self.assertEqual(session.stops, 0)
+
+    def test_choice_update_button_after_the_update_ended_is_expired(self) -> None:
+        """A card tapped after its update ended says the choice expired, edits nothing and interrupts nothing."""
+        self.linger.interrupt_answer = True
+        self.tap(f"cm:{THREAD}:sq:u:3:2")
+        self.assertEqual(self.answers(), [CHOICE_EXPIRED_TOAST])
+        self.assertEqual(self.edits(), [])
+        self.assertEqual(self.linger.requests, [])
+
+    def test_choice_close_button_stops_the_session(self) -> None:
+        """'close the session' stops the update and its session, as the stop did before D2."""
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=60.0, self_turn=True, hold_id=3, self_seq=2)
+        self.linger.self_turn_now = (3, 2)
+        session = self.start_turn()
+        session.on_stop = lambda: self.end_turn(session)
+        self.tap(f"cm:{THREAD}:sq:c:3:2")
+        self.assertTrue(session.stopped.wait(5), "the close button did not stop the session")
+        self.assertEqual(self.answers(), [STOP_TOAST])
+        self.assertEqual(self.edits()[-1]["text"], UPDATE_CLOSED_TEXT)
+        self.assertEqual(session.stops, 1)
+
+    def test_choice_close_button_after_the_update_ended_is_expired(self) -> None:
+        """A card closed after its update ended says the choice expired and stops nothing, not even a kept session."""
+        self.linger.release_answer = True
+        self.tap(f"cm:{THREAD}:sq:c:3:2")
+        self.assertEqual(self.answers(), [CHOICE_EXPIRED_TOAST])
+        self.assertEqual(self.edits(), [])
+        self.assertEqual(self.linger.requests, [])
+
+    def test_a_stale_choice_card_expires_and_stops_nothing(self) -> None:
+        """A card posted for self turn 2 of hold 3 expires after that turn ended, after a new self turn started, after
+        its hold ended and during a user turn. Both buttons answer 'this choice has expired', edit nothing and stop
+        nothing, while the running turn goes on."""
+        ended = LingerStatus(pending=1, seconds_left=60.0, self_turn=False, hold_id=3, self_seq=2)
+        cases = {
+            "self turn ended": (ended, None),
+            "new self turn started": (LingerStatus(pending=1, seconds_left=60.0, self_turn=True, hold_id=3, self_seq=3),
+                                     (3, 3)),
+            "hold ended": (None, None),
+            "user turn on the kept session": (ended, None),
+        }
+        for name, (status, running) in cases.items():
+            with self.subTest(name):
+                self.linger.status_value = status
+                self.linger.self_turn_now = running
+                session = self.start_turn()
+                for choice in ("u", "c"):
+                    self.tap(f"cm:{THREAD}:sq:{choice}:3:2")
+                    self.assertEqual(self.answers()[-1], CHOICE_EXPIRED_TOAST)
+                self.assertEqual(self.edits(), [])
+                self.assertEqual(self.linger.requests, [])
+                self.assertEqual(session.stops, 0)
+                self.assertFalse(session.stopped.is_set())
+                self.end_turn(session)
+
+    def test_a_choice_card_without_hold_numbers_expires(self) -> None:
+        """A card in the old format (no hold id or self turn) is expired too, and it stops nothing."""
+        self.linger.status_value = LingerStatus(pending=1, seconds_left=60.0, self_turn=True, hold_id=3, self_seq=2)
+        self.linger.self_turn_now = (3, 2)
+        session = self.start_turn()
+        self.tap(f"cm:{THREAD}:sq:c")
+        self.assertEqual(self.answers(), [CHOICE_EXPIRED_TOAST])
+        self.assertEqual(self.linger.requests, [])
+        self.assertFalse(session.stopped.is_set())
+        self.end_turn(session)
+
+    def test_now_during_a_self_turn_interrupts_the_update_only(self) -> None:
+        """⏭ Now during a background update interrupts that update, not the session: the item runs on the same process."""
+        session = self.start_turn()
+        self.linger.interrupt_answer = True
+        with mock.patch.object(self.dispatcher, "to_front", return_value=True):
+            self.tap(f"now:{THREAD}:n1")
+        self.assertEqual(self.linger.requests, [("interrupt", THREAD)])
+        self.assertEqual(session.stops, 0)
+        self.assertFalse(session.stopped.is_set())
+
+    def test_now_when_no_update_can_be_interrupted_stops_the_turn_as_before(self) -> None:
+        """When the interrupt does not apply (a user turn on a kept process, or no kept session), ⏭ Now takes the old
+        path: the turn is aborted and its session is stopped."""
+        session = self.start_turn()
+        self.linger.interrupt_answer = False
+        with mock.patch.object(self.dispatcher, "to_front", return_value=True):
+            self.tap(f"now:{THREAD}:n1")
+        self.assertEqual(self.linger.requests, [("interrupt", THREAD)])
+        self.assertTrue(session.stopped.wait(5), "the old path did not stop the session")
+        self.assertEqual(session.stops, 1)
+        self.assertTrue(self.live.is_aborted(THREAD))
 
 
 if __name__ == "__main__":

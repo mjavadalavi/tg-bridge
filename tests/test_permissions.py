@@ -730,5 +730,44 @@ class BlockedCardTests(PermissionCase):
         self.assertTrue(self.messenger.returned.is_set())
 
 
+class InsertHookAsks:
+    """An AskRepo wrapper that runs one hook right after an insert: the window between the database insert and the
+    in-memory registration of an ask."""
+
+    def __init__(self, inner: AskRepo) -> None:
+        self._inner = inner
+        self.after_insert = None
+
+    def insert(self, **kwargs) -> None:
+        self._inner.insert(**kwargs)
+        if self.after_insert is not None:
+            hook, self.after_insert = self.after_insert, None
+            hook()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class ClosedDuringInsertTests(PermissionCase):
+    """K7: an approval passes the closed check, then the turn ends while its record is being inserted."""
+
+    def test_turn_closed_during_the_insert_voids_the_record_and_posts_no_card(self) -> None:
+        """The race: void_all runs between the insert and the registration. It cannot see the ask, so the registration
+        must recheck the turn under the same lock. The record is then voided, no card is posted and no wait starts."""
+        hooked = InsertHookAsks(self.asks)
+        self.asks = hooked
+        self.service = self.build_service()
+        self.listener = self.service.bind_turn(self.binding)
+        self.service.attach(self.binding, self.session)
+        voided = []
+        hooked.after_insert = lambda: voided.append(self.service.void_all(self.binding))
+        self.emit(bash_request())
+        self.assertEqual(voided, [0], "the hook ran void_all inside the insert window")
+        self.assertEqual(self.posted(), [], "no live card for a dead turn")
+        self.assertEqual(self.row("00000001"), "void")
+        self.assertEqual(self.waits.changes, [])
+        self.assertEqual(self.answers(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

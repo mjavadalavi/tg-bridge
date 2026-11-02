@@ -133,5 +133,21 @@ class ProcessExited:
     stderr_tail: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class BackgroundWork:
+    """Claude only: the number of background tasks and scheduled wakeups the session is waiting for. Emitted on every
+    change, from the session's own threads. Never shown by the feed; the SessionRouter keeps the latest count."""
+
+    pending: int
+
+
+@dataclass(frozen=True, slots=True)
+class TurnBegan:
+    """Claude only: the CLI began a turn by itself (a task notification or a wakeup), with no user message."""
+
+    origin: str = ""                 # 'task-notification' (print) | 'task_notification' (tui) | 'scheduled' | 'human' | '' ; logged only
+
+
 AgentEvent = (SessionStarted | TextEvent | ToolStart | ToolEnd | StatusEvent
-              | ApprovalRequest | ApprovalWithdrawn | UsageEvent | TurnResult | ProcessExited)
+              | ApprovalRequest | ApprovalWithdrawn | UsageEvent | TurnResult | ProcessExited
+              | BackgroundWork | TurnBegan)

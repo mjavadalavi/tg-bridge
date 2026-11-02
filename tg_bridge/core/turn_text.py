@@ -26,6 +26,10 @@ TIMEZONE = "Asia/Tehran"  # the TZ of every agent process, as the live file sets
 NO_CONVERSATION = "No conversation found"  # the CLI's text for a resume of an id it never saved
 RESTART_TEXT = "⏹ interrupted by a bridge restart"
 INTERRUPTED_TEXT = "⏹ interrupted — session kept"
+CLOSED_STOP_TEXT = "⏹ stopped — the session was closed"  # a self turn stopped on purpose: the session is closed too
+CLOSED_CAP_TEMPLATE = ("⏱ stopped after {limit}s of work. The session was closed — "
+                       "ask again if you still need it.")
+BACKGROUND_PREFIX = "🔔 background update"  # the first line of every reply of a self turn (a kept session's own turn)
 NO_OUTPUT = "(no output)"
 ERROR_DETAIL_CHARS = 1500
 LAUNCH_ERROR_CHARS = 200
@@ -56,39 +60,46 @@ def fresh_note(*, uid: str, cwd: str, launcher: str, keeps_id: bool, home: str) 
             f"(each launcher keeps its own transcripts), so this reply starts empty {ending}")
 
 
-def stop_text(stop_tap: bool, tools: int) -> str:
-    """The reply of a turn stopped on purpose: a ⏹ tap names the tool count, ⏭ Now does not."""
+def stop_text(stop_tap: bool, tools: int, *, session_kept: bool = True) -> str:
+    """The reply of a turn stopped on purpose: a ⏹ tap names the tool count, ⏭ Now does not. A stop that closed the
+    session (a self turn's stop) says so instead of saying the session is kept."""
+    if not session_kept:
+        return CLOSED_STOP_TEXT
     if stop_tap:
         return f"⏹ stopped after {tools} tool calls — session kept; send a message to continue"
     return INTERRUPTED_TEXT
 
 
-def capped_notice(limit: float) -> str:
-    """The notice that a turn stopped at a time cap (max_turn_seconds or hard_cap_seconds)."""
+def capped_notice(limit: float, *, session_kept: bool = True) -> str:
+    """The notice that a turn stopped at a time cap (max_turn_seconds or hard_cap_seconds). A cap that closed the
+    session (a self turn's cap) says so instead of saying the session is kept."""
+    if not session_kept:
+        return CLOSED_CAP_TEMPLATE.format(limit=format_seconds(limit))
     return (f'⏱ stopped after {format_seconds(limit)}s of work. The session is kept — '
             'send "continue" to pick up where it left off.')
 
 
 def compose_reply(outcome: TurnOutcome, *, result: TurnResult | None, texts: Sequence[str], limit: float | None,
                   stop_tap: bool, tools: int, launch_err: str | None, exit_code: int | None,
-                  tail: str) -> tuple[str | None, str | None]:
+                  tail: str, session_kept: bool = True) -> tuple[str | None, str | None]:
     """(answer, err) of a finished turn. Exactly one of them is set, except a capped turn that answered (both).
 
     texts are the top-level assistant texts of the turn, used when the result carries no answer text. tail is the last
-    stderr lines of the process, appended to the error texts that describe a process failure.
+    stderr lines of the process, appended to the error texts that describe a process failure. session_kept is False
+    when the turn's stop or cap closed the session (a self turn); the stop and cap texts then say it was closed.
     """
     tail_text = ("\n" + tail) if tail else ""
     if outcome is TurnOutcome.ERROR and launch_err is not None:
         return None, launch_err
     if outcome is TurnOutcome.STOPPED:
-        return None, stop_text(stop_tap, tools)
+        return None, stop_text(stop_tap, tools, session_kept=session_kept)
     if outcome is TurnOutcome.INTERRUPTED:
         return None, INTERRUPTED_TEXT
     if outcome is TurnOutcome.RESTART:
         return None, RESTART_TEXT
     if outcome is TurnOutcome.CAPPED:
         answer = (result.answer if result is not None else None) or "\n\n".join(texts) or None
-        notice = capped_notice(limit or 0)
+        notice = capped_notice(limit or 0, session_kept=session_kept)
         if answer:
             return f"{answer}\n\n{notice}", None
         return None, notice

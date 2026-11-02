@@ -49,7 +49,10 @@ class _Recorder:
 
     def runners(self) -> cli.Runners:
         return cli.Runners(daemon=self._call("daemon"), send=self._call("send"), sendfile=self._call("sendfile"),
-                           type_text=self._call("type"), spawn=self._call("spawn"))
+                           type_text=self._call("type"), spawn=self._call("spawn"),
+                           hook_permission=self._call("hook"), view=self._call("view"),
+                           view_sync=self._call("view-sync"), view_pane=self._call("view-pane"),
+                           view_delete=self._call("view-delete"))
 
 
 class DocsCleanupPort(unittest.TestCase):

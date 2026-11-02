@@ -16,6 +16,9 @@ from tg_bridge.config import (
     MODEL_CHOICES,
     SECTION_AGENT,
     SECTION_CLAUDE,
+    TRANSPORT_PRINT,
+    TRANSPORT_TUI,
+    TRANSPORTS,
     Config,
     LauncherError,
     LauncherSpec,
@@ -395,6 +398,49 @@ class ConfigFileTests(unittest.TestCase):
                 Config.load(paths, env={}, log=_Log())
 
 
+class LingerConfigTests(unittest.TestCase):
+    def test_defaults_when_absent(self) -> None:
+        with TempHome() as home:
+            cfg = _config(home.home, {})
+            self.assertEqual(cfg.linger_seconds(), 1800)
+            self.assertEqual(cfg.linger_max_sessions(), 3)
+
+    def test_zero_turns_linger_off(self) -> None:
+        with TempHome() as home:
+            cfg = _config(home.home, {"linger_seconds": 0, "linger_max_sessions": 0})
+            self.assertEqual(cfg.linger_seconds(), 0)
+            self.assertEqual(cfg.linger_max_sessions(), 0)
+
+    def test_bad_values_fall_back(self) -> None:
+        with TempHome() as home:
+            for bad in (-1, "x", True, None, 1.5):
+                with self.subTest(value=bad):
+                    cfg = _config(home.home, {"linger_seconds": bad, "linger_max_sessions": bad})
+                    self.assertEqual(cfg.linger_max_sessions(), 3)
+                    if bad == 1.5:
+                        self.assertEqual(cfg.linger_seconds(), 1.5)
+                    else:
+                        self.assertEqual(cfg.linger_seconds(), 1800)
+            self.assertEqual(_config(home.home, {"linger_seconds": 12.5}).linger_seconds(), 12.5)
+
+    def test_non_finite_values_fall_back(self) -> None:
+        """json accepts NaN and Infinity; neither is a usable number of seconds or of sessions."""
+        with TempHome() as home:
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(value=bad):
+                    cfg = _config(home.home, {"linger_seconds": bad, "linger_max_sessions": bad})
+                    self.assertEqual(cfg.linger_seconds(), 1800)
+                    self.assertEqual(cfg.linger_max_sessions(), 3)
+
+    def test_example_config_loads_both_keys(self) -> None:
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "config.example.json"), encoding="utf-8") as handle:
+            data = json.load(handle)
+        with TempHome() as home:
+            cfg = _config(home.home, data)
+            self.assertEqual((cfg.linger_seconds(), cfg.linger_max_sessions()), (1800, 3))
+
+
 class HomeHelperTests(unittest.TestCase):
     def test_expand_home_and_tilde_round_trip(self) -> None:
         self.assertEqual(expand_home("~/a/b", "/h"), os.path.join("/h", "a", "b"))
@@ -407,6 +453,99 @@ class HomeHelperTests(unittest.TestCase):
     def test_claude_config_dir_constant_is_home_relative(self) -> None:
         self.assertEqual(CLAUDE_CONFIG_DIR, "~/.claude")
         self.assertEqual(expand_home(CLAUDE_CONFIG_DIR, "/h"), os.path.join("/h", ".claude"))
+
+
+class TransportTests(unittest.TestCase):
+    """The per-launcher transport: print (default) or tui, accepted for claude only, invalid values hide the entry."""
+
+    def test_transport_constants(self) -> None:
+        self.assertEqual(TRANSPORT_PRINT, "print")
+        self.assertEqual(TRANSPORT_TUI, "tui")
+        self.assertEqual(TRANSPORTS, ("print", "tui"))
+
+    def test_string_and_plain_object_launchers_default_to_print(self) -> None:
+        with TempHome() as home:
+            cfg = _config(home.home, {"launchers": {"plain": "plaincmd", "obj": {"cmd": "objcmd"}}})
+            self.assertEqual(cfg.launcher_specs()["plain"].transport, TRANSPORT_PRINT)
+            self.assertEqual(cfg.launcher_specs()["obj"].transport, TRANSPORT_PRINT)
+
+    def test_spec_default_transport_is_print(self) -> None:
+        spec = LauncherSpec(name="c", backend=BACKEND_CLAUDE, command="c", argv=("c",), config_dir="/x")
+        self.assertEqual(spec.transport, TRANSPORT_PRINT)
+
+    def test_tui_is_accepted_in_launchers_section(self) -> None:
+        with TempHome() as home:
+            log = _Log()
+            cfg = _config(home.home, {"launchers": {"teamclaude": {"cmd": "teamclaude", "transport": "tui"}}}, log)
+            spec = cfg.launcher_specs()["teamclaude"]
+            self.assertEqual(spec.transport, TRANSPORT_TUI)
+            self.assertEqual(spec.backend, BACKEND_CLAUDE)
+            self.assertEqual(log.lines, [])
+
+    def test_tui_is_accepted_for_a_claude_agent_launcher(self) -> None:
+        with TempHome() as home:
+            log = _Log()
+            cfg = _config(home.home, {"agent_launchers": {
+                "teamclaude": {"backend": "claude", "command": "teamclaude", "transport": "tui"},
+            }}, log)
+            self.assertEqual(cfg.launcher_specs()["teamclaude"].transport, TRANSPORT_TUI)
+            self.assertEqual(log.lines, [])
+
+    def test_codex_agent_launcher_accepts_print_and_rejects_tui(self) -> None:
+        with TempHome() as home:
+            log = _Log()
+            cfg = _config(home.home, {"agent_launchers": {
+                "ok": {"backend": "codex", "command": "codex", "transport": "print"},
+                "bad": {"backend": "codex", "command": "codex", "transport": "tui"},
+            }}, log)
+            self.assertEqual(cfg.launcher_specs()["ok"].transport, TRANSPORT_PRINT)
+            self.assertNotIn("bad", cfg.launcher_specs())
+            self.assertEqual(len(log.lines), 1)
+            self.assertIn("bad", log.lines[0])
+            self.assertIn("only a claude launcher", log.lines[0])
+
+    def test_invalid_transport_hides_launcher_with_one_log_line_and_no_value(self) -> None:
+        with TempHome() as home:
+            log = _Log()
+            secret = "SECRET-TRANSPORT-987"
+            cfg = _config(home.home, {"launchers": {
+                "pty": {"cmd": "pty", "transport": secret},
+                "num": {"cmd": "num", "transport": 5},
+                "good": "goodcmd",
+            }}, log)
+            self.assertNotIn("pty", cfg.launcher_specs())
+            self.assertNotIn("num", cfg.launcher_specs())
+            self.assertIn("good", cfg.launcher_specs())
+            self.assertEqual(len(log.lines), 2)
+            for line in log.lines:
+                self.assertIn("transport must be one of: print, tui", line)
+                self.assertNotIn(secret, line)
+            self.assertIn("'pty'", log.lines[0])
+
+    def test_invalid_transport_on_agent_launcher_hides_it(self) -> None:
+        with TempHome() as home:
+            log = _Log()
+            cfg = _config(home.home, {"agent_launchers": {
+                "teamclaude": {"backend": "claude", "command": "teamclaude", "transport": "pipe"},
+            }}, log)
+            self.assertNotIn("teamclaude", cfg.launcher_specs())
+            self.assertEqual(len(log.lines), 1)
+            self.assertIn("transport must be one of: print, tui", log.lines[0])
+
+    def test_parse_passes_transport_to_the_spec(self) -> None:
+        spec = LauncherSpec.parse("t", {"cmd": "t run", "transport": "tui"},
+                                  section=SECTION_CLAUDE, home="/h", codex_home="/h/.codex")
+        self.assertEqual(spec.transport, TRANSPORT_TUI)
+        self.assertEqual(spec.argv, ("t", "run"))
+
+    def test_unnamed_launcher_from_a_bare_command_stays_print(self) -> None:
+        with TempHome() as home:
+            cfg = _config(home.home, {"launchers": {"teamclaude": {"cmd": "teamclaude", "transport": "tui"}}})
+            spec = cfg.resolve_launcher("", "some-other-claude --x", "")
+            self.assertFalse(spec.configured)
+            self.assertEqual(spec.transport, TRANSPORT_PRINT)
+            matched = cfg.resolve_launcher("", "teamclaude", "")
+            self.assertEqual(matched.transport, TRANSPORT_TUI)
 
 
 if __name__ == "__main__":

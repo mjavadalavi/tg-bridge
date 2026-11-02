@@ -136,3 +136,7 @@ class AskRepo:
             for nonce in nonces:
                 conn.execute("UPDATE asks SET answer=? WHERE nonce=? AND answer=?", (VOID, nonce, PENDING))
         return nonces
+
+    def delete_thread(self, thread_id: int) -> int:
+        """Removes every ask row of the topic, pending ones included (forget_topic). Returns how many were removed."""
+        return self._db.execute("DELETE FROM asks WHERE thread_id=?", (thread_id,))

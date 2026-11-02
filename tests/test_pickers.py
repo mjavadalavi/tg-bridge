@@ -190,7 +190,7 @@ class LauncherPickerTests(PickerCase):
 
 class ResumePickerTests(PickerCase):
     def _history(self) -> list[HistoryRecord]:
-        """Ten sessions, newest first. Ids 10..1; the launcher alternates between wrap and codex."""
+        """Ten sessions, newest first. Ids 10..1; the launcher alternates between wrap and codex (odd ids are codex)."""
         records = []
         for n in range(10, 0, -1):
             launcher = "codex" if n % 2 else "wrap run"
@@ -208,17 +208,18 @@ class ResumePickerTests(PickerCase):
             )
         return records
 
-    def test_last_eight_newest_first_with_tehran_time(self) -> None:
-        """Q: the last 8 sessions, one per row, callback cm:<thread>:rs:<id>; the label is MM-DD HH:MM Tehran time.
+    def test_last_ten_newest_first_with_tehran_time(self) -> None:
+        """Q: the last 10 sessions (RESUME_LIMIT), one per row, callback cm:<thread>:rs:<id>; the label is the launcher
+        name, MM-DD HH:MM Tehran time, then the title.
 
         Ported labels:
         Q: newest first, callback cm:<thread>:rs:<rowid>
         """
         picker = resume_picker(THREAD, self._history(), "", "wrap run", self.names)
-        self.assertEqual(len(picker.rows), 8)
+        self.assertEqual(len(picker.rows), 10)
         self.assertTrue(all(len(row) == 1 for row in picker.rows))
         self.assertEqual(_callbacks(picker)[0], f"cm:{THREAD}:rs:10")
-        self.assertEqual(_flat_labels(picker)[0], "10-24 09:40 · topic talk number 10…")
+        self.assertEqual(_flat_labels(picker)[0], "wrap · 10-24 09:40 · topic talk number 10…")
         # the fixture has sessions of the other launcher, so the ⚠ explanation follows the fresh-session text
         self.assertEqual(picker.text, "↩️ the next message starts a fresh session\n"
                          "⚠ = made by another launcher: tapping it switches the launcher to that one")
@@ -237,12 +238,20 @@ class ResumePickerTests(PickerCase):
         self.assertEqual(picker.text, "↩️ the next message resumes the ✓ session\n"
                          "⚠ = made by another launcher: tapping it switches the launcher to that one")
 
+    def test_own_rows_name_their_launcher_and_the_one_in_use_is_marked(self) -> None:
+        """Every row names its launcher: own rows the plain name, foreign rows the ⚠ mark with the same name."""
+        history = self._history()
+        picker = resume_picker(THREAD, history, history[2].uuid, "wrap run", self.names)
+        labels = _flat_labels(picker)
+        self.assertEqual(labels[2], "✓ wrap · 10-24 09:38 · topic talk number 8…")
+        self.assertEqual(labels[1], "⚠ gpt · 10-24 09:39 · topic talk number 9…")
+
     def test_session_made_by_another_launcher_is_marked(self) -> None:
         """K3: a session from another launcher gets ⚠ and its launcher's name; the text explains the mark."""
         picker = resume_picker(THREAD, self._history(), "", "wrap run", self.names)
         labels = _flat_labels(picker)
         self.assertIn("⚠ gpt · 10-24 09:39 · topic talk number 9…", labels)
-        self.assertEqual(sum("⚠" in label for label in labels), 4)   # sessions 9, 7, 5, 3 of the last eight
+        self.assertEqual(sum("⚠" in label for label in labels), 5)   # sessions 9, 7, 5, 3, 1 of the last ten
         self.assertIn("⚠ = made by another launcher", picker.text)
 
     def test_unknown_launcher_name_falls_back_to_other(self) -> None:

@@ -1,7 +1,10 @@
 """InboxService: the durable inbox of the daemon (C22): ingest, process, replay, and the spool drain.
 
 Port of the live file's ingest_update, inbox_done, process_update, replay_inbox and drain_spool (tg-bridge.py:3331-3420,
-3472-3491, 3495-3580). The rules that make a restart lose nothing:
+3472-3491, 3495-3580). The bridge's group (GROUP_KEY) is learned only from an allow-listed sender's message in a forum supergroup, and once it is
+set it is never overwritten by another chat (see _learn_chat).
+
+The rules that make a restart lose nothing:
 
 - ingest_update stores the update as pending before the offset moves (the offset is the last update_id stored), so a
   crash can re-deliver an update but never drop one. It returns False for a re-delivery, and the poller then skips it.
@@ -12,13 +15,14 @@ Port of the live file's ingest_update, inbox_done, process_update, replay_inbox 
   without running, and so is a payload that is not a JSON object.
 - drain_spool relays the {topic, text} files that other local tools drop into the spool folder.
 
-Every collaborator is injected. The service holds no state of its own; the chat-learning writes go to kv.
+Every collaborator is injected. The service keeps no state beyond the chat ids it has already logged as ignored; the
+chat-learning writes go to kv.
 """
 
 import datetime
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Collection, Mapping
 from typing import Any, Protocol
 
 from tg_bridge.bot.inbound import Disposition
@@ -31,8 +35,9 @@ from tg_bridge.telegram.messenger import Messenger
 
 CALLBACK_REPLAY_SECONDS = 600  # a callback tap older than this at start-up is stale and is not run
 OFFSET_KEY = "offset"  # kv key: the last update_id stored (the poller asks Telegram for the next one)
-GROUP_KEY = "group_id"  # kv key: the forum group the bridge answers in, learned from its first message
+GROUP_KEY = "group_id"  # kv key: the forum group the bridge answers in, learned from its first allow-listed message
 CHAT_KEY = "chat:{chat_id}"  # kv key: the title (or type) of a chat, learned from its messages
+OTHER_GROUP_LOG = "message from another group {chat} ignored for the bridge's group (kept {kept})"
 SPOOL_SUFFIX = ".json"
 DATA_LOG_LIMIT = 20  # characters of a callback_data shown in the log
 ERROR_TEXT_LIMIT = 200
@@ -86,6 +91,7 @@ class InboxService:
         spool_dir: str,
         clock: Clock,
         logger: Logger,
+        allowed_user_ids: Callable[[], Collection[Any]],  # the allowlist (config.allow_user_ids), read per message
     ) -> None:
         self._inbox = inbox
         self._kv = kv
@@ -96,6 +102,8 @@ class InboxService:
         self._spool_dir = spool_dir
         self._clock = clock
         self._logger = logger
+        self._allowed_user_ids = allowed_user_ids
+        self._other_groups_logged: set[str] = set()  # chat ids already logged as 'another group': one line each
 
     def ingest_update(self, update: Mapping[str, Any]) -> bool:
         """Stores one getUpdates update as pending, then moves the offset to it. False when it was already stored."""
@@ -131,7 +139,9 @@ class InboxService:
             self._logger.log(f"callback data={str(query.get('data') or '')[:DATA_LOG_LIMIT]}")
         deferred = False
         if message:
-            self._learn_chat(message)
+            # learned before the handler's allowlist check (inbound.handle), so the sender is checked here as a read only
+            sender = (message.get("from") or {}).get("id")
+            self._learn_chat(message, allowed=sender is not None and sender in self._allowed_user_ids())
             try:
                 deferred = self._messages.handle(message, update_id=update_id) is Disposition.DEFERRED
             except Exception as exc:
@@ -186,14 +196,27 @@ class InboxService:
             except Exception as exc:
                 self._logger.log(f"spool {name}: {str(exc)[:ERROR_TEXT_LIMIT]}")
 
-    def _learn_chat(self, message: Mapping[str, Any]) -> None:
-        """Remembers the chat's title in kv, and the forum group's id, from any message. Never raises."""
+    def _learn_chat(self, message: Mapping[str, Any], allowed: bool) -> None:
+        """Remembers the chat's title (or type) under chat:<id> from any message. The bridge's group id (GROUP_KEY) is
+        set only from an allow-listed sender in a forum (chat.is_forum): a plain 'group' has no topics, and nothing
+        needs one. Once GROUP_KEY is set, another chat never replaces it; each such chat is logged once. Never raises.
+        """
         try:
             chat = message.get("chat") or {}
-            if chat.get("id") is not None:
-                title = chat.get("title") or chat.get("type") or ""
-                self._kv.set(CHAT_KEY.format(chat_id=chat["id"]), str(title))
-                if chat.get("type") == "group" or chat.get("is_forum"):
-                    self._kv.set(GROUP_KEY, str(chat["id"]))
+            if chat.get("id") is None:
+                return
+            title = chat.get("title") or chat.get("type") or ""
+            self._kv.set(CHAT_KEY.format(chat_id=chat["id"]), str(title))
+            if allowed and chat.get("is_forum"):
+                self._learn_group(str(chat["id"]))
         except Exception as exc:
             self._logger.log(f"chat learn: {str(exc)[:ERROR_TEXT_LIMIT]}")
+
+    def _learn_group(self, chat_id: str) -> None:
+        """Sets GROUP_KEY to the chat when it is unset; keeps the stored group and logs a different chat once."""
+        kept = self._kv.get(GROUP_KEY)
+        if not kept:
+            self._kv.set(GROUP_KEY, chat_id)
+        elif kept != chat_id and chat_id not in self._other_groups_logged:
+            self._other_groups_logged.add(chat_id)
+            self._logger.log(OTHER_GROUP_LOG.format(chat=chat_id, kept=kept))

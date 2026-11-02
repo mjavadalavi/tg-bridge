@@ -106,6 +106,10 @@ class SessionRepo:
         rows = self._db.query("SELECT * FROM sessions WHERE thread_id=?", (thread_id,))
         return SessionRecord.from_row(rows[0]) if rows else None
 
+    def all_records(self) -> list[SessionRecord]:
+        """Every topic's row, ordered by thread id (the deleted-topic probe walks them)."""
+        return [SessionRecord.from_row(row) for row in self._db.query("SELECT * FROM sessions ORDER BY thread_id")]
+
     def ensure(self, thread_id: int, name: str, claude_launcher: str, cwd: str, mode: str = "") -> bool:
         """Creates the topic's row if it is missing (INSERT OR IGNORE: an existing row is never changed).
 
@@ -184,6 +188,16 @@ class SessionRepo:
         rows = self._db.query("SELECT thread_id FROM sessions WHERE name=? ORDER BY thread_id LIMIT 1", (name,))
         return int(rows[0]["thread_id"]) if rows else None
 
+    def bound_uuids(self, exclude_thread: int) -> set[str]:
+        """The session ids that some topic other than exclude_thread has as its current uuid (one query).
+
+        Only the current uuid counts: a previous id (prev_uuid) is not bound to anything. An empty uuid is not an id.
+        """
+        rows = self._db.query(
+            "SELECT uuid FROM sessions WHERE uuid!='' AND thread_id!=?", (exclude_thread,)
+        )
+        return {_text(row, "uuid") for row in rows}
+
     def cwds(self) -> list[str]:
         """The non-empty folders of all topics, in topic order (duplicates kept; callers de-duplicate)."""
         return [_text(row, "cwd") for row in self._db.query("SELECT cwd FROM sessions WHERE cwd!='' ORDER BY thread_id")]
@@ -192,6 +206,10 @@ class SessionRepo:
         if column not in _SESSION_COLUMNS:  # the column name is never user input, but it is spliced into SQL
             raise ValueError(f"not a settable sessions column: {column}")
         self._db.execute(f"UPDATE sessions SET {column}=? WHERE thread_id=?", (value, thread_id))
+
+    def delete_thread(self, thread_id: int) -> int:
+        """Removes the topic's row (forget_topic). Returns how many rows were removed (0 or 1)."""
+        return self._db.execute("DELETE FROM sessions WHERE thread_id=?", (thread_id,))
 
 
 class HistoryRepo:
@@ -241,22 +259,60 @@ class HistoryRepo:
                 "UPDATE session_history SET launcher=? WHERE thread_id=? AND uuid=?", (launcher, thread_id, uuid)
             )
 
+    def remember_disk(self, thread_id: int, uuid: str, *, started: str, first_text: str, cwd: str, launcher: str,
+                      backend: str) -> None:
+        """Records a session the CLI left on disk for the topic's folder, for the /resume list.
+
+        INSERT OR IGNORE: a session already in the list keeps its row, so the start time read from disk never replaces
+        the one a turn recorded. A blank folder or launcher on an existing row is filled (a row made before those were
+        known gets them from the disk listing), and nothing else on it changes. `started` is an ISO UTC stamp, as
+        utc_stamp writes it.
+        """
+        folder = _folder(cwd)
+        with self._db.tx() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO session_history(thread_id, uuid, started, first_text, cwd, launcher, backend) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (thread_id, uuid, started, first_text, folder, launcher, backend),
+            )
+            conn.execute(
+                "UPDATE session_history SET cwd=? WHERE thread_id=? AND uuid=? AND cwd=''", (folder, thread_id, uuid)
+            )
+            conn.execute(
+                "UPDATE session_history SET launcher=? WHERE thread_id=? AND uuid=? AND launcher=''",
+                (launcher, thread_id, uuid),
+            )
+
     def list_for(
-        self, thread_id: int, backend: str, cwd: str | None = None, limit: int = HISTORY_LIST_LIMIT
+        self, thread_id: int, backend: str, cwd: str | None = None, limit: int | None = HISTORY_LIST_LIMIT
     ) -> list[HistoryRecord]:
-        """The newest `limit` sessions of the topic that ran on `backend`, newest first.
+        """The newest `limit` sessions of the topic that ran on `backend`, newest first (by id).
 
         With `cwd` given, only the sessions recorded in that folder (or with no folder recorded) are returned. None (the
-        default) returns sessions from every folder.
+        default) returns sessions from every folder. A `limit` of None returns all of them.
         """
         sql = "SELECT * FROM session_history WHERE thread_id=? AND backend=?"
         args: list[object] = [thread_id, backend]
         if cwd is not None:
             sql += " AND (cwd=? OR cwd='')"
             args.append(_folder(cwd))
-        sql += " ORDER BY id DESC LIMIT ?"
-        args.append(limit)
+        sql += " ORDER BY id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(limit)
         return [HistoryRecord.from_row(row) for row in self._db.query(sql, args)]
+
+    def list_newest(self, thread_id: int, backend: str, limit: int) -> list[HistoryRecord]:
+        """The `limit` newest sessions of the topic that ran on `backend`, by start time (id breaks a tie), newest first.
+
+        One bounded query (ORDER BY started DESC, id DESC LIMIT): the /resume picker reads through it, so a topic with a
+        long history is never read whole. Folder filtering is not done here.
+        """
+        rows = self._db.query(
+            "SELECT * FROM session_history WHERE thread_id=? AND backend=? ORDER BY started DESC, id DESC LIMIT ?",
+            (thread_id, backend, limit),
+        )
+        return [HistoryRecord.from_row(row) for row in rows]
 
     def find(self, thread_id: int, uuid: str) -> HistoryRecord | None:
         """The history row of one session of the topic, or None."""
@@ -267,3 +323,7 @@ class HistoryRepo:
         """The history row with this id, if it belongs to the topic (a /resume button carries the id)."""
         rows = self._db.query("SELECT * FROM session_history WHERE id=? AND thread_id=?", (history_id, thread_id))
         return HistoryRecord.from_row(rows[0]) if rows else None
+
+    def delete_thread(self, thread_id: int) -> int:
+        """Removes every remembered session of the topic (forget_topic). Returns how many rows were removed."""
+        return self._db.execute("DELETE FROM session_history WHERE thread_id=?", (thread_id,))

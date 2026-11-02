@@ -7,7 +7,7 @@ Uses the DispatcherCase harness of test_dispatcher: a real AnswerSender over Fak
 import unittest
 
 from tests.test_dispatcher import THREAD, DispatcherCase
-from tg_bridge.core.turn_runner import TurnReply
+from tg_bridge.core.turn_kit import TurnReply
 from tg_bridge.core.turn_state import TurnOutcome
 
 

@@ -8,7 +8,7 @@ Uses the DispatcherCase harness of test_dispatcher: real inbox, queues and Messe
 import unittest
 
 from tests.test_dispatcher import CHAT, SENDER, THREAD, TOPIC, DispatcherCase, RecordingTitles
-from tg_bridge.core.dispatcher import Admission
+from tg_bridge.core.topic_queues import Admission
 
 
 class OrderedTitles(RecordingTitles):

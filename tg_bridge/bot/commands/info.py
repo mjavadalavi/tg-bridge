@@ -6,11 +6,14 @@ and the tool count of the running turn. /cost splits the totals by backend when 
 """
 
 import json
+import math
 
 from tg_bridge.agents.registry import BackendRegistry, UnknownBackend
 from tg_bridge.bot.commands.base import Command, CommandContext, CommandRegistry
 from tg_bridge.config import Config
 from tg_bridge.bot.pickers import rules_picker, status_rows
+from tg_bridge.core import terminal_claim
+from tg_bridge.core.linger import LingerStatus
 from tg_bridge.core.live import RunningTurn
 from tg_bridge.core.topic_backend import topic_backend
 from tg_bridge.core.turn_listeners import slash_key
@@ -23,6 +26,13 @@ DEFAULT_BACKEND = "claude"
 QUEUE_TEXT_CHARS = 80
 MEDIA_PLACEHOLDER = "(voice or photo, still processing)"  # a queued voice/photo whose text is not in yet
 SQLITE_MAX_INT = 2**63 - 1  # a /forget number above this cannot be a rule id (and would overflow the query)
+SECONDS_PER_MINUTE = 60
+SELF_TURN_STATUS_TEXT = "turn: background update running, {tools} tool calls so far"
+LINGER_STATUS_TEXT = ("turn: idle — session kept open for background work ({pending} running, closes in {minutes} min; "
+                      "/stop closes it)")
+LINGER_QUIET_STATUS_TEXT = ("turn: idle — background work finished; the session closes in a few seconds (/stop closes "
+                            "it now)")
+TERMINAL_STATUS_TEXT = "turn: open in the terminal"
 
 
 def register_info_commands(registry: CommandRegistry) -> None:
@@ -63,16 +73,40 @@ def _status(ctx: CommandContext, args: str) -> None:
     hint = _resume_hint(deps.backends, backend, uuid, cwd) if uuid else ""
     if hint:
         lines.append(f"in a terminal: {hint}")
-    lines.append(_turn_line(running))
+    linger = deps.linger.status(ctx.thread_id) if deps.linger is not None else None
+    lines.append(_turn_line(running, linger, _terminal_holds(deps.view_dir, ctx.thread_id)))
     lines += [f"queued: {len(deps.queues.snapshot(ctx.thread_id))}",
               f"always-allow rules: {len(deps.rules.for_thread(ctx.thread_id))}"]
-    ctx.say_buttons("\n".join(lines), status_rows(ctx.thread_id, running is not None))
+    ctx.say_buttons("\n".join(lines), status_rows(ctx.thread_id, running is not None or linger is not None))
 
 
-def _turn_line(running: RunningTurn | None) -> str:
-    if running is None:
+def _terminal_holds(view_dir: str, thread_id: int) -> bool:
+    """True while a live terminal claim (tg-bridge view) holds the topic. Views off ('') never reads the view folder.
+    A view folder that cannot be read counts as no claim, so /status still answers."""
+    if view_dir == "":
+        return False
+    try:
+        return terminal_claim.live_claim(view_dir, thread_id) is not None
+    except OSError:
+        return False
+
+
+def _turn_line(running: RunningTurn | None, linger: LingerStatus | None, terminal: bool = False) -> str:
+    """The turn line of /status: the terminal when it holds the topic's session, else a running turn (a background
+    update of a kept session is named as one), else the kept session with its background work and minutes left, else
+    idle."""
+    if terminal:
+        return TERMINAL_STATUS_TEXT
+    if running is not None:
+        if linger is not None and linger.self_turn:
+            return SELF_TURN_STATUS_TEXT.format(tools=running.feed.tools)
+        return f"turn: running, {running.feed.tools} tool calls so far"
+    if linger is None:
         return "turn: idle"
-    return f"turn: running, {running.feed.tools} tool calls so far"
+    if linger.pending > 0:
+        minutes = math.ceil(linger.seconds_left / SECONDS_PER_MINUTE)
+        return LINGER_STATUS_TEXT.format(pending=linger.pending, minutes=minutes)
+    return LINGER_QUIET_STATUS_TEXT
 
 
 def _resume_hint(backends: BackendRegistry, backend: str, uuid: str, cwd: str) -> str:

@@ -162,6 +162,55 @@ class ProcessTests(InboxCase):
         self.assertEqual(self.h.kv.get("chat:42"), "private")
 
 
+OTHER_GROUP = -200
+OTHER_GROUP_ID = str(OTHER_GROUP)
+STRANGER = 99
+
+
+def other_forum(update: dict, chat_id: int = OTHER_GROUP, forum: bool = True) -> dict:
+    """The same update, moved to another supergroup (a forum unless told otherwise)."""
+    update["message"]["chat"] = {"id": chat_id, "type": "supergroup", "title": "other", "is_forum": forum}
+    return update
+
+
+class GroupLearnTests(InboxCase):
+    def test_non_allowlisted_sender_in_another_forum_does_not_set_the_group(self) -> None:
+        update = other_forum(message_update(880010, 1))
+        update["message"]["from"]["id"] = STRANGER
+        self.h.service.process_update(update)
+        self.assertIsNone(self.h.kv.get("group_id"))
+        self.assertEqual(self.h.kv.get(f"chat:{OTHER_GROUP}"), "other")
+
+    def test_non_allowlisted_sender_does_not_replace_a_known_group(self) -> None:
+        self.h.service.process_update(message_update(880011, 1))
+        update = other_forum(message_update(880012, 2))
+        update["message"]["from"]["id"] = STRANGER
+        self.h.service.process_update(update)
+        self.assertEqual(self.h.kv.get("group_id"), GROUP_ID)
+
+    def test_allowlisted_sender_in_another_forum_keeps_the_group_and_logs_once(self) -> None:
+        self.h.service.process_update(message_update(880013, 1))
+        self.h.service.process_update(other_forum(message_update(880014, 2)))
+        self.h.service.process_update(other_forum(message_update(880015, 3)))
+        self.assertEqual(self.h.kv.get("group_id"), GROUP_ID)
+        lines = [line for line in self.h.log_text().splitlines() if "another group" in line]
+        self.assertEqual(len(lines), 1)  # one line per other chat, after the timestamp
+        self.assertTrue(lines[0].endswith(f"message from another group {OTHER_GROUP_ID} ignored for the bridge's group "
+                                          f"(kept {GROUP_ID})"))
+
+    def test_first_allowlisted_forum_message_sets_the_group(self) -> None:
+        self.assertIsNone(self.h.kv.get("group_id"))
+        self.h.service.process_update(message_update(880016, 1))
+        self.assertEqual(self.h.kv.get("group_id"), GROUP_ID)
+        self.assertNotIn("another group", self.h.log_text())
+
+    def test_plain_group_without_topics_does_not_set_the_group(self) -> None:
+        update = message_update(880017, 1, thread=None, chat={"id": OTHER_GROUP, "type": "group", "title": "plain"})
+        self.h.service.process_update(update)
+        self.assertIsNone(self.h.kv.get("group_id"))
+        self.assertEqual(self.h.kv.get(f"chat:{OTHER_GROUP}"), "plain")
+
+
 class ReplayTests(InboxCase):
     def test_replay_processes_pending_in_update_id_order(self) -> None:
         """replay processes every pending row, lowest update_id first, and marks each done.

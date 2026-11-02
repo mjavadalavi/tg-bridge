@@ -13,8 +13,18 @@ shows their sum as '↑' (the live file's footer did the same with the three Cla
 """
 
 import os
+import re
 
-from tg_bridge.agents.events import StatusEvent, TurnResult, UsageEvent
+from tg_bridge.agents.events import (
+    AgentEvent,
+    StatusEvent,
+    TextEvent,
+    ToolEnd,
+    ToolStart,
+    TurnResult,
+    TurnStatus,
+    UsageEvent,
+)
 
 SEP = " · "
 UNKNOWN = "?"
@@ -24,6 +34,21 @@ OUTCOME_OK = "ok"
 OUTCOME_STOPPED = "stopped"
 OUTCOME_CAPPED = "capped"
 OUTCOME_INTERRUPTED = "interrupted"
+LINE_LABEL_CHARS = 200  # a tool label cut in the readable feed
+LINE_ERROR_CHARS = 200  # a tool failure or a turn error cut in the readable feed
+REPLY_INDENT = "  ↳ "  # a message from a subagent (the event has a parent id)
+NO_DETAIL = "tool failed"
+# Terminal escapes and control characters that must not reach the viewer's terminal: CSI (ESC [ ... final, or its C1
+# form), OSC (ESC ] ... ended by BEL, ESC \, or the end of the text), other ESC sequences and a lone ESC, then the C0
+# and C1 control characters. Tab and newline are kept. Limit: the payload of DCS, APC, PM and SOS strings and of the
+# C1 OSC form stays as visible text (it cannot drive the terminal), and a stray ESC also takes the letter after it.
+TERMINAL_JUNK = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x9b[0-?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\?|\Z)"
+    r"|\x1b[ -/]*[0-~]?"
+    r"|[\x00-\x08\x0b-\x1f\x7f-\x9f]"
+)
 
 
 def fmt_k(n: int) -> str:
@@ -114,3 +139,51 @@ def final_header(outcome: str, *, result: TurnResult | None, usage: UsageEvent |
     if outcome == OUTCOME_INTERRUPTED:
         return f"⏹ interrupted by a bridge restart · {tools} tools"
     return f"❌ turn failed · {tools} tools"
+
+
+def strip_terminal_junk(text: str) -> str:
+    """The text without terminal escape sequences and control characters (tab and newline stay)."""
+    return TERMINAL_JUNK.sub("", text)
+
+
+def plain_line(event: AgentEvent, cwd: str) -> str | None:
+    """One line of the readable terminal feed for an event, or None when the feed does not show it.
+
+    Shown: the text of an assistant message (indented when a subagent wrote it), a tool start, a failed tool end, the
+    result of the turn, the token usage and a status note. cwd is the session's working folder; the labels the
+    backends send are already one line, so no event needs it yet. Every piece of text is passed through
+    strip_terminal_junk first, so the agent's output cannot send escape codes to the viewer's terminal.
+    """
+    if isinstance(event, TextEvent):
+        text = strip_terminal_junk(event.text).strip()
+        if not text:
+            return None
+        return (REPLY_INDENT if event.parent_id else "") + text
+    if isinstance(event, ToolStart):
+        prefix = REPLY_INDENT if event.parent_id else ""
+        return f"{prefix}🔧 {short(strip_terminal_junk(event.label), LINE_LABEL_CHARS)}"
+    if isinstance(event, ToolEnd):
+        if event.ok:
+            return None
+        return f"❌ {short(strip_terminal_junk(event.detail or NO_DETAIL), LINE_ERROR_CHARS)}"
+    if isinstance(event, TurnResult):
+        return _result_line(event)
+    if isinstance(event, UsageEvent):
+        up = event.input_tokens + event.cached_tokens
+        return f"🔢 tokens {fmt_k(up)} in · {fmt_k(event.output_tokens)} out"
+    if isinstance(event, StatusEvent):
+        return status_text(event)
+    return None
+
+
+def _result_line(result: TurnResult) -> str:
+    """The turn's last line: done, interrupted or the error, with the duration when the backend gave one."""
+    if result.status is TurnStatus.OK:
+        line = "✅ done"
+    elif result.status is TurnStatus.INTERRUPTED:
+        line = "⏹ interrupted"
+    else:
+        line = f"⚠ error: {short(strip_terminal_junk(result.error or result.subtype or 'unknown'), LINE_ERROR_CHARS)}"
+    if isinstance(result.duration_ms, (int, float)):
+        line = SEP.join([line, mmss(result.duration_ms / 1000)])
+    return line

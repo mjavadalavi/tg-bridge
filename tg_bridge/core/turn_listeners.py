@@ -23,6 +23,7 @@ from tg_bridge.agents.events import (
     TurnResult,
     UsageEvent,
 )
+from tg_bridge.core.handoff import HandoffService
 from tg_bridge.core.permissions import WaitObserver
 from tg_bridge.logging_ import Logger
 from tg_bridge.store.kv import KvRepo
@@ -224,3 +225,16 @@ class WaitRouter:
             observer = self._observers.get(thread_id)
         if observer is not None:
             observer.waiting_changed(thread_id, waiting)
+
+
+class HandoffClearer:
+    """Discards the pending handoff digest once the fresh session that was given it has started. A turn that dies before
+    SessionStarted never reaches this, so its digest stays in kv for the next try."""
+
+    def __init__(self, handoff: HandoffService, thread_id: int) -> None:
+        self._handoff = handoff
+        self._thread_id = thread_id
+
+    def on_event(self, event: AgentEvent) -> None:
+        if isinstance(event, SessionStarted):
+            self._handoff.discard(self._thread_id)

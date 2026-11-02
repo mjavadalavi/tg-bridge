@@ -24,9 +24,10 @@ from tg_bridge.bot.commands.info import register_info_commands
 from tg_bridge.bot.commands.session import SessionCommands
 from tg_bridge.config import Config
 from tg_bridge.core.cwd import CwdService
-from tg_bridge.core.dispatcher import Dispatcher, TopicQueues
+from tg_bridge.core.dispatcher import Dispatcher
 from tg_bridge.core.handoff import HandoffService
 from tg_bridge.core.live import LiveRegistry
+from tg_bridge.core.topic_queues import TopicQueues
 from tg_bridge.core.workers import WorkerPool
 from tg_bridge.logging_ import Logger
 from tg_bridge.paths import Paths

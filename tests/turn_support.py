@@ -14,15 +14,19 @@ from typing import Any
 from tests.fakes.backend import FakeBackend
 from tests.fakes.clock import FakeClock
 from tests.fakes.telegram import FakeTelegram
+from tests.fakes.uploads import FakeUploader
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.config import Config
 from tg_bridge.core.cards import ApprovalCards
 from tg_bridge.core.handoff import HandoffService
+from tg_bridge.core.linger import LingerService
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.permissions import PermissionService
+from tg_bridge.core.self_turn import SelfTurns
 from tg_bridge.core.slots import SlotPool
 from tg_bridge.core.turn_listeners import WaitRouter
 from tg_bridge.core.turn_runner import TurnRunner
+from tg_bridge.core.view_recorder import ViewFactory
 from tg_bridge.logging_ import Logger
 from tg_bridge.paths import Paths
 from tg_bridge.store.asks import AskRepo
@@ -31,6 +35,7 @@ from tg_bridge.store.kv import KvRepo
 from tg_bridge.store.rules import RuleRepo
 from tg_bridge.store.sessions import HistoryRepo, SessionRepo
 from tg_bridge.store.turns import TurnRepo
+from tg_bridge.telegram.answers import AnswerSender
 from tg_bridge.telegram.messenger import Messenger
 
 THREAD = 9101
@@ -118,9 +123,10 @@ class TurnHarness:
     """Every service a TurnRunner is built with, on real repositories in a migrated database under `home`."""
 
     def __init__(self, home: str, config_data: Mapping[str, Any] | None = None,
-                 base_env: Mapping[str, str] | None = None, poll_seconds: float = 0.005) -> None:
+                 base_env: Mapping[str, str] | None = None, poll_seconds: float = 0.005,
+                 clock: FakeClock | None = None) -> None:
         self.home = home
-        self.clock = FakeClock()
+        self.clock = clock if clock is not None else FakeClock()
         self.log_path = os.path.join(home, "bridge.log")
         self.logger = Logger(self.log_path)
         self.tg = FakeTelegram(clock=self.clock)
@@ -157,12 +163,27 @@ class TurnHarness:
             registry.register(name, lambda config, logger, clock: backend)
         return registry
 
-    def runner(self, registry: BackendRegistry) -> TurnRunner:
+    def runner(self, registry: BackendRegistry, views: ViewFactory | None = None, view_dir: str = "",
+               linger: LingerService | None = None) -> TurnRunner:
         return TurnRunner(
             config=self.config, registry=registry, live=self.live, permissions=self.permissions, waits=self.waits,
             sessions=self.sessions, history=self.history, rules=self.rules, turns=self.turns, kv=self.kv,
             handoff=HandoffService(self.kv, registry, self.logger), feeds=self.feeds, clock=self.clock, logger=self.logger, base_env=self.base_env,
-            errfile_dir=self.errfile_dir, poll_seconds=self.poll_seconds)
+            errfile_dir=self.errfile_dir, poll_seconds=self.poll_seconds, views=views, view_dir=view_dir,
+            linger=linger)
+
+    def linger(self, registry: BackendRegistry) -> LingerService:
+        """A LingerService built from the config as it is now, with a real SelfTurns (its 🔔 replies go to the fake
+        Telegram). Build it again after a set_config(): the service reads the config it was given."""
+        handoff = HandoffService(self.kv, registry, self.logger)
+        self_turns = SelfTurns(
+            config=self.config, clock=self.clock, logger=self.logger, feeds=self.feeds, views=None,
+            permissions=self.permissions, handoff=handoff, waits=self.waits, live=self.live, turns=self.turns,
+            answers=AnswerSender(self.tg, FakeUploader(), self.messenger, self.logger, self.clock),
+            messenger=self.messenger, poll_seconds=self.poll_seconds)
+        return LingerService(
+            config=self.config, sessions=self.sessions, kv=self.kv, live=self.live, permissions=self.permissions,
+            self_turns=self_turns, clock=self.clock, logger=self.logger, poll_seconds=self.poll_seconds)
 
     def log_lines(self) -> list[str]:
         if not os.path.exists(self.log_path):

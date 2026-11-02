@@ -16,18 +16,11 @@ from tests.fakes.telegram import FakeTelegram
 from tests.fakes.uploads import FakeUploader
 from tests.support import TempHome
 from tg_bridge.config import Config
-from tg_bridge.core.dispatcher import (
-    MEDIA_WAIT_SECONDS,
-    QUEUE_MAX,
-    Admission,
-    Delivery,
-    Dispatcher,
-    Placeholder,
-    TopicQueues,
-)
+from tg_bridge.core.dispatcher import MEDIA_WAIT_SECONDS, Dispatcher
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.slots import SlotPool
-from tg_bridge.core.turn_runner import TurnReply
+from tg_bridge.core.topic_queues import QUEUE_MAX, Admission, Delivery, Placeholder, TopicQueues
+from tg_bridge.core.turn_kit import TurnReply
 from tg_bridge.core.turn_state import TurnOutcome
 from tg_bridge.core.turn_text import RESTART_TEXT
 from tg_bridge.logging_ import Logger

@@ -115,3 +115,7 @@ class InboxRepo:
         return self._db.execute(
             "DELETE FROM inbox_queue WHERE state=? AND created < ?", (STATE_DONE, cutoff)
         )
+
+    def delete_thread(self, thread_id: int) -> int:
+        """Removes every queued or finished update of the topic (forget_topic), so nothing of it replays."""
+        return self._db.execute("DELETE FROM inbox_queue WHERE thread_id=?", (thread_id,))

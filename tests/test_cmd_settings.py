@@ -32,10 +32,11 @@ from tg_bridge.bot.commands.settings import (
     NO_SESSION_TEXT,
     SettingsCommands,
 )
+from tg_bridge.bot.pickers import NOT_LIVE_NOTE
 from tg_bridge.config import Config, tilde
 from tg_bridge.core.cards import ApprovalCards
 from tg_bridge.core.cwd import CwdService
-from tg_bridge.core.dispatcher import TopicQueues
+from tg_bridge.core.topic_queues import TopicQueues
 from tg_bridge.core.handoff import HandoffService
 from tg_bridge.core.launcher_switch import COPIED_TEXT, FRESH_TEXT, HANDOFF_TEXT, NOT_FOUND_TEXT, SAME_TEXT, LauncherSwitch
 from tg_bridge.core.live import LiveRegistry
@@ -56,6 +57,7 @@ THREAD = 9480
 CHAT = -1009480
 TOPIC = "SET"
 CLAUDE_CMD = "wrap run"
+TUI_CMD = "tui run"
 SID = "1f2e3d4c-aaaa-4bbb-8ccc-000000000080"
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "claude_transcripts",
                        "handoff_session.jsonl")
@@ -79,16 +81,19 @@ class WaitRecorder:
         pass
 
 
-def config_data(project: str, codex_home: str, codex_models: list[str] | None = None) -> dict:
+def config_data(project: str, codex_home: str, codex_models: list[str] | None = None, with_tui: bool = False) -> dict:
     codex = {"backend": "codex", "command": "codex", "config_dir": codex_home}
     if codex_models is not None:
         codex["models"] = codex_models
+    launchers = {
+        "wrap": {"cmd": CLAUDE_CMD, "config_dir": os.path.join(project, "cfg-a")},
+        "plain": {"cmd": "plain run", "config_dir": os.path.join(project, "cfg-b")},
+        "shared": {"cmd": "shared-cmd", "config_dir": os.path.join(project, "cfg-a")},
+    }
+    if with_tui:  # only the tui tests add it: the launcher picker lists every launcher of the config
+        launchers["tui"] = {"cmd": TUI_CMD, "config_dir": os.path.join(project, "cfg-c"), "transport": "tui"}
     return {
-        "launchers": {
-            "wrap": {"cmd": CLAUDE_CMD, "config_dir": os.path.join(project, "cfg-a")},
-            "plain": {"cmd": "plain run", "config_dir": os.path.join(project, "cfg-b")},
-            "shared": {"cmd": "shared-cmd", "config_dir": os.path.join(project, "cfg-a")},
-        },
+        "launchers": launchers,
         "agent_launchers": {"codex": codex},
         "topics": {TOPIC: {"launcher": CLAUDE_CMD, "cwd": project}},
         "models": MODELS,
@@ -99,6 +104,7 @@ class SettingsCase(unittest.TestCase):
     """The settings commands wired to real services and repositories under a TempHome."""
 
     CODEX_MODELS: list[str] | None = None  # the 'models' of the codex agent launcher (None: the config lists none)
+    WITH_TUI = False                       # True adds a tui launcher ('tui') to the config
 
     def setUp(self) -> None:
         self.home = self.enterContext(TempHome())
@@ -107,8 +113,8 @@ class SettingsCase(unittest.TestCase):
         os.makedirs(self.project, exist_ok=True)
         self.clock = FakeClock()
         self.logger = Logger(os.path.join(self.home.state, "bridge.log"))
-        self.config = Config(config_data(self.project, os.path.join(self.base, "codex"), self.CODEX_MODELS),
-                             home=self.base, env={})
+        self.config = Config(config_data(self.project, os.path.join(self.base, "codex"), self.CODEX_MODELS,
+                                         self.WITH_TUI), home=self.base, env={})
         self.backends = build_default_registry(self.config, self.logger, self.clock, title_launcher="")
         self.db = Database(Paths.from_home(self.base))
         self.addCleanup(self.db.close)
@@ -533,6 +539,33 @@ class RegistrationTests(SettingsCase):
         self.assertFalse(self.run_cmd("/compact"))
         self.assertFalse(self.run_cmd("use /mode here"))
         self.assertEqual(self.row().mode, "bypassPermissions")
+
+
+class TuiLauncherTests(SettingsCase):
+    """A tui launcher (transport tui) has no live mode or model switch: its replies say the change applies next."""
+
+    WITH_TUI = True
+
+    def test_mode_during_a_turn_on_a_tui_launcher_says_next_message(self) -> None:
+        """A tui launcher has no live mode switch (its capabilities say so): the reply says the change applies next."""
+        self.sessions.set_launcher_pick(THREAD, "tui")
+        session, _ = self.start_turn()
+        self.run_cmd("/mode plan")
+        self.assertEqual(self.last(), "🛡 mode set to plan — applies from your next message")
+        self.assertEqual(self.row().mode, "plan")
+        self.assertTrue(wait_until(lambda: ("set_mode", "plan") in session.calls))
+
+    def test_mode_picker_on_a_tui_launcher_carries_the_not_live_note(self) -> None:
+        self.sessions.set_launcher_pick(THREAD, "tui")
+        self.run_cmd("/mode")
+        self.assertIn(NOT_LIVE_NOTE, self.last())
+
+    def test_model_during_a_turn_on_a_tui_launcher_says_next_message(self) -> None:
+        self.sessions.set_launcher_pick(THREAD, "tui")
+        self.start_turn()
+        self.run_cmd("/model opus")
+        self.assertEqual(self.last(), "🧠 model set to opus — applies from your next message")
+        self.assertEqual(self.row().model, "opus")
 
 
 if __name__ == "__main__":

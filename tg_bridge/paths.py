@@ -26,6 +26,7 @@ class Paths:
     log: str
     lock: str
     turns: str
+    view: str
 
     @classmethod
     def from_home(cls, home: str) -> "Paths":
@@ -43,6 +44,7 @@ class Paths:
             log=os.path.join(state, "bridge.log"),
             lock=os.path.join(state, "lock"),
             turns=os.path.join(state, "turns"),
+            view=os.path.join(state, "view"),
         )
 
     @classmethod

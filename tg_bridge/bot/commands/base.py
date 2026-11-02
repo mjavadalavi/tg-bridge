@@ -17,8 +17,9 @@ from typing import Protocol
 
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.config import Config
-from tg_bridge.core.dispatcher import TopicQueues
+from tg_bridge.core.linger import LingerService
 from tg_bridge.core.live import LiveRegistry
+from tg_bridge.core.topic_queues import TopicQueues
 from tg_bridge.store.kv import KvRepo
 from tg_bridge.store.rules import RuleRepo
 from tg_bridge.store.sessions import SessionRepo
@@ -51,6 +52,8 @@ class CommandDeps:
     backends: BackendRegistry
     messenger: Messenger
     out: Submitter
+    linger: LingerService | None = None  # the kept session, for /status and /stop; None when no session is kept
+    view_dir: str = ""  # the view folder, for the terminal claim in /status; '' = views off
 
 
 @dataclass(frozen=True)

@@ -8,16 +8,30 @@ ClaudeTranslator, which is the one place that turns raw objects into AgentEvents
 Threads: the reader thread (ProcessSession) calls _on_line; answer(), interrupt(), set_mode(), set_model() and
 send_user() are called from other threads. A control request made on the reader thread is refused (ControlChannel),
 and set_mode()/set_model()/interrupt() report that as False instead of raising.
+
+Background work (linger): every raw line also goes through BackgroundLedger, which counts the background tasks and
+wakeups still pending. _track() decides which BackgroundWork and TurnBegan events a line produces; they are emitted before
+the translated events of the same line. A turn the CLI starts by itself (a task notification, a wakeup, or a main
+session's text while no turn is open) is reported as TurnBegan; the user's own turns never are.
+
+Interrupts: interrupt() marks the current turn (_interrupt_intent). That turn's error_during_execution result is then
+reported as INTERRUPTED, so a self turn keeps the session (linger).
+Lock map: _state_lock guards _ledger, _turn_open, _removed and _interrupt_intent. Nothing is emitted or written while it
+is held.
 """
 
 import json
+import threading
+from dataclasses import replace
 
 from tg_bridge.agents.base import AgentSession, EventSink, SessionSpec
 from tg_bridge.agents.claude import protocol
+from tg_bridge.agents.claude.background import BackgroundLedger
 from tg_bridge.agents.claude.protocol import ControlChannel
 from tg_bridge.agents.claude.rules import ClaudeRuleMapper
 from tg_bridge.agents.claude.translate import ClaudeTranslator
-from tg_bridge.agents.events import ApprovalRequest, Decision
+from tg_bridge.agents.events import (AgentEvent, ApprovalRequest, BackgroundWork, Decision, TurnBegan, TurnResult,
+                                     TurnStatus)
 from tg_bridge.agents.process import ProcessSession
 from tg_bridge.clock import Clock
 from tg_bridge.logging_ import Logger
@@ -25,6 +39,32 @@ from tg_bridge.logging_ import Logger
 KILL_SWITCH_TOOL = "KillShell"        # the CLI refuses these even in bypass mode
 BYPASS_MODE = "bypassPermissions"
 INTERRUPT_TIMEOUT = 10.0
+ERROR_DURING_EXECUTION = "error_during_execution"  # the CLI's end of a turn that an interrupt stopped
+
+
+def _opens_turn(event: dict) -> bool:
+    """True for a line that starts a turn the CLI began by itself: a system init, the start of a scheduled turn, or a
+    main session's assistant line. A subagent line (parent_tool_use_id set) never starts one."""
+    kind = event.get("type")
+    if kind == "system":
+        return event.get("subtype") == "init"
+    if kind == "command_lifecycle":
+        return event.get("state") == "started"
+    return kind == "assistant" and event.get("parent_tool_use_id") is None
+
+
+def _origin(event: dict, removed: bool) -> str:
+    """Why a self turn began, for the log: a scheduled turn, a task notification, or unknown (empty)."""
+    if event.get("type") == "command_lifecycle":
+        return "scheduled"
+    return "task-notification" if removed else ""
+
+
+def _as_interrupted(event: AgentEvent) -> AgentEvent:
+    """The end of a turn that was interrupted on purpose: error_during_execution is INTERRUPTED, not an error."""
+    if isinstance(event, TurnResult) and event.status is TurnStatus.ERROR and event.subtype == ERROR_DURING_EXECUTION:
+        return replace(event, status=TurnStatus.INTERRUPTED, error=None)
+    return event
 
 
 def build_args(spec: SessionSpec) -> list[str]:
@@ -61,6 +101,11 @@ class ClaudeSession(ProcessSession, AgentSession):
         self._initialize_timeout = initialize_timeout
         self._channel = ControlChannel(self.write, self.on_reader_thread)
         self.session_id: str | None = None
+        self._state_lock = threading.Lock()
+        self._ledger = BackgroundLedger()
+        self._turn_open = False    # a user or self turn is running (set by send_user, cleared by the result)
+        self._removed = False      # the ledger removed a pending task since the last turn began or send_user
+        self._interrupt_intent = False  # interrupt() was asked for the current turn (cleared when it ends or the next begins)
 
     # ---- ProcessSession hooks -------------------------------------------------------------------------
 
@@ -92,6 +137,15 @@ class ClaudeSession(ProcessSession, AgentSession):
             return
         self._learn_session_id(event)
         kind = event.get("type")
+        try:
+            work, began, interrupted = self._track(event)
+        except Exception as e:  # a bookkeeping failure must not end the stream
+            self._log(f"background ledger: {e!r}")
+            work, began, interrupted = None, None, False
+        if work is not None:
+            self._emit(work)
+        if began is not None:
+            self._emit(began)
         if kind == "control_response":
             self._channel.deliver(event)
             return
@@ -100,10 +154,35 @@ class ClaudeSession(ProcessSession, AgentSession):
         except Exception as e:  # a translator failure must not end the stream or leave the CLI waiting
             self._log(f"translate: {e!r}")
             events = []
+        if interrupted:
+            events = [_as_interrupted(item) for item in events]
         for item in events:
             self._emit(item)
         if kind == "control_request" and not events:
             self.write(protocol.unhandled_response(event))
+
+    def _track(self, event: dict) -> tuple[BackgroundWork | None, TurnBegan | None, bool]:
+        """Ledger and turn bookkeeping for one raw line, under _state_lock. Returns the events to emit before the
+        translated ones, and whether this line ends an interrupted turn. A result clears the turn flag before the
+        result's own events are emitted, so a send_user made from a TurnResult listener is not overwritten."""
+        with self._state_lock:
+            before = self._ledger.pending()
+            changed = self._ledger.note(event)
+            pending = self._ledger.pending()
+            if pending < before:
+                self._removed = True
+            work = BackgroundWork(pending=pending) if changed else None
+            began = None
+            if not self._turn_open and _opens_turn(event):
+                self._turn_open = True
+                began = TurnBegan(origin=_origin(event, self._removed))
+                self._removed = False
+                self._interrupt_intent = False  # a new turn never inherits an interrupt aimed at an older one
+            interrupted = False
+            if event.get("type") == "result" and not event.get("resume_reason"):
+                self._turn_open = False
+                interrupted, self._interrupt_intent = self._interrupt_intent, False
+        return work, began, interrupted
 
     def _learn_session_id(self, event: dict) -> None:
         sid = event.get("session_id")
@@ -117,6 +196,10 @@ class ClaudeSession(ProcessSession, AgentSession):
     def send_user(self, text: str, images: tuple[str, ...] = ()) -> None:
         if images:
             raise ValueError("Claude sessions take text only: capabilities.images is False")
+        with self._state_lock:
+            self._turn_open = True  # before the frame goes out: the CLI's answer must find the turn already open
+            self._removed = False
+            self._interrupt_intent = False
         self.write(protocol.user_message(text, self.session_id))
 
     def answer(self, req: ApprovalRequest, decision: Decision, *,
@@ -148,10 +231,14 @@ class ClaudeSession(ProcessSession, AgentSession):
         return self.write(frame)
 
     def interrupt(self, timeout: float = INTERRUPT_TIMEOUT) -> bool:
+        with self._state_lock:  # set before the request: the CLI's result may arrive before its control_response
+            self._interrupt_intent = True
         try:
             self._channel.request("interrupt", timeout)
             return True
         except Exception as e:  # no reply, dead stdin, or called on the reader thread
+            with self._state_lock:
+                self._interrupt_intent = False
             self._log(f"interrupt failed: {e!r}")
             return False
 

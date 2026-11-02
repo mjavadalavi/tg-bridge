@@ -6,7 +6,9 @@ waits for the answer to reach the topic. The TG_BRIDGE_FAKE_TG hook is checked b
 refused for the real home (checked without building anything there, so no real state directory is touched).
 """
 
+import json
 import os
+import stat
 import time
 import unittest
 from collections.abc import Callable
@@ -18,7 +20,10 @@ from tests.support import TempHome
 from tg_bridge.agents.events import TurnResult, TurnStatus
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.app import FAKE_TELEGRAM_ENV, App, fake_telegram_requested, real_home
+from tg_bridge.bot.callbacks.handlers import CHOICE_EXPIRED_TOAST
 from tg_bridge.config import BACKEND_CLAUDE, Config
+from tg_bridge.core.linger import LingerService
+from tg_bridge.core.self_turn import SelfTurns
 from tg_bridge.logging_ import Logger
 from tg_bridge.paths import Paths
 from tg_bridge.telegram.client import HttpTelegramClient
@@ -101,12 +106,42 @@ class AppEndToEndTests(unittest.TestCase):
                          "the session id that was preassigned to the spawn is stored for the topic")
         self.assertEqual(self.app.shutdown_sessions(), 0, "the finished turn left no live session")
 
+    def test_the_turn_leaves_the_topic_view_files_and_the_view_folder_is_private(self) -> None:
+        update = _text_update(1, "hello")
+        self.assertTrue(self.app.inbox.ingest_update(update))
+        self.app.inbox.process_update(update)
+        self.assertTrue(_settle(self.clock, lambda: ANSWER in self.telegram.texts(THREAD)))
+        view = self.app.paths.view
+        self.assertEqual(stat.S_IMODE(os.stat(view).st_mode), 0o700)
+        with open(os.path.join(view, f"{THREAD}.json"), encoding="utf-8") as handle:
+            meta = json.load(handle)
+        self.assertEqual((meta["topic"], meta["transport"], meta["state"]), (TOPIC, "print", "idle"))
+        with open(os.path.join(view, f"{THREAD}.feed"), encoding="utf-8") as handle:
+            self.assertIn("✅ done · 0:00", handle.read().splitlines())
+
     def test_the_services_share_one_live_registry_and_the_injected_registry(self) -> None:
         self.assertIs(self.app.registry.get(BACKEND_CLAUDE), self.backend)
         self.assertIs(self.app.client, self.telegram)
         self.assertIs(self.app.lifecycle._live, self.app.live)
         self.assertIs(self.app.inbox._messages, self.app.handler)
         self.assertIs(self.app.inbox._callbacks, self.app.router)
+
+    def test_app_wires_one_linger_service_into_runner_and_dispatcher(self) -> None:
+        """The turn runner and the dispatcher share one LingerService, which runs its self turns through a SelfTurns."""
+        self.assertIsInstance(self.app.linger, LingerService)
+        self.assertIsInstance(self.app.linger._self_turns, SelfTurns)
+        self.assertIs(self.app.dispatcher._linger, self.app.linger)
+        self.assertIs(self.app.dispatcher._turns._linger, self.app.linger)
+
+    def test_the_router_handles_the_stop_choice_card_taps(self) -> None:
+        """The D2 choice card's buttons (sq:) are registered on the App's router: a tap reaches its handler, which
+        answers 'this choice has expired' when no kept update with the card's hold and self turn runs (the stop path is
+        covered by test_callbacks)."""
+        tap = {"id": "cb-choice", "from": {"id": ALLOWED_UID}, "data": f"cm:{THREAD}:sq:c:1:1",
+               "message": {"message_id": 5, "chat": {"id": CHAT}, "text": "card"}}
+        self.app.router.dispatch(tap)
+        answers = [c.params.get("text") for c in self.telegram.calls if c.method == "answerCallbackQuery"]
+        self.assertEqual(answers, [CHOICE_EXPIRED_TOAST])
 
     def test_the_menu_and_help_list_the_commands_in_the_live_order(self) -> None:
         """The /help text and the setMyCommands menu both follow the live BRIDGE_COMMANDS order (STEP 57 compares them)."""
@@ -188,6 +223,65 @@ class FakeTelegramHookTests(unittest.TestCase):
         plain = App.build(paths, config, clock=clock, registry=registry, env={})
         self.addCleanup(plain.close)
         self.assertIsInstance(plain.client, HttpTelegramClient)
+
+
+class ViewFolderStartupTests(unittest.TestCase):
+    """The view folder at start-up. A folder that cannot be created turns the views off: the App still builds and a turn
+    still answers. Only the daemon's start-up (sweep_stale_views) clears the 'running' state a killed daemon left."""
+
+    def setUp(self) -> None:
+        self.home = self.enterContext(TempHome())
+        self.clock = FakeClock()
+        self.config = _config(self.home.home)
+        self.log_path = os.path.join(self.home.state, "bridge.log")
+        self.logger = Logger(self.log_path)
+        self.paths = Paths.from_home(self.home.home)
+        self.telegram = FakeTelegram(self.clock)
+        self.backend = FakeBackend([[TurnResult(TurnStatus.OK, answer=ANSWER, duration_ms=5, num_turns=1,
+                                                subtype="success")]])
+
+    def build(self, sweep: bool = False) -> App:
+        app = App.build(self.paths, self.config, telegram=self.telegram, clock=self.clock,
+                        registry=_registry(self.config, self.logger, self.clock, self.backend), env={},
+                        sweep_stale_views=sweep)
+        self.addCleanup(app.close)
+        return app
+
+    def write_running_meta(self, thread: int) -> None:
+        with open(os.path.join(self.paths.view, f"{thread}.json"), "w", encoding="utf-8") as handle:
+            json.dump({"topic": TOPIC, "transport": "tui", "launcher": "claude-cmd", "state": "running",
+                       "updated": 1.0}, handle)
+
+    def stored_state(self, thread: int) -> str:
+        with open(os.path.join(self.paths.view, f"{thread}.json"), encoding="utf-8") as handle:
+            return json.load(handle)["state"]
+
+    def test_a_view_folder_that_is_a_file_turns_the_views_off_and_the_turn_still_answers(self) -> None:
+        with open(self.paths.view, "w", encoding="utf-8") as handle:
+            handle.write("not a folder")
+        app = self.build()
+        app.kv.set(f"thread:{THREAD}", TOPIC)
+        update = _text_update(1, "hello")
+        self.assertTrue(app.inbox.ingest_update(update))
+        app.inbox.process_update(update)
+        self.assertTrue(_settle(self.clock, lambda: ANSWER in self.telegram.texts(THREAD)))
+        self.assertTrue(os.path.isfile(self.paths.view))  # nothing was replaced or removed
+        with open(self.log_path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        self.assertEqual(len([line for line in lines if "views are off" in line]), 1)
+        self.assertEqual([line for line in lines if "view: cannot write" in line], [], "no recorder was built")
+
+    def test_the_daemon_start_clears_the_running_state_a_killed_daemon_left(self) -> None:
+        os.makedirs(self.paths.view, mode=0o700, exist_ok=True)
+        self.write_running_meta(9001)
+        self.build(sweep=True)
+        self.assertEqual(self.stored_state(9001), "idle")
+
+    def test_a_short_command_build_leaves_the_running_state_alone(self) -> None:
+        os.makedirs(self.paths.view, mode=0o700, exist_ok=True)
+        self.write_running_meta(9001)
+        self.build(sweep=False)
+        self.assertEqual(self.stored_state(9001), "running")
 
 
 if __name__ == "__main__":

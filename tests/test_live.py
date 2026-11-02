@@ -164,5 +164,55 @@ class ShutdownTests(unittest.TestCase):
             self.assertIsNone(reg.running(THREAD_A + i))
 
 
+class LingerMapTests(unittest.TestCase):
+    """The kept sessions of topics between their turns: counted against a limit, part of the shutdown snapshot."""
+
+    def test_begin_and_end_linger(self) -> None:
+        reg = LiveRegistry()
+        session = object()
+        self.assertIsNone(reg.lingering(THREAD_A))
+        self.assertTrue(reg.begin_linger(THREAD_A, session, limit=3))
+        self.assertIs(reg.lingering(THREAD_A), session)
+        self.assertEqual(reg.lingering_count(), 1)
+        reg.end_linger(THREAD_A, session)
+        self.assertIsNone(reg.lingering(THREAD_A))
+        self.assertEqual(reg.lingering_count(), 0)
+
+    def test_limit_counts_other_threads_only(self) -> None:
+        reg = LiveRegistry()
+        self.assertFalse(reg.begin_linger(THREAD_A, object(), limit=0))
+        self.assertTrue(reg.begin_linger(THREAD_A, object(), limit=1))
+        self.assertFalse(reg.begin_linger(THREAD_B, object(), limit=1))  # one other topic already holds the slot
+        again = object()
+        self.assertTrue(reg.begin_linger(THREAD_A, again, limit=1))  # the same topic replaces its own entry
+        self.assertIs(reg.lingering(THREAD_A), again)
+        self.assertEqual(reg.lingering_count(), 1)
+
+    def test_refused_after_shutdown(self) -> None:
+        reg = LiveRegistry()
+        reg.begin_shutdown()
+        self.assertFalse(reg.begin_linger(THREAD_A, object(), limit=3))
+        self.assertIsNone(reg.lingering(THREAD_A))
+
+    def test_shutdown_snapshot_includes_lingering_once(self) -> None:
+        reg = LiveRegistry()
+        running, kept, both = object(), object(), object()
+        reg.begin_turn(THREAD_A, running, object())
+        reg.begin_turn(THREAD_B, both, object())
+        reg.begin_linger(THREAD_B, both, limit=3)
+        reg.begin_linger(9303, kept, limit=3)
+        snapshot = reg.begin_shutdown()
+        self.assertEqual(len(snapshot), 3)
+        for expected in (running, both, kept):
+            self.assertEqual(sum(1 for s in snapshot if s is expected), 1)
+
+    def test_end_linger_ignores_another_session(self) -> None:
+        reg = LiveRegistry()
+        held, other = object(), object()
+        reg.begin_linger(THREAD_A, held, limit=3)
+        reg.end_linger(THREAD_A, other)
+        self.assertIs(reg.lingering(THREAD_A), held)
+
+
 if __name__ == "__main__":
     unittest.main()

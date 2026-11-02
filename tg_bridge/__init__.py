@@ -54,6 +54,10 @@ Subcommands:
   sendfile <topic> <path> [caption]   push a photo (sendPhoto) or any file (sendDocument)
   type <pane> <text>   type text into a live tmux pane
   spawn <launcher> <name> <text>   start a live seat in a new tmux window
+  view          open the tg-bridge tmux session: one read-only window per topic, live
+  view-sync     the view's sync loop (run in the session's own sync window)
+  view-pane <thread>   one topic's read-only window (run by the view's windows)
+  view-delete <thread>   delete a topic here and in Telegram (the view's Delete topic item); prints the daemon's answer
 """
 
 __version__ = "3.0.0"

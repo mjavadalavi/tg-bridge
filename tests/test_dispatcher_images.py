@@ -14,7 +14,8 @@ from tests.fakes.uploads import FakeUploader
 from tests.support import TempHome
 from tests.turn_support import CHAT, THREAD, TOPIC, ProbingBackend, TurnHarness, wait_until
 from tg_bridge.agents.events import TurnResult, TurnStatus
-from tg_bridge.core.dispatcher import Admission, Dispatcher
+from tg_bridge.core.dispatcher import Dispatcher
+from tg_bridge.core.topic_queues import Admission
 from tg_bridge.telegram.answers import AnswerSender
 
 SENDER = "42"
