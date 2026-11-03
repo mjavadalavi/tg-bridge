@@ -71,10 +71,10 @@ def hook_settings(command: Sequence[str], timeout_seconds: int) -> str:
 def hook_command(python: str = sys.executable) -> list[str]:
     """The argv of the hook: the interpreter, -I, this checkout's tg-bridge.py and the `hook permission` words. -I keeps
     the user's site packages and PYTHON* variables out; the entry script puts its own folder on sys.path itself."""
-    return [python, "-I", _entry_script(), *HOOK_WORDS]
+    return [python, "-I", entry_script(), *HOOK_WORDS]
 
 
-def _entry_script() -> str:
+def entry_script() -> str:
     """tg-bridge.py in the checkout that holds the tg_bridge package. This file is
     tg_bridge/agents/claude/hookbridge.py, so the checkout is four directories up."""
     here = os.path.realpath(__file__)

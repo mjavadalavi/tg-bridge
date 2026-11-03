@@ -6,8 +6,9 @@ run, a call that times out, a non-zero exit and an empty pane id are answers, no
 
 The pure functions at the end read a captured screen: input_empty (the input box holds no text), working (the CLI is busy,
 or a dialog of its own waits for a key), shows_cli (the screen is the CLI's: its box, or one of the states above) and idle
-(input box empty and not working: a message can be pasted now). A pane in a tmux mode (copy-mode) takes no keys for the
-app, so ready() is False there, and paste() leaves the mode first.
+(input box empty and not working: a message can be pasted now), and screen_reason (why it cannot be, as one REASON_ value).
+A pane in a tmux mode (copy-mode) takes no keys for the app, so ready() is False there, and paste() leaves the mode first;
+reason() gives the same answer for the pane itself, with REASON_GONE and REASON_MODE too.
 
 Threads: none of its own; the owner calls it from its own thread. Lock map: none.
 """
@@ -31,6 +32,13 @@ BUSY_HINT = "esc to interrupt"    # the spinner line while a turn runs
 DIALOG_FOOTER = "Enter to confirm · Esc to cancel"  # a selection dialog of the CLI waits for a key
 TAIL_LINES = 6                    # without an input box, the busy hint and the dialog footer are looked for in the last lines
 SPINNER_ABOVE_BOX = 3             # with a box, the spinner line is looked for from this many lines above its top rule
+REASON_IDLE = "idle"              # a message can be pasted now
+REASON_BUSY = "busy"              # the CLI runs a turn (its spinner shows BUSY_HINT)
+REASON_DIALOG = "dialog"          # a selection dialog of the CLI waits for a key (its footer is DIALOG_FOOTER)
+REASON_TYPED = "typed"            # the input box holds text
+REASON_NO_CLI = "no-cli"          # the screen has no input box of the CLI
+REASON_MODE = "mode"              # the pane is in a tmux mode (copy-mode): keys do not reach the app
+REASON_GONE = "gone"              # tmux does not show the pane
 
 
 class TmuxRunner(Protocol):
@@ -80,6 +88,15 @@ class TmuxPane:
     def ready(self) -> bool:
         """True when a message can be pasted into the pane now: it exists, it is in no tmux mode, and its screen is idle."""
         return self.exists() and not self.in_mode() and idle(self.capture())
+
+    def reason(self) -> str:
+        """Why a message cannot be pasted into the pane now, one of the REASON_ values; REASON_IDLE when it can. The pane
+        must exist and be out of any tmux mode first, then its screen decides (screen_reason)."""
+        if not self.exists():
+            return REASON_GONE
+        if self.in_mode():
+            return REASON_MODE
+        return screen_reason(self.capture())
 
     def escape(self) -> bool:
         """Presses Escape in the pane (the CLI's interrupt key)."""
@@ -154,14 +171,18 @@ def input_empty(screen: str) -> bool:
     return _blank(typed) and all(_blank(line) for line in lines[first + 1:bottom])
 
 
-def working(screen: str) -> bool:
-    """True when the CLI is busy (its spinner shows 'esc to interrupt') or a selection dialog of its own waits for a key
-    (its footer 'Enter to confirm · Esc to cancel'). With an input box, the lines from SPINNER_ABOVE_BOX lines above its
-    top rule to the end of the screen are looked at (the statusline sits below the box); without one, the last TAIL_LINES."""
+def _scanned(screen: str) -> list[str]:
+    """The lines that the busy hint and the dialog footer are looked for in: with an input box, from SPINNER_ABOVE_BOX lines
+    above its top rule to the end of the screen (the statusline sits below the box); without one, the last TAIL_LINES."""
     lines = screen.splitlines()
     box = _input_box(lines)
-    scan = _last_lines(screen, TAIL_LINES) if box is None else lines[max(0, box[0] - SPINNER_ABOVE_BOX):]
-    return any(BUSY_HINT in line.lower() or DIALOG_FOOTER in line for line in scan)
+    return _last_lines(screen, TAIL_LINES) if box is None else lines[max(0, box[0] - SPINNER_ABOVE_BOX):]
+
+
+def working(screen: str) -> bool:
+    """True when the CLI is busy (its spinner shows 'esc to interrupt') or a selection dialog of its own waits for a key
+    (its footer 'Enter to confirm · Esc to cancel'). The lines looked at are those of _scanned."""
+    return any(BUSY_HINT in line.lower() or DIALOG_FOOTER in line for line in _scanned(screen))
 
 
 def shows_cli(screen: str) -> bool:
@@ -172,3 +193,18 @@ def shows_cli(screen: str) -> bool:
 def idle(screen: str) -> bool:
     """True when a message can be pasted now: the input box is empty and the CLI is not working."""
     return input_empty(screen) and not working(screen)
+
+
+def screen_reason(screen: str) -> str:
+    """Why a message cannot be pasted into the screen now, one of the REASON_ values: a dialog or a busy hint in _scanned
+    (dialog first), then no input box, then text in the box. REASON_IDLE when none holds: then idle(screen) is True."""
+    scan = _scanned(screen)
+    if any(DIALOG_FOOTER in line for line in scan):
+        return REASON_DIALOG
+    if any(BUSY_HINT in line.lower() for line in scan):
+        return REASON_BUSY
+    if _input_box(screen.splitlines()) is None:
+        return REASON_NO_CLI
+    if not input_empty(screen):
+        return REASON_TYPED
+    return REASON_IDLE

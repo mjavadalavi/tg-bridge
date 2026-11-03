@@ -8,7 +8,7 @@ pasted now)."""
 import unittest
 from pathlib import Path
 
-from tg_bridge.agents.claude.tmux_pane import _is_rule, idle, input_empty, working
+from tg_bridge.agents.claude.tmux_pane import REASON_IDLE, _is_rule, idle, input_empty, screen_reason, working
 
 SCREENS = Path(__file__).resolve().parent / "fixtures" / "tmux_screens"
 
@@ -63,6 +63,12 @@ class ClaudeScreenCaptureTest(unittest.TestCase):
         self.assertTrue(input_empty(busy))
         self.assertTrue(working(busy))
         self.assertFalse(idle(busy))
+
+    def test_reason_idle_agrees_with_idle_on_every_capture(self) -> None:
+        for path in sorted(SCREENS.iterdir()):
+            screen = read_screen(path.name)
+            with self.subTest(capture=path.name):
+                self.assertEqual(screen_reason(screen) == REASON_IDLE, idle(screen))
 
     def test_the_labelled_top_rule_is_a_rule(self) -> None:
         self.assertTrue(_is_rule("─" * 20 + " tg:master-thisis ─"))

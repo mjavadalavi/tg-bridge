@@ -3,7 +3,8 @@
 A turn is read from the session's .jsonl: TranscriptTail follows the file and every line goes to the ClaudeTranslator, and
 TuiTurn keeps the turn's usage, text and interrupt state. The turn ends at the first system/turn_duration after its message
 was typed; an interrupt (Esc) writes none, so the turn ends itself after INTERRUPT_FALLBACK_SECONDS. A message whose line
-never reaches the transcript ends its turn with an error after USER_ECHO_SECONDS (the echo watch). Fifteen seconds after the
+never reaches the transcript ends its turn with an error after USER_ECHO_SECONDS (the echo watch; an attached session
+looks for it in rounds and waits longer for a queued message). Fifteen seconds after the
 send, a transcript that is not where it was expected is looked up and followed from there (TRANSCRIPT_WAIT_SECONDS).
 
 The tail lives as long as the session, not only as long as a turn: after a turn it keeps reading, so background work the
@@ -13,6 +14,10 @@ TurnResult) are both seen. A session marked ending (an intentional close) or clo
 foreign_interrupts is the attached session's mode: the Esc (or a denied permission) was pressed in the terminal, not by this
 bridge, so no interrupt is armed here, and an interrupt line of the transcript ends the turn as INTERRUPTED on its own. Without
 it (the tui transport), an interrupt line counts only while the bridge's own Esc is awaited.
+
+strict_echo (also the attached session) makes the turn's echo its own user line only: until that line is read, the lines
+before it belong to an earlier turn of the tab, so a turn_duration among them does not end the pasted turn and their
+text and tool events are not sent to the topic.
 
 Nothing here knows of processes, PTYs or tmux. The owner passes the transcript location (config_dir, cwd, session_id), its
 translator and logger, and small callables: emit (an event goes out), log (a message), deny_requests (the owner's pending
@@ -32,9 +37,9 @@ from tg_bridge.agents.claude.background import BackgroundLedger
 from tg_bridge.agents.claude.hookbridge import TURN_ENDED
 from tg_bridge.agents.claude.tail import TranscriptTail
 from tg_bridge.agents.claude.translate import ClaudeTranslator
-from tg_bridge.agents.claude.tui_turn import (ECHO_MISSED_ERROR, ECHO_MISSED_SUBTYPE, INTERRUPTED_SUBTYPE,
-                                                TURN_DURATION, USER_ECHO_SECONDS, TuiTurn, is_interrupt,
-                                                turn_start_origin)
+from tg_bridge.agents.claude.tui_turn import (ATTACH_ECHO_MISSED_ERROR, ECHO_MISSED_ERROR, ECHO_MISSED_SUBTYPE,
+                                                INTERRUPTED_SUBTYPE, TURN_DURATION, USER_ECHO_SECONDS, TuiTurn,
+                                                is_interrupt, turn_start_origin)
 from tg_bridge.agents.events import (BackgroundWork, SessionStarted, TurnBegan, TurnResult, TurnStatus, UsageEvent)
 from tg_bridge.clock import Clock
 from tg_bridge.logging_ import Logger
@@ -42,6 +47,7 @@ from tg_bridge.logging_ import Logger
 TRANSCRIPT_WAIT_SECONDS = 15.0  # the transcript must exist this soon after the message is typed
 INTERRUPT_FALLBACK_SECONDS = 3.0  # without an interrupt line in the transcript, the session ends the turn itself
 ATTACH_RELOCATE_SECONDS = 10.0  # an attached turn whose echo is not read this soon looks for the session's new transcript
+ATTACH_QUEUED_MAX_SECONDS = 600.0  # a message the CLI queued (a compaction, a busy turn) may be echoed this late
 
 # relocate(since, text, primary) -> (path, offset, session_id) of the transcript that holds the echo, or None
 Relocate = Callable[[float, str, str], tuple[str, int, str] | None]
@@ -54,11 +60,13 @@ class TranscriptTurns:
     def __init__(self, *, config_dir: str, cwd: str, session_id: str | None, translator: ClaudeTranslator,
                  emit: Callable[[object], None], log: Callable[[str], None], logger: Logger, clock: Clock,
                  deny_requests: Callable[..., object], foreign_interrupts: bool = False,
-                 relocate: Relocate | None = None, on_relocated: Callable[[str], None] | None = None) -> None:
+                 relocate: Relocate | None = None, on_relocated: Callable[[str], None] | None = None,
+                 strict_echo: bool = False) -> None:
         self._config_dir = config_dir
         self._relocate = relocate  # set for an attached session: the echo is looked for in the newer transcripts too
         self._on_relocated = on_relocated  # told the new session id when the turn moved to its transcript
         self._foreign_interrupts = foreign_interrupts  # an interrupt line ends a turn even when no Esc of ours was sent
+        self._strict_echo = strict_echo  # an attached turn counts only its own user line as its echo (TuiTurn strict)
         self._cwd = cwd
         self._session_id = session_id
         self._translator = translator
@@ -76,7 +84,7 @@ class TranscriptTurns:
         self._ending = False                # set by an intentional close: no self turn starts from here on
         self._before: tuple[str | None, int] = (None, 0)  # the transcript found before the send, and its size
         self._sent_at = 0.0  # the wall-clock time the current turn began, before its message is typed
-        self._turn = TuiTurn()                     # the turn's usage, text and interrupt state; guarded by _turn_lock
+        self._turn = TuiTurn(strict=strict_echo)   # the turn's usage, text and interrupt state; guarded by _turn_lock
         self._ledger = BackgroundLedger()          # the background work still pending; guarded by _turn_lock
 
     # ---- owner's thread -------------------------------------------------------------------------------
@@ -113,9 +121,10 @@ class TranscriptTurns:
         if current is not None and current is not tail:  # a follow that started during the drain
             current.stop()
 
-    def begin(self) -> tuple[int, str | None, bool]:
-        """Opens a turn for a send: a new generation with a fresh TuiTurn, and the transcript as it is now. Returns the
-        generation, the transcript path of this session (None without a session id) and whether a tail already follows."""
+    def begin(self, text: str = "") -> tuple[int, str | None, bool]:
+        """Opens a turn for a send: a new generation with a fresh TuiTurn, and the transcript as it is now. text is the
+        message pasted for the turn (TuiTurn.expect: its echo is then the line that holds it). Returns the generation,
+        the transcript path of this session (None without a session id) and whether a tail already follows."""
         primary = self._primary_path()
         before = None
         if self._session_id:
@@ -126,6 +135,7 @@ class TranscriptTurns:
             gen = self._gen
             self._done = False
             self._turn.reset()
+            self._turn.expect(text)  # before the paste: the echo of this message is the only line that starts it
             self._before = (before, TranscriptTail.size_of(before) if before else 0)
             self._sent_at = self._clock.now()
         return gen, primary, follows
@@ -174,18 +184,27 @@ class TranscriptTurns:
                 self._gen += 1
                 self._done = False
                 self._turn.reset()
+                self._turn.echoed = True  # the tab's own starting line is the echo: nothing is typed for this turn
             gen = self._gen
         if changed:
             self._emit(BackgroundWork(pending=pending))
         if began:
             self._emit(TurnBegan(origin=origin))
         if line.get("type") == "system" and line.get("subtype") == TURN_DURATION:
-            self.finish(gen, duration=line)
+            with self._turn_lock:
+                earlier = self._turn.waiting_for_echo  # this duration closes an earlier turn the owner started in the tab
+            if not earlier:
+                self.finish(gen, duration=line)
             return
         with self._turn_lock:
             if gen != self._gen or self._done:
                 return
             self._turn.note(line)
+            # an earlier turn's line: the ledger has it, the topic does not. The interrupt of our own Esc still ends the
+            # turn: the CLI writes it when it stops, even when the pasted message's echo was not read first.
+            own_interrupt = self._turn.interrupting and is_interrupt(line)
+            if self._turn.waiting_for_echo and not own_interrupt:
+                return
             interrupted = (self._turn.interrupting or self._foreign_interrupts) and is_interrupt(line)
         try:
             events = self._translator.translate(line)
@@ -278,22 +297,38 @@ class TranscriptTurns:
         self.finish(gen, interrupted=True)
 
     def _echo_watch(self, gen: int, since: float, text: str) -> None:
-        """Safety net for a typed message: when no line of this turn's message is read within USER_ECHO_SECONDS, the keys
-        went to a dialog of the TUI, and the turn ends with an error instead of waiting for a turn_duration that never comes.
-        An attached session first looks for the echo in the transcripts written since the paste (ATTACH_RELOCATE_SECONDS in:
-        a /clear or /resume in the tab moved the session). finish does nothing when the message was read, or when the
-        generation is no longer this turn."""
+        """Safety net for a typed message: when no line of this turn's message is read within USER_ECHO_SECONDS,
+        the keys went to a dialog of the TUI, and the turn ends with an error instead of waiting for a
+        turn_duration that never comes. An attached session works in rounds of ATTACH_RELOCATE_SECONDS: each
+        round looks for the echo in the transcripts written since the paste (a /clear or /resume in the tab
+        moved the session), and a message the CLI queued (a compaction, a busy turn) keeps the turn open for
+        ATTACH_QUEUED_MAX_SECONDS without those lookups, since the followed transcript holds it. Nothing is
+        sent again. finish does nothing when the message was read, or when the generation is no longer this
+        turn."""
         if self._relocate is None:
             self._clock.sleep(USER_ECHO_SECONDS)
-        else:
+            self.finish(gen, error=ECHO_MISSED_ERROR)
+            return
+        waited = 0.0
+        while True:
             self._clock.sleep(ATTACH_RELOCATE_SECONDS)
-            self._relocate_turn(gen, since, text)
-            self._clock.sleep(USER_ECHO_SECONDS - ATTACH_RELOCATE_SECONDS)
-        self.finish(gen, error=ECHO_MISSED_ERROR)
+            waited += ATTACH_RELOCATE_SECONDS
+            with self._turn_lock:
+                if gen != self._gen or self._done or self._closed or self._turn.echoed:
+                    return
+                queued = self._turn.queued
+                session = self._session_id or ""
+            limit = ATTACH_QUEUED_MAX_SECONDS if queued else USER_ECHO_SECONDS
+            if waited >= limit:
+                self.finish(gen, error=ATTACH_ECHO_MISSED_ERROR.format(session=session, seconds=limit))
+                return
+            if not queued:  # a queued message is in the transcript being followed: other transcripts cannot hold it
+                self._relocate_turn(gen, since, text, waited)
 
-    def _relocate_turn(self, gen: int, since: float, text: str) -> None:
-        """Follows the turn to the transcript that holds its echo, from the echo line on, when the echo was not read in the
-        claim's transcript. The session id moves with it (the next message follows that file too)."""
+    def _relocate_turn(self, gen: int, since: float, text: str, waited: float) -> None:
+        """Follows the turn to the transcript that holds its echo, from the echo line on, when the echo was not read in
+        the claim's transcript. The session id moves with it (the next message follows that file too). waited is the time
+        the echo has been looked for, for the log."""
         with self._turn_lock:
             if gen != self._gen or self._done or self._closed or self._turn.echoed:
                 return
@@ -304,10 +339,13 @@ class TranscriptTurns:
             self._log(f"session relocation failed: {exc!r}")
             return
         if found is None:
-            self._log(f"no transcript holds the message within {ATTACH_RELOCATE_SECONDS:g} s")
+            self._log(f"no transcript holds the message after {waited:g} s")
             return
         path, offset, session_id = found
-        with self._turn_lock:
+        with self._turn_lock:  # the lookup ran without the lock: the turn may have moved on meanwhile
+            if gen != self._gen or self._done or self._closed or self._turn.echoed or self._turn.queued:
+                self._log("session relocation dropped: the turn moved on")
+                return
             self._session_id = session_id
         self._log(f"session moved to {session_id}: following {path}")
         if self._on_relocated is not None:  # before the follow: the lines read there may end the turn at once

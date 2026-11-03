@@ -27,11 +27,14 @@ from dataclasses import dataclass
 
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.bot.commands.base import Alias, Command, CommandContext, CommandRegistry
+from tg_bridge.bot.commands.change_guard import ask_first
+from tg_bridge.bot.commands.disk_sessions import remember_disk_sessions
 from tg_bridge.bot.commands.info import launcher_state
 from tg_bridge.bot.commands.stop_types import StopKind, StopResult
-from tg_bridge.bot.keep_guard import KEEP_TOAST_TEXT, SAME_SESSION_TEXT, WHAT_SESSION, ApplyResult, KeepGuard, applies
+from tg_bridge.bot.keep_guard import SAME_SESSION_TEXT, WHAT_SESSION, ApplyResult, KeepGuard, applies
 from tg_bridge.bot.pickers import RESUME_LIMIT, Picker, resume_picker, stop_choice_picker
-from tg_bridge.clock import Clock, utc_stamp
+from tg_bridge.bot.terminal_guard import TerminalGuard
+from tg_bridge.clock import Clock
 from tg_bridge.config import BACKEND_CLAUDE, Config, LauncherError, LauncherSpec, tilde
 from tg_bridge.core.handoff import HandoffService
 from tg_bridge.core.linger import LingerService, LingerStatus
@@ -96,10 +99,12 @@ class SessionCommands:
     def __init__(self, *, config: Config, sessions: SessionRepo, history: HistoryRepo, live: LiveRegistry,
                  backends: BackendRegistry, messenger: Messenger, clock: Clock, logger: Logger,
                  handoff: HandoffService, stop_wait: float = STOP_WAIT_SECONDS,
-                 linger: LingerService | None = None, keep: KeepGuard | None = None) -> None:
+                 linger: LingerService | None = None, keep: KeepGuard | None = None,
+                 terminal: TerminalGuard | None = None) -> None:
         self._config = config
         self._linger = linger  # None: no session is kept, so nothing can be asked to close or to be interrupted
         self._keep = keep      # None: no change to /new or /resume waits for a confirm card (section 5 D1)
+        self._terminal = terminal  # None: no change waits for the card of an open terminal tab (card H1)
         self._sessions = sessions
         self._history = history
         self._handoff = handoff
@@ -204,7 +209,8 @@ class SessionCommands:
         taken = self._sessions.bound_uuids(thread) - {current_uuid}
         found: dict[str, str] = {}
         if row is not None:
-            found = self._remember_disk(thread, row.cwd, current_command, taken)
+            found = remember_disk_sessions(self._config, self._backends, self._history, thread, row.cwd,
+                                           current_command, taken)
         newest_first = sorted(self._picker_records(thread, taken, found),
                               key=lambda record: (found.get(record.uuid, record.started), record.id), reverse=True)
         return resume_picker(thread, newest_first[:RESUME_LIMIT], current_uuid, current_command, names)
@@ -225,32 +231,6 @@ class SessionCommands:
                 records.append(record)
         return records
 
-    def _remember_disk(self, thread: int, cwd: str, current_command: str, taken: set[str]) -> dict[str, str]:
-        """Records the sessions on disk for the topic's folder, one listing per Claude config folder.
-
-        Launchers that share a config folder are listed once. Their sessions are attributed to the current launcher when
-        it uses that folder, else to the first launcher in config order that does. The ids in taken (sessions another
-        topic is bound to) are left out of the listing before its limit applies, so they do not use up its slots.
-        Returns the modification stamp of each session found, keyed by its id (the newest copy when a folder is listed
-        twice).
-        """
-        exclude = frozenset(taken)
-        owners: dict[str, LauncherSpec] = {}
-        for spec in self._config.launcher_specs().values():
-            if spec.backend != BACKEND_CLAUDE or not spec.config_dir:
-                continue
-            key = os.path.realpath(spec.config_dir)
-            if key not in owners or spec.command == current_command:
-                owners[key] = spec
-        found: dict[str, str] = {}
-        for spec in owners.values():
-            for disk in self._backends.get(spec.backend).list_sessions(spec, cwd, RESUME_LIMIT, exclude):
-                stamp = utc_stamp(disk.modified)
-                self._history.remember_disk(thread, disk.uuid, started=stamp, first_text=disk.title, cwd=cwd,
-                                            launcher=spec.command, backend=spec.backend)
-                found[disk.uuid] = max(found.get(disk.uuid, ""), stamp)
-        return found
-
     def resume_tap(self, thread: int, history_id: int) -> ResumeTap:
         """A tap on a /resume picker button: the same change as /resume <uuid>, refused while a turn runs."""
         row = self._sessions.get(thread)
@@ -263,10 +243,11 @@ class SessionCommands:
             return ResumeTap(NOT_IDLE_TAP_TEXT)
         if self._resume_unchanged(row, record.uuid):
             return ResumeTap(SAME_SESSION_TEXT.format(sid=record.uuid))
-        if self._keep is not None:
-            card = self._keep.hold(thread, WHAT_SESSION, lambda: self._resume_change(thread, record.uuid))
-            if card is not None:
-                return ResumeTap(KEEP_TOAST_TEXT, card)
+        asked = ask_first(self._terminal, self._keep, thread, WHAT_SESSION,
+                          lambda: self._resume_reply(thread, record.uuid, RESUMED_TAP_TEXT),
+                          lambda: self._resume_change(thread, record.uuid))
+        if asked is not None:
+            return ResumeTap(asked[1], asked[0])
         ok, suffix = self.resume_session(thread, record.uuid)
         if not ok:
             return ResumeTap(suffix)
@@ -286,6 +267,22 @@ class SessionCommands:
         """The /resume change a card waits for: a refusal (a session in use elsewhere, another launcher's) is the result."""
         ok, text = self.resume_session(thread, sid)
         return ApplyResult(True) if ok else ApplyResult(False, text)
+
+    def _resume_reply(self, thread: int, sid: str, reply: str) -> ApplyResult:
+        """The /resume change a terminal card waits for: the same reply the direct change gives, formatted from reply
+        (RESUMED_TEXT or RESUMED_TAP_TEXT), or the refusal. Refused while a turn runs (the card may outlive it)."""
+        if self._live.running(thread) is not None:
+            return ApplyResult(False, NOT_IDLE_TEXT)
+        ok, suffix = self.resume_session(thread, sid)
+        return ApplyResult(True, reply.format(sid=sid, suffix=suffix)) if ok else ApplyResult(False, suffix)
+
+    def _new_change(self, thread: int) -> ApplyResult:
+        """The /new change a terminal card waits for: the same reply the direct /new gives, or the refusal while a turn
+        runs (the card may outlive it)."""
+        if self._live.running(thread) is not None:
+            return ApplyResult(False, NOT_IDLE_TEXT)
+        self.new_session(thread)
+        return ApplyResult(True, NEW_TEXT)
 
     def resume_session(self, thread: int, sid: str) -> tuple[bool, str]:
         """Binds the topic to an existing session id (the one in use moves to prev_uuid). Returns (ok, text).
@@ -413,11 +410,12 @@ class SessionCommands:
             button = CallbackData(PICKER_PREFIX, (ctx.thread_id, STOP_BUTTON_KIND, 0))
             ctx.say_buttons(NEW_BUSY_TEXT, [[(NEW_BUTTON_TEXT, button)]])
             return
-        if self._keep is not None:
-            card = self._keep.hold(ctx.thread_id, WHAT_SESSION, applies(lambda: self.new_session(ctx.thread_id)))
-            if card is not None:
-                ctx.say_buttons(card.text, card.rows)
-                return
+        asked = ask_first(self._terminal, self._keep, ctx.thread_id, WHAT_SESSION,
+                          lambda: self._new_change(ctx.thread_id),
+                          applies(lambda: self.new_session(ctx.thread_id)))
+        if asked is not None:
+            ctx.say_buttons(asked[0].text, asked[0].rows)
+            return
         self.new_session(ctx.thread_id)
         ctx.say(NEW_TEXT)
 
@@ -441,10 +439,11 @@ class SessionCommands:
         if row is not None and self._resume_unchanged(row, sid):
             ctx.say(SAME_SESSION_TEXT.format(sid=sid))
             return
-        if self._keep is not None:
-            card = self._keep.hold(ctx.thread_id, WHAT_SESSION, lambda: self._resume_change(ctx.thread_id, sid))
-            if card is not None:
-                ctx.say_buttons(card.text, card.rows)
-                return
+        asked = ask_first(self._terminal, self._keep, ctx.thread_id, WHAT_SESSION,
+                          lambda: self._resume_reply(ctx.thread_id, sid, RESUMED_TEXT),
+                          lambda: self._resume_change(ctx.thread_id, sid))
+        if asked is not None:
+            ctx.say_buttons(asked[0].text, asked[0].rows)
+            return
         ok, suffix = self.resume_session(ctx.thread_id, sid)
         ctx.say(RESUMED_TEXT.format(sid=sid, suffix=suffix) if ok else suffix)

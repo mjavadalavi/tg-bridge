@@ -10,37 +10,49 @@ import json
 import os
 import threading
 import time
+import unittest
 from collections.abc import Callable
 
 from tests.test_dispatcher import THREAD, wait_until
 from tests.test_dispatcher_terminal import QUIET_SECONDS, TerminalDispatcherCase
 from tg_bridge.agents.base import AttachSpec
+from tg_bridge.agents.claude import tmux_pane
 from tg_bridge.core import terminal_claim
 from tg_bridge.core.dispatcher import Dispatcher
-from tg_bridge.core.terminal_wait import WAITING_TEXT
+from tg_bridge.core.terminal_wait import STALL_TEXT, STALL_TEXTS, WAITING_TEXT
 from tg_bridge.core.turn_kit import TurnReply
 from tg_bridge.core.turn_state import TurnOutcome
 from tg_bridge.store.inbox import STATE_DONE
 
 UUID = "0a1b2c3d-0000-4000-8000-000000000001"
+NEW_UUID = "0a1b2c3d-0000-4000-8000-000000000002"
 PANE = "%3"
 CONFIG_DIR = "/srv/claude-config"
 CWD = "/srv/work"
 ATTACH = AttachSpec(socket="", pane=PANE, uuid=UUID, config_dir=CONFIG_DIR, cwd=CWD)
 POLL_SECONDS = 0.01
 WAIT_SECONDS = 5.0
+STALL_THRESHOLD_SECONDS = 0.05  # the stall threshold the dispatcher of these tests runs with
+STALL_STEP_SECONDS = 1.0  # one clock step: well past the threshold, and under a minute in all
 
 
 class PaneProbe:
-    """Stands in for the pane probe of the app: busy until idle is set, and it counts its reads."""
+    """Stands in for the pane probe of the app: busy until idle is set, and it counts its reads. reason is what the
+    reason probe reports while the pane is not idle."""
 
     def __init__(self) -> None:
         self.idle = False
         self.calls = 0
+        self.reason = "typed"
+        self.reason_calls = 0
 
     def __call__(self, claim: terminal_claim.Claim) -> bool:
         self.calls += 1
         return self.idle
+
+    def reason_of(self, claim: terminal_claim.Claim) -> str:
+        self.reason_calls += 1
+        return self.reason
 
 
 class AttachableDispatcherCase(TerminalDispatcherCase):
@@ -58,15 +70,27 @@ class AttachableDispatcherCase(TerminalDispatcherCase):
             titles=self.titles, client=self.tg, live=self.live, config=self.config, logger=self.logger,
             media_wait_seconds=self.media_wait if media_wait is None else media_wait,
             start_thread=self.thread_log, clock=self.clock, poll_seconds=POLL_SECONDS, view_dir=self.view,
-            pane_idle=self.probe if self.WITH_PROBE else None)
+            pane_idle=self.probe if self.WITH_PROBE else None, pane_reason=self.probe.reason_of,
+            stall_seconds=STALL_THRESHOLD_SECONDS)
 
-    def write_attachable(self, pid: int) -> None:
+    def write_attachable(self, pid: int, hooked: bool = False) -> None:
         with open(self.claim_file(), "w", encoding="utf-8") as handle:
             json.dump({"pid": pid, "started": 1.0, "pane": PANE, "uuid": UUID, "config_dir": CONFIG_DIR,
-                       "cwd": CWD, "socket": ""}, handle)
+                       "cwd": CWD, "socket": "", "hooked": hooked}, handle)
 
     def waiting_notices(self) -> int:
         return sum(1 for text in self.tg.texts(THREAD) if text == WAITING_TEXT)
+
+    def stall_notices(self) -> list[str]:
+        return [text for text in self.tg.texts(THREAD) if text.startswith(STALL_TEXT.split("{", 1)[0])]
+
+    def stalled(self, count: int) -> Callable[[], bool]:
+        """A wait_until predicate: each call moves the clock one step on, and it is true once count stall notices went
+        out. The stall starts at the first poll of a wait, so the clock keeps moving until the topic is told."""
+        def check() -> bool:
+            self.clock.advance(STALL_STEP_SECONDS)
+            return len(self.stall_notices()) >= count
+        return check
 
     def deliver_first(self) -> None:
         self.ingest(1)
@@ -213,6 +237,67 @@ class AttachedTurnIsHeldByItsClaim(AttachableDispatcherCase):
         self.assertTrue(wait_until(lambda: self.state(1) == STATE_DONE))
 
 
+class StalledPaneIsExplained(AttachableDispatcherCase):
+    """A pane that stays busy or typed in past the stall threshold tells the topic why, once. Nothing is sent to the
+    pane."""
+
+    def test_after_the_threshold_the_topic_is_told_the_reason_once(self) -> None:
+        self.write_attachable(os.getpid())
+        self.probe.reason = "typed"
+        self.deliver_first()
+        self.assertTrue(wait_until(lambda: self.waiting_notices() == 1), "the topic was not told it waits")
+        self.assertTrue(wait_until(self.stalled(1)), "the topic was not told why it waits")
+        self.assertEqual(self.stall_notices(), [STALL_TEXT.format(minutes=1, detail=STALL_TEXTS["typed"])])
+        self.assertEqual(self.waiting_notices(), 1)
+        time.sleep(QUIET_SECONDS)  # more polls go by with the clock moved on
+        self.clock.advance(STALL_STEP_SECONDS)
+        time.sleep(QUIET_SECONDS)
+        self.assertEqual(len(self.stall_notices()), 1, "the stall notice was sent more than once")
+        self.assertEqual(self.turns.texts_run(THREAD), [], "the message ran while the pane was typed in")
+        self.probe.idle = True
+        self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the message never ran")
+        self.assertEqual(self.turns.attached("first"), ATTACH)
+
+    def test_each_reason_has_its_own_text(self) -> None:
+        self.write_attachable(os.getpid())
+        for number, reason in enumerate(("busy", "dialog", "gone"), start=1):
+            self.probe.reason = reason
+            self.ingest(number)
+            self.deliver(number, reason)
+            self.assertTrue(wait_until(self.stalled(number)), f"the {reason} pane was not explained")
+            self.assertEqual(self.stall_notices()[-1], STALL_TEXT.format(minutes=1, detail=STALL_TEXTS[reason]))
+            self.probe.idle = True
+            self.assertTrue(wait_until(lambda: len(self.turns.texts_run(THREAD)) == number), "the message never ran")
+            self.probe.idle = False
+
+    def test_a_late_idle_reason_sends_no_stall_notice(self) -> None:
+        self.write_attachable(os.getpid())
+        self.probe.reason = "idle"  # the pane freed between the idle poll and the reason probe
+        self.deliver_first()
+        self.assertTrue(wait_until(lambda: self.waiting_notices() == 1), "the topic was not told it waits")
+        for _ in range(3):  # the stall is due: the reason is asked for at each poll past the threshold
+            self.clock.advance(STALL_STEP_SECONDS)
+            time.sleep(QUIET_SECONDS)
+        self.assertGreaterEqual(self.probe.reason_calls, 1, "the stall was never due, so the test proves nothing")
+        self.assertEqual(self.stall_notices(), [], "an idle pane was explained as stalled")
+        self.assertEqual(self.turns.texts_run(THREAD), [], "the message ran while the pane was not idle")
+        self.probe.reason = "typed"  # the next poll decides: the stall is still open, so the notice goes out now
+        self.assertTrue(wait_until(self.stalled(1)), "the stall was not reported once the pane is not idle")
+        self.assertEqual(self.stall_notices(), [STALL_TEXT.format(minutes=1, detail=STALL_TEXTS["typed"])])
+        self.probe.idle = True
+        self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the message never ran")
+
+    def test_no_stall_notice_when_the_pane_frees_in_time(self) -> None:
+        self.write_attachable(os.getpid())
+        self.deliver_first()
+        self.assertTrue(wait_until(lambda: self.waiting_notices() == 1), "the topic was not told it waits")
+        self.probe.idle = True
+        self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the message never ran")
+        self.clock.advance(STALL_STEP_SECONDS)
+        time.sleep(QUIET_SECONDS)
+        self.assertEqual(self.stall_notices(), [], "a pane that freed in time was reported as stalled")
+
+
 class OldClaimKeepsTheOldWait(AttachableDispatcherCase):
     """A claim without a pane (an old view process) is never attached: the probe is not even asked."""
 
@@ -243,3 +328,48 @@ class WithoutAProbeNothingIsAttachable(AttachableDispatcherCase):
         os.remove(self.claim_file())
         self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]))
         self.assertIsNone(self.turns.attached("first"))
+
+
+class StallTextsMatchThePaneReasons(unittest.TestCase):
+    """The reason strings of terminal_wait are the tmux_pane REASON_* values: every non-idle reason has a stall text,
+    and every stall text is for one of those reasons."""
+
+    def test_every_pane_reason_has_a_stall_text(self) -> None:
+        reasons = {value for name, value in vars(tmux_pane).items() if name.startswith("REASON_")}
+        self.assertIn(tmux_pane.REASON_IDLE, reasons)
+        self.assertEqual(set(STALL_TEXTS), reasons - {tmux_pane.REASON_IDLE})
+
+
+class AttachSpecReportsTheClaim(AttachableDispatcherCase):
+    """The attach spec says whether the tab's claim is hooked, and reads the session the claim names right now."""
+
+    def test_the_attach_spec_says_whether_the_tab_is_hooked(self) -> None:
+        self.write_attachable(os.getpid(), hooked=True)
+        self.probe.idle = True
+        self.deliver_first()
+        self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the message never ran")
+        self.assertTrue(self.turns.attached("first").hooked, "a hooked claim gave a spec that is not hooked")
+        self.assertTrue(wait_until(lambda: self.state(1) == STATE_DONE))
+
+    def test_the_attach_spec_of_an_unhooked_claim_is_not_hooked(self) -> None:
+        self.write_attachable(os.getpid())
+        self.probe.idle = True
+        self.deliver_first()
+        self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the message never ran")
+        self.assertFalse(self.turns.attached("first").hooked)
+        self.assertTrue(wait_until(lambda: self.state(1) == STATE_DONE))
+
+    def test_the_attach_spec_reads_the_claim_s_current_session(self) -> None:
+        self.write_attachable(os.getpid(), hooked=True)
+        self.probe.idle = True
+        gate = self.turns.gates.setdefault("first", threading.Event())
+        self.deliver_first()
+        self.assertTrue(self.turns.started("first").wait(WAIT_SECONDS), "the turn did not start")
+        claim_uuid = self.turns.attached("first").claim_uuid
+        self.assertEqual(claim_uuid(), UUID, "the spec does not read the claim's session")
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID))
+        self.assertEqual(claim_uuid(), NEW_UUID, "the spec does not read the session the claim moved to")
+        os.remove(self.claim_file())  # the claim is released: nothing names a session any more
+        self.assertEqual(claim_uuid(), "", "a released claim still names a session")
+        gate.set()
+        self.assertTrue(wait_until(lambda: self.state(1) == STATE_DONE))

@@ -21,11 +21,12 @@ Terminal: with a view folder, the head message waits for the terminal claims of 
 claim with a pane and a session uuid is attachable: when its pane is idle, the message runs as a turn in that terminal
 session (TerminalTurn.attach set; no turn mark is taken, the process belongs to the terminal). A pane that is not ready
 when the turn is about to paste (TerminalNotReady) sends the message back into that wait, with no reply. A claim without
-them keeps the old wait. Otherwise a turn starts only when no claim is live: the check and the turn mark are one step under the
-topic's claim lock (terminal_claim.begin_turn). The mark stays while the topic's process may run: after a kept session's
-turn it stays until the hold ends (the tick that ends it clears it), and a turn that left no kept session clears it when
-it ends (terminal_claim.end_turn). A begun turn keeps its mark through its slot wait: the hold ticks of that wait never
-clear it, since the turn is about to spawn its process. Without a view folder the terminal is not checked at all.
+them keeps the old wait. Otherwise a turn starts only when no claim is live: the check and the turn mark are one step
+under the topic's claim lock (terminal_claim.begin_turn). The mark stays while the topic's process may run: after a
+kept session's turn it stays until the hold ends (the tick that ends it clears it), and a turn that left no kept session
+clears it when it ends (terminal_claim.end_turn). A begun turn keeps its mark through its slot wait: the hold ticks of
+that wait never clear it, since the turn is about to spawn its process. Without a view folder the terminal is not
+checked at all. The before_turn hook runs after the wait, before a turn the bridge spawns (not an attached one).
 
 Lock map: none. TopicQueues and LingerService guard their own data; nothing is called under a lock here. The claim lock
 is an fcntl file lock taken inside terminal_claim, and only file I/O runs under it.
@@ -44,7 +45,7 @@ from tg_bridge.core.linger import LINGER_CAP_TEXT, LINGER_EXIT_TEXT, POLL_SECOND
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.removals import Removals
 from tg_bridge.core.slots import Slot, SlotPool
-from tg_bridge.core.terminal_wait import TerminalWait
+from tg_bridge.core.terminal_wait import STALL_SECONDS, TerminalWait
 from tg_bridge.core.titles import TitleService
 from tg_bridge.core.topic_queues import Admission, Delivery, Placeholder, QueuedItem, TopicQueues, _Entry, _HeadKind
 from tg_bridge.core.turn_runner import TurnRunner
@@ -92,6 +93,9 @@ class Dispatcher:
         view_dir: str = "",  # the view folder of the terminal claims; '' = views off, the terminal is not checked
         removals: Removals | None = None,  # the marks of topics being removed, shared with TopicRemover
         pane_idle: Callable[[terminal_claim.Claim], bool] | None = None,  # the probe of an attachable claim's pane
+        pane_reason: Callable[[terminal_claim.Claim], str] | None = None,  # why that pane is not idle (stall notice)
+        stall_seconds: float = STALL_SECONDS,  # a pane not idle this long gets the stall notice
+        before_turn: Callable[[int], None] | None = None,  # run before a turn the bridge spawns (not an attached one)
     ) -> None:
         self._turns = turns
         self._slots = slots
@@ -103,6 +107,7 @@ class Dispatcher:
         self._live = live
         self._config = config
         self._logger = logger
+        self._before_turn = before_turn  # None: no hook; a raising hook is logged and the turn runs anyway
         self._media_wait = media_wait_seconds
         self._start_thread = start_thread
         self._linger = linger  # None: no session is kept, the runner never holds a topic
@@ -115,7 +120,7 @@ class Dispatcher:
         self._terminal = TerminalWait(
             view_dir=view_dir, removals=self._removals, shutting_down=live.is_shutting_down, clock=self._clock,
             logger=logger, messenger=messenger, poll_seconds=poll_seconds, pane_idle=pane_idle,
-            holding=self._holding, tick=self._hold_tick)
+            holding=self._holding, tick=self._hold_tick, pane_reason=pane_reason, stall_seconds=stall_seconds)
 
     def busy(self, thread_id: int) -> bool:
         """True while the topic's runner runs: a message is queued, taken or in a turn, or a session is held."""
@@ -316,11 +321,17 @@ class Dispatcher:
     def _run_entry(self, thread_id: int, topic: str, entry: _Entry, text: str, images: tuple[str, ...]) -> bool:
         """Run one queued message as a turn, once the terminal allows it (TerminalWait). False: the runner must stop
         (restart stop, shutdown refusal, shutdown while the terminal held the topic). A terminal that was not ready when
-        the turn was to start (_run_turn returns None) sends the message back into the terminal wait, without a reply."""
+        the turn was to start (_run_turn returns None) sends the message back into the terminal wait, without a reply.
+        Before a turn the bridge spawns itself (attach None), the before_turn hook runs; an attached turn skips it."""
         while True:
             turn = self._terminal.wait(thread_id, entry.chat_id)
             if turn is None:  # no turn started: the row is still pending for a restart
                 return False
+            if turn.attach is None and self._before_turn is not None:
+                try:
+                    self._before_turn(thread_id)
+                except Exception as exc:  # the hook is best-effort: the turn runs regardless
+                    self._logger.log(f"thread {thread_id}: before-turn hook failed: {str(exc)[:SEND_ERROR_CHARS]}")
             try:
                 done = self._run_turn(thread_id, topic, entry, text, images, turn.attach)
             finally:

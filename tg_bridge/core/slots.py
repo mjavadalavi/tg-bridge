@@ -1,4 +1,4 @@
-"""SlotPool (size permits, default 2) + Slot take / give_back / retake (C15).
+"""SlotPool (size permits, default 5) + Slot take / give_back / retake (C15).
 
 Port of the live file's _sem (Semaphore(_SLOTS)) and class _Slot. A turn holds one permit while it runs. A turn that
 is parked on a permission card gives its permit back (give_back) so the other topics keep running, and takes it again
@@ -13,7 +13,7 @@ from collections.abc import Callable
 
 from tg_bridge.telegram.messenger import Messenger
 
-SLOT_COUNT = 2  # turns that may run at once
+SLOT_COUNT = 5  # turns that may run at once; one below a 6-session cap leaves a seat for a view tab
 WAIT_POLL_SECONDS = 1.0  # how often a queued take() checks for shutdown (the live file used acquire(timeout=1))
 
 

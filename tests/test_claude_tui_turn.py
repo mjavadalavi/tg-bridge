@@ -10,8 +10,8 @@ and on any assistant line, never on a metadata line."""
 import unittest
 
 from tg_bridge.agents.claude.translate import NO_CONVERSATION, RESULT_DETAIL_CHARS
-from tg_bridge.agents.claude.tui_turn import (INTERRUPTED_SUBTYPE, TURN_DURATION, TuiTurn, is_echo, is_interrupt,
-                                              turn_start_origin)
+from tg_bridge.agents.claude.tui_turn import (INTERRUPTED_SUBTYPE, TURN_DURATION, TuiTurn, echo_needle, is_echo,
+                                              is_echo_of, is_interrupt, is_queued, turn_start_origin)
 from tg_bridge.agents.events import TurnStatus
 
 
@@ -208,3 +208,195 @@ class EchoTests(unittest.TestCase):
         for line in METADATA_LINES:
             turn.note(line)
         self.assertFalse(turn.echoed)
+
+    def test_an_enqueue_line_marks_the_turn_queued_but_not_echoed(self) -> None:
+        enqueue = {"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-11-02T10:00:00Z",
+                   "sessionId": "s1", "content": "hi"}
+        self.assertTrue(is_queued(enqueue))
+        turn = TuiTurn()
+        turn.reset()
+        turn.note(enqueue)
+        self.assertTrue(turn.queued)
+        self.assertFalse(turn.echoed)
+
+    def test_a_dequeue_line_marks_nothing(self) -> None:
+        dequeue = {"type": "queue-operation", "operation": "dequeue", "timestamp": "2026-11-02T10:00:05Z",
+                   "sessionId": "s1"}
+        self.assertFalse(is_queued(dequeue))
+        turn = TuiTurn()
+        turn.reset()
+        turn.note(dequeue)
+        self.assertFalse(turn.queued)
+        self.assertFalse(turn.echoed)
+
+    def test_reset_clears_queued(self) -> None:
+        turn = TuiTurn()
+        turn.note({"type": "queue-operation", "operation": "enqueue", "sessionId": "s1"})
+        self.assertTrue(turn.queued)
+        turn.reset()
+        self.assertFalse(turn.queued)
+
+    def test_a_strict_turn_ignores_assistant_lines_before_its_echo(self) -> None:
+        turn = TuiTurn(strict=True)
+        turn.reset()
+        turn.note(assistant("m0", texts=("earlier answer",), usage={"input_tokens": 7}) | {"isApiErrorMessage": True})
+        self.assertFalse(turn.echoed)
+        self.assertTrue(turn.waiting_for_echo)
+        self.assertEqual(turn.usage_event().input_tokens, 0)
+        self.assertIsNone(turn.result(None).answer)
+        self.assertEqual(turn.result(None).status, TurnStatus.OK)  # the earlier turn's error is not this turn's
+        turn.note(SDK_PROMPT)
+        self.assertTrue(turn.echoed)
+        self.assertFalse(turn.waiting_for_echo)
+        turn.note(assistant("m1", texts=("later answer",), usage={"input_tokens": 3}))
+        self.assertEqual(turn.usage_event().input_tokens, 3)
+        self.assertEqual(turn.result(None).answer, "later answer")
+
+    def test_a_strict_turn_is_echoed_only_by_its_user_line(self) -> None:
+        turn = TuiTurn(strict=True)
+        turn.reset()
+        turn.note(assistant("m1", texts=("working",)))
+        self.assertFalse(turn.echoed)
+        for line in METADATA_LINES:
+            turn.note(line)
+        self.assertFalse(turn.echoed)
+        turn.note(SDK_PROMPT)
+        self.assertTrue(turn.echoed)
+
+    def test_strict_survives_reset(self) -> None:
+        turn = TuiTurn(strict=True)
+        turn.reset()
+        turn.note(SDK_PROMPT)
+        turn.note(assistant("m1", texts=("first turn",)))
+        turn.reset()
+        self.assertTrue(turn.strict)
+        self.assertTrue(turn.waiting_for_echo)
+        turn.note(assistant("m2", texts=("earlier turn, read late",)))
+        self.assertFalse(turn.echoed)
+        self.assertIsNone(turn.result(None).answer)
+
+    def test_a_non_strict_turn_keeps_an_assistant_line_as_its_echo(self) -> None:
+        turn = TuiTurn()
+        turn.reset()
+        self.assertFalse(turn.strict)
+        turn.note(assistant("m1", texts=("working",)))
+        self.assertTrue(turn.echoed)
+        self.assertFalse(turn.waiting_for_echo)
+        self.assertEqual(turn.result(None).answer, "working")
+
+TEXT = "please summarise the ledger for March"
+INTERRUPT_LINE = {"type": "user", "message": {"role": "user", "content": "[Request interrupted by user]"}}
+
+
+def owner_prompt(text: str) -> dict:
+    """A prompt the owner typed into the tab (an interactive prompt: turnOrigin 'human')."""
+    return {"type": "user", "turnOrigin": "human", "message": {"role": "user", "content": text}}
+
+
+def queued_command(prompt: str) -> dict:
+    """The attachment the CLI writes when it delivers a message pasted while a turn was busy."""
+    return {"type": "attachment", "attachment": {"type": "queued_command", "prompt": prompt, "commandMode": "prompt"}}
+
+
+def command_line(command: str, args: str) -> dict:
+    """The user line the CLI stores for a slash command with arguments: the command and its args as tags."""
+    content = (f"<command-name>{command}</command-name>\n<command-message>{command[1:]}</command-message>\n"
+               f"<command-args>{args}</command-args>")
+    return owner_prompt(content)
+
+
+def enqueue(content: str) -> dict:
+    return {"type": "queue-operation", "operation": "enqueue", "sessionId": "s1", "content": content}
+
+
+class AttachedEchoTests(unittest.TestCase):
+    """An attached turn with its pasted text (expect): only the lines holding that text are its echo or its queue."""
+
+    def turn(self) -> TuiTurn:
+        turn = TuiTurn(strict=True)
+        turn.reset()
+        turn.expect(TEXT)
+        return turn
+
+    def test_another_prompt_of_the_owner_and_an_interrupt_line_are_not_the_echo(self) -> None:
+        turn = self.turn()
+        turn.note(owner_prompt("what is in the ledger?"))
+        turn.note(INTERRUPT_LINE)
+        self.assertFalse(turn.echoed)
+        self.assertTrue(turn.waiting_for_echo)
+        turn.note(owner_prompt(TEXT + ", and the totals"))
+        self.assertTrue(turn.echoed)
+
+    def test_a_foreign_enqueue_does_not_mark_the_turn_queued(self) -> None:
+        turn = self.turn()
+        turn.note(enqueue("<task-notification><task-id>b1</task-id></task-notification>"))
+        turn.note(enqueue("a question typed in the tab"))
+        self.assertFalse(turn.queued)
+        self.assertFalse(turn.echoed)
+        turn.note(enqueue(TEXT))
+        self.assertTrue(turn.queued)
+        self.assertFalse(turn.echoed, "a queue line is not the echo: the message has not started its turn")
+
+    def test_the_queued_command_attachment_holding_the_text_is_the_echo(self) -> None:
+        turn = self.turn()
+        turn.note(queued_command("a different prompt"))
+        self.assertFalse(turn.echoed)
+        turn.note(queued_command(TEXT))
+        self.assertTrue(turn.echoed)
+        self.assertFalse(turn.waiting_for_echo)
+        turn.note(assistant("m1", texts=("answer",)))
+        self.assertEqual(turn.result(None).answer, "answer")
+
+    def test_a_blank_text_keeps_the_strict_rule_of_any_user_line(self) -> None:
+        turn = TuiTurn(strict=True)
+        turn.reset()
+        turn.expect("   ")
+        turn.note(owner_prompt("anything"))
+        self.assertTrue(turn.echoed)
+
+    def test_reset_clears_the_text_and_expect_after_it_names_the_next_turn(self) -> None:
+        turn = self.turn()
+        turn.reset()
+        turn.note(owner_prompt("anything"))
+        self.assertTrue(turn.echoed, "the text of the earlier turn is still held after reset")
+        turn = TuiTurn(strict=True)
+        turn.reset()
+        turn.expect("the next message, long enough to be named by its start")
+        turn.note(owner_prompt(TEXT))
+        self.assertFalse(turn.echoed)
+
+    def test_a_non_strict_turn_ignores_the_text(self) -> None:
+        turn = TuiTurn()
+        turn.reset()
+        turn.expect(TEXT)
+        turn.note(owner_prompt("anything"))
+        self.assertTrue(turn.echoed)
+        turn = TuiTurn()
+        turn.reset()
+        turn.expect(TEXT)
+        turn.note(assistant("m1", texts=("working",)))
+        self.assertTrue(turn.echoed)
+
+    def test_is_echo_of_accepts_the_user_line_the_attachment_and_the_enqueue_with_the_text(self) -> None:
+        needle = echo_needle(TEXT)
+        self.assertTrue(is_echo_of(owner_prompt(TEXT), needle))
+        self.assertTrue(is_echo_of(queued_command(TEXT), needle))
+        self.assertTrue(is_echo_of(enqueue(TEXT), needle))
+        self.assertFalse(is_echo_of(owner_prompt("another prompt"), needle))
+        self.assertFalse(is_echo_of(INTERRUPT_LINE, needle))
+        self.assertFalse(is_echo_of(queued_command("another prompt"), needle))
+        self.assertFalse(is_echo_of(owner_prompt(TEXT), ""), "a blank needle matches nothing")
+
+    def test_is_echo_of_matches_a_slash_command_with_arguments_by_its_stored_tags(self) -> None:
+        tagged = command_line("/review-pr", "12")
+        self.assertTrue(is_echo_of(tagged, echo_needle("/review-pr 12")))
+        self.assertFalse(is_echo_of(tagged, echo_needle("/review-pr 13")), "another argument is another command")
+        self.assertFalse(is_echo_of(command_line("/model", "sonnet"), echo_needle("/review-pr 12")))
+        self.assertTrue(is_echo_of(command_line("/model", ""), echo_needle("/model")), "no arguments still matches")
+        self.assertTrue(is_echo_of(command_line("/model", "sonnet"), echo_needle("/model")))
+        self.assertFalse(is_echo_of(tagged, echo_needle("review-pr 12")), "a plain needle is matched as before")
+
+    def test_echo_needle_is_the_first_sixty_characters_of_the_stripped_text(self) -> None:
+        self.assertEqual(echo_needle("  " + TEXT + "  "), TEXT)
+        self.assertEqual(echo_needle("x" * 100), "x" * 60)
+        self.assertEqual(echo_needle(" \n "), "")

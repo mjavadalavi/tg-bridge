@@ -20,6 +20,7 @@ from tests.turn_support import CHAT, THREAD, TOPIC, TurnHarness, wait_until
 from tg_bridge.agents.base import AttachSpec, always_attached
 from tg_bridge.agents.claude import history
 from tg_bridge.agents.claude.transcript_turns import ATTACH_RELOCATE_SECONDS
+from tg_bridge.agents.claude.tui_turn import ATTACH_ECHO_MISSED_ERROR, USER_ECHO_SECONDS
 from tg_bridge.agents.claude.backend import ClaudeBackend
 from tg_bridge.bot.commands.info import ATTACHED_STATUS_TEXT, TERMINAL_STATUS_TEXT, _turn_line
 from tg_bridge.core import terminal_claim
@@ -266,21 +267,22 @@ class BotLevelTests(SessionCase):
 
 
 class RelocatingClock(BlockingClock):
-    """The attached session's echo window (user-echo thread): the relocation step returns at once and the rest blocks
-    until the test releases it, so the 10 s step and the 30 s window are both checked without waiting for them."""
+    """The attached session's echo window (user-echo thread): the echo rounds (ATTACH_RELOCATE_SECONDS each) return at
+    once and the round block_at blocks until the test releases it, so the three rounds of the 30 s window are checked
+    without waiting for them."""
 
-    def __init__(self) -> None:
+    def __init__(self, block_at: int = 3) -> None:
         super().__init__()
         self.echo_sleeps: list[float] = []
+        self.block_at = block_at
 
     def sleep(self, seconds: float) -> None:
         if threading.current_thread().name != "user-echo":
             super().sleep(seconds)
             return
         self.echo_sleeps.append(seconds)
-        if seconds == ATTACH_RELOCATE_SECONDS:
-            return
-        self.release.wait()
+        if len(self.echo_sleeps) >= self.block_at:
+            self.release.wait()
 
 
 class StaleClaimTests(AttachedTurnCase):
@@ -327,13 +329,13 @@ class StaleClaimTests(AttachedTurnCase):
     def test_with_no_transcript_holding_the_message_the_turn_ends_with_the_echo_error_at_thirty_seconds(self) -> None:
         self.tmux.on_paste = None  # nothing is written: the message never reaches a transcript
         thread, box = self.start()
-        self.assertTrue(wait_until(lambda: len(self.clock.echo_sleeps) == 2), "the echo window did not start")
-        self.assertEqual(self.clock.echo_sleeps, [10.0, 20.0])
+        self.assertTrue(wait_until(lambda: len(self.clock.echo_sleeps) == 3), "the third echo round did not start")
+        self.assertEqual(self.clock.echo_sleeps, [10.0, 10.0, 10.0], "the echo window is not 30 s in three rounds")
         self.assertTrue(thread.is_alive(), "the turn ended before the echo window")
         self.clock.release.set()
         thread.join(TURN_WAIT)
         self.assertFalse(thread.is_alive())
         self.assertEqual(box[0].outcome, TurnOutcome.ERROR)
-        self.assertIn("did not reach Claude Code", box[0].err)
+        self.assertIn(ATTACH_ECHO_MISSED_ERROR.format(session=UUID, seconds=USER_ECHO_SECONDS), box[0].err)
         self.assertEqual(self.h.sessions.get(THREAD).uuid, UUID, "the topic moved without a transcript")
 

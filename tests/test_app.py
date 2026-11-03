@@ -12,6 +12,7 @@ import stat
 import time
 import unittest
 from collections.abc import Callable
+from unittest import mock
 
 from tests.fakes.backend import FakeBackend
 from tests.fakes.clock import FakeClock
@@ -21,6 +22,9 @@ from tg_bridge.agents.events import TurnResult, TurnStatus
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.app import FAKE_TELEGRAM_ENV, App, fake_telegram_requested, real_home
 from tg_bridge.bot.callbacks.handlers import CHOICE_EXPIRED_TOAST
+from tg_bridge.bot.callbacks.terminal_taps import TerminalTaps
+from tg_bridge.bot.commands.session import SessionCommands
+from tg_bridge.bot.terminal_guard import TerminalGuard
 from tg_bridge.config import BACKEND_CLAUDE, Config
 from tg_bridge.core.linger import LingerService
 from tg_bridge.core.self_turn import SelfTurns
@@ -132,6 +136,25 @@ class AppEndToEndTests(unittest.TestCase):
         self.assertIsInstance(self.app.linger._self_turns, SelfTurns)
         self.assertIs(self.app.dispatcher._linger, self.app.linger)
         self.assertIs(self.app.dispatcher._turns._linger, self.app.linger)
+
+    def test_the_terminal_guard_gets_the_live_registry_and_the_clock_and_settles_before_a_bridge_turn(self) -> None:
+        """One TerminalGuard, built with the app's live registry and clock, is the dispatcher's before_turn hook and
+        the guard the session commands and the terminal taps hold."""
+        with TempHome() as home, \
+                mock.patch("tg_bridge.app.TerminalGuard", wraps=TerminalGuard) as guard_cls, \
+                mock.patch("tg_bridge.app.SessionCommands", wraps=SessionCommands) as session_cmds, \
+                mock.patch("tg_bridge.app.TerminalTaps", wraps=TerminalTaps) as taps:
+            config = _config(home.home)
+            app = App.build(Paths.from_home(home.home), config, telegram=self.telegram, clock=self.clock,
+                            registry=_registry(config, self.logger, self.clock, self.backend), env={})
+            self.addCleanup(app.close)
+        guard = app.dispatcher._before_turn.__self__
+        self.assertIsInstance(guard, TerminalGuard)
+        self.assertEqual(app.dispatcher._before_turn, guard.before_turn)
+        self.assertIs(guard_cls.call_args.kwargs["live"], app.live)
+        self.assertIs(guard_cls.call_args.kwargs["clock"], self.clock)
+        self.assertIs(session_cmds.call_args.kwargs["terminal"], guard)
+        self.assertIs(taps.call_args.kwargs["terminal"], guard)
 
     def test_the_router_handles_the_stop_choice_card_taps(self) -> None:
         """The D2 choice card's buttons (sq:) are registered on the App's router: a tap reaches its handler, which

@@ -28,7 +28,7 @@ NOTICE_FRAGMENT = "waiting for a free slot"
 class Harness:
     """A SlotPool over a Messenger on a FakeTelegram. shutdown is an Event the test sets when it wants a stop."""
 
-    def __init__(self, home: TempHome, size: int = SLOT_COUNT) -> None:
+    def __init__(self, home: TempHome, size: int = 2) -> None:
         self.tg = FakeTelegram(clock=FakeClock())
         self.messenger = Messenger(self.tg, Logger(os.path.join(home.state, "bridge.log")), FakeClock())
         self.shutdown = threading.Event()
@@ -83,11 +83,11 @@ class PoolBasicsTests(unittest.TestCase):
             slot = h.slot(TOPIC_A)
             self.assertTrue(slot.take())
             self.assertTrue(slot.take())
-            self.assertEqual(h.pool.free(), SLOT_COUNT - 1)
+            self.assertEqual(h.pool.free(), h.pool.size - 1)
             self.assertTrue(slot.held)
 
     def test_slot_count(self) -> None:
-        self.assertEqual(SLOT_COUNT, 2)
+        self.assertEqual(SLOT_COUNT, 5)
 
 
 class QueuedTurnTests(unittest.TestCase):
@@ -124,7 +124,7 @@ class QueuedTurnTests(unittest.TestCase):
 
             holders[1].give_back()
             waiter.give_back()
-            self.assertEqual(h.pool.free(), SLOT_COUNT)
+            self.assertEqual(h.pool.free(), h.pool.size)
 
     def test_notice_names_the_pool_size(self) -> None:
         with TempHome() as home:
@@ -134,7 +134,7 @@ class QueuedTurnTests(unittest.TestCase):
                 holder.take()
             th, _ = _in_thread(h.slot(TOPIC_C).take)
             self.assertTrue(_wait_until(lambda: len(h.notices(TOPIC_C)) == 1))
-            self.assertIn(f"{SLOT_COUNT} topics are busy", h.notices(TOPIC_C)[0])
+            self.assertIn(f"{h.pool.size} topics are busy", h.notices(TOPIC_C)[0])
             holders[0].give_back()
             th.join(WAIT)
 
@@ -156,7 +156,7 @@ class QueuedTurnTests(unittest.TestCase):
             self.assertEqual(h.pool.free(), 0)
             for holder in holders:
                 holder.give_back()
-            self.assertEqual(h.pool.free(), SLOT_COUNT)
+            self.assertEqual(h.pool.free(), h.pool.size)
 
     def test_shutdown_does_not_block_a_free_permit(self) -> None:
         """Parity with the live acquire(timeout=1) loop: a permit that is free is taken even during shutdown."""
@@ -178,7 +178,7 @@ class ParkedTurnTests(unittest.TestCase):
             parked_b.take()
             parked_a.give_back()
             parked_b.give_back()
-            self.assertEqual(h.pool.free(), SLOT_COUNT)
+            self.assertEqual(h.pool.free(), h.pool.size)
 
             other = h.slot(TOPIC_C)
             t0 = time.monotonic()
@@ -194,7 +194,7 @@ class ParkedTurnTests(unittest.TestCase):
             self.assertEqual(h.pool.free(), 0)
             parked_a.give_back()
             parked_b.give_back()
-            self.assertEqual(h.pool.free(), SLOT_COUNT)
+            self.assertEqual(h.pool.free(), h.pool.size)
 
     def test_give_back_releases_exactly_once(self) -> None:
         """Two give_back() calls release one permit only: no over-release, the pool never grows past its size."""
@@ -204,7 +204,7 @@ class ParkedTurnTests(unittest.TestCase):
             slot.take()
             slot.give_back()
             slot.give_back()
-            self.assertEqual(h.pool.free(), SLOT_COUNT)
+            self.assertEqual(h.pool.free(), h.pool.size)
             self.assertFalse(slot.held)
             self.assertTrue(h.pool.try_acquire_permit())
             self.assertTrue(h.pool.try_acquire_permit())
@@ -238,7 +238,7 @@ class ParkedTurnTests(unittest.TestCase):
             slot = h.slot(TOPIC_A)
             slot.take()
             self.assertTrue(slot.retake())
-            self.assertEqual(h.pool.free(), SLOT_COUNT - 1)
+            self.assertEqual(h.pool.free(), h.pool.size - 1)
 
 
 class TimedTakeTests(unittest.TestCase):
@@ -276,7 +276,7 @@ class TimedTakeTests(unittest.TestCase):
             slot = h.slot(TOPIC_A)
             slot.take()
             self.assertTrue(slot.take_for(POLL))
-            self.assertEqual(h.pool.free(), SLOT_COUNT - 1)
+            self.assertEqual(h.pool.free(), h.pool.size - 1)
 
 
 class BalanceTests(unittest.TestCase):
@@ -289,10 +289,10 @@ class BalanceTests(unittest.TestCase):
                     self.assertTrue(slot.take())
                 for slot in slots:
                     slot.give_back()
-            self.assertEqual(h.pool.free(), SLOT_COUNT)
+            self.assertEqual(h.pool.free(), h.pool.size)
 
     def test_concurrent_turns_never_hold_more_than_the_pool_size(self) -> None:
-        """Eight topics take and give back permits at random; the number held at once never exceeds SLOT_COUNT."""
+        """Eight topics take and give back permits at random; the number held at once never exceeds the pool size."""
         with TempHome() as home:
             h = Harness(home)
             lock = threading.Lock()
@@ -322,8 +322,8 @@ class BalanceTests(unittest.TestCase):
                 th.join(WAIT * 4)
                 self.assertFalse(th.is_alive())
             self.assertEqual(errors, [])
-            self.assertLessEqual(peak[0], SLOT_COUNT)
-            self.assertEqual(h.pool.free(), SLOT_COUNT)
+            self.assertLessEqual(peak[0], h.pool.size)
+            self.assertEqual(h.pool.free(), h.pool.size)
 
 
 if __name__ == "__main__":

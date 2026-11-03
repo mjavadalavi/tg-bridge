@@ -145,6 +145,25 @@ topic (`claude-work`, `claude-alt`, `claude` or another one you set), so the ses
 - While Telegram runs a turn for the topic, or keeps the session for background work, the tab shows a busy screen
   with the live output instead of opening Claude Code. Enter does nothing there; press Enter again once the bot is
   idle.
+- While a topic's session is open in a tab, `/new` and `/resume` from Telegram post a card with three choices: close the
+  tab's Claude Code and run it now (the tab stays open at its ready screen), run it when you close the tab yourself (the
+  card keeps a cancel button until then), or cancel. In both run cases the tab's session is not taken back afterwards.
+  "Run it now" needs a tab started by this version; an older tab must be exited by hand. A pending "run it when I close
+  the tab" is forgotten if the bridge restarts.
+
+The tab's Claude Code starts with one `SessionStart` hook, passed through `--settings`, so no settings file is touched.
+When you `/clear` or `/resume` inside the tab, the hook runs `tg-bridge hook session-start <thread> <pid>` and the
+bridge follows the tab's new session, so Telegram messages pasted into the tab get their answers back.
+
+When the tab closes, the topic continues from the session the tab ended on, if the tab started from the topic's session.
+If Telegram moved the topic to another session meanwhile (`/new`, `/resume`), the topic keeps that one.
+
+A message waiting for a busy tab gets one notice after 2 minutes. It says why it waits (Claude Code is working, text is
+typed in the input box, a dialog is open, tmux copy mode is on, or the pane is unreadable) and what to do in the tab.
+The bridge never clears text you typed.
+
+If Claude Code queued a pasted message (for example during auto-compaction), the bridge waits up to 10 minutes for it
+instead of failing after 30 s.
 
 The ready screen lists the Claude launchers under the topic's details, numbered, with the current one marked. Press a
 number (1 to 9) to change the topic's launcher: it is the same change as Telegram's `/launcher`, so Telegram uses the new

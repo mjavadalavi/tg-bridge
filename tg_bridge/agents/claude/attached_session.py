@@ -10,6 +10,11 @@ is never signalled or typed into.
 The owner passes plain strings (the tmux socket, the pane id, the session uuid, the launcher's config folder, the topic's
 folder), never a core type. idle() tells the owner whether a message can be pasted now (TmuxPane.ready).
 
+A turn whose echo is not read in the followed transcript relocates (_relocate). The tab's claim decides where it
+looks: a claim that names another session moves the turn to that session's transcript only. A hooked tab (its
+SessionStart hook keeps the claim current) never scans the other transcripts of the folder. Only a tab started without
+the hook scans the folder for the echo, as before the hook existed.
+
 Threads: the transcript tail thread delivers the lines (TranscriptTurns); the owner's thread calls the methods, and an
 interrupt may come from another thread (the ⏹ tap). Lock map: _keys serialises the keys typed into the pane (the paste and
 the Escape); the turn state is TranscriptTurns' own. No lock is held while a turn is opened or followed.
@@ -40,6 +45,12 @@ def pane_idle(socket: str, pane: str, run: TmuxRunner = run_tmux) -> bool:
     return TmuxPane(socket, pane, run=run).ready()
 
 
+def pane_reason(socket: str, pane: str, run: TmuxRunner = run_tmux) -> str:
+    """Why the pane cannot take a message now, one of the tmux_pane REASON_ values (REASON_IDLE when it can). The owner
+    shows it in the stall notice while the turn waits for the pane."""
+    return TmuxPane(socket, pane, run=run).reason()
+
+
 def _no_requests(message: str, *, main_only: bool = False) -> list[str]:
     """The terminal's permission dialog is not in this process: no request of this session is ever pending."""
     return []
@@ -65,7 +76,8 @@ class AttachedSession(AgentSession):
         self._turns = TranscriptTurns(config_dir=config_dir, cwd=cwd, session_id=uuid,
                                       translator=ClaudeTranslator(cwd=cwd), emit=sink, log=logger.log,
                                       logger=logger, clock=clock, deny_requests=_no_requests,
-                                      foreign_interrupts=True, relocate=self._relocate, on_relocated=self._moved)
+                                      foreign_interrupts=True, relocate=self._relocate, on_relocated=self._moved,
+                                      strict_echo=True)
 
     # ---- lifecycle ------------------------------------------------------------------------------------
 
@@ -116,7 +128,7 @@ class AttachedSession(AgentSession):
         if not self._pane.ready():
             self._logger.log(f"terminal: tmux pane {self._pane_id} is not ready, the message is not pasted")
             raise TerminalNotReady(f"the terminal session of tmux pane {self._pane_id} is busy or has text typed in it")
-        gen, primary, follows = self._turns.begin()
+        gen, primary, follows = self._turns.begin(text)
         armed = self._turns.follow_turn(gen, primary, follows)
         with self._keys:
             pasted = self._pane.paste(text)
@@ -129,9 +141,30 @@ class AttachedSession(AgentSession):
 
     def _relocate(self, since: float, text: str, primary: str) -> tuple[str, int, str] | None:
         """The transcript of the session that holds the echo of text, written after since (TranscriptTurns asks after
-        ATTACH_RELOCATE_SECONDS). The followed file is excluded: its echo was not read there."""
-        found = session_finder.find_relocated(self._config_dir, since, text, exclude=primary)
+        ATTACH_RELOCATE_SECONDS). The tab's claim decides which transcript is read:
+        - the claim names another session than the one followed (a /clear or /resume moved the tab, and the hook told
+          the claim): that session's transcript, and no other;
+        - else a hooked tab: None, since the claim proves the followed session is the tab's;
+        - else (a tab started without the hook): the folder's transcripts, the followed file excluded (its echo was
+          not read there)."""
+        current = self._claim_uuid()
+        if current and current != self.session_id:
+            found = session_finder.find_in_session(self._config_dir, current, since, text)
+        elif self._spec.attach is not None and self._spec.attach.hooked:
+            return None
+        else:
+            found = session_finder.find_relocated(self._config_dir, since, text, exclude=primary)
         return None if found is None else (found.path, found.offset, found.session_id)
+
+    def _claim_uuid(self) -> str:
+        """The session the tab's claim names now: '' when there is no claim or its read fails (a failed read names
+        nothing)."""
+        if self._spec.attach is None:
+            return ""
+        try:
+            return self._spec.attach.claim_uuid() or ""
+        except Exception:  # the claim is read from the tab's side: a read that fails must not end the turn
+            return ""
 
     def _moved(self, session_id: str) -> None:
         """The turn moved to another session's transcript: that session is now this session. Its start is reported, so

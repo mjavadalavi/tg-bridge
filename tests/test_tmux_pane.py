@@ -10,7 +10,9 @@ import unittest
 from unittest import mock
 
 from tg_bridge.agents.claude.tmux_pane import (BUSY_HINT, DIALOG_FOOTER, NBSP, PASTE_GAP_MAX_SECONDS, PASTE_GAP_SECONDS,
-                                               TmuxPane, idle, input_empty, paste_gap, shows_cli, working)
+                                               REASON_BUSY, REASON_DIALOG, REASON_GONE, REASON_IDLE, REASON_MODE,
+                                               REASON_NO_CLI, REASON_TYPED, TmuxPane, idle, input_empty, paste_gap,
+                                               screen_reason, shows_cli, working)
 
 RULE = "─" * 40
 
@@ -142,6 +144,12 @@ class TmuxPaneCallTests(unittest.TestCase):
         self.assertFalse(TmuxPane("", "%3", run=FakeTmux(pane="%4")).ready())
         self.assertFalse(TmuxPane("", "%3", run=FakeTmux(fail=("display-message",))).ready())
 
+    def test_reason_is_gone_for_a_missing_pane_and_mode_in_copy_mode(self) -> None:
+        self.assertEqual(TmuxPane("", "%3", run=FakeTmux(pane="%4")).reason(), REASON_GONE)
+        self.assertEqual(TmuxPane("", "%3", run=FakeTmux(fail=("display-message",))).reason(), REASON_GONE)
+        self.assertEqual(TmuxPane("", "%3", run=FakeTmux(in_mode=True, screen=BUSY)).reason(), REASON_MODE)
+        self.assertEqual(TmuxPane("", "%3", run=FakeTmux()).reason(), REASON_IDLE)
+
     def test_a_failed_paste_presses_no_enter(self) -> None:
         for failing in ("load-buffer", "paste-buffer"):
             with self.subTest(failing=failing):
@@ -234,6 +242,14 @@ class ScreenTests(unittest.TestCase):
         self.assertFalse(input_empty("user@host:~$ \n"))
         self.assertFalse(idle("user@host:~$ \n"))
         self.assertFalse(input_empty(""))
+
+    def test_reason_of_each_screen(self) -> None:
+        self.assertEqual(screen_reason(IDLE), REASON_IDLE)
+        self.assertEqual(screen_reason(TYPED), REASON_TYPED)
+        self.assertEqual(screen_reason(BUSY), REASON_BUSY)
+        self.assertEqual(screen_reason(DIALOG), REASON_DIALOG)
+        self.assertEqual(screen_reason("user@host:~$ \n"), REASON_NO_CLI)
+        self.assertEqual(screen_reason(""), REASON_NO_CLI)
 
 
 class RealTmuxTests(unittest.TestCase):

@@ -10,6 +10,7 @@ and been reaped is dead. No claude process is started.
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import unittest
@@ -244,6 +245,7 @@ class ClaimFields(ClaimCase):
         claim = terminal_claim.read_claim(self.view, THREAD)
         self.assertEqual(claim, terminal_claim.Claim(pid=os.getpid(), started=1.0))
         self.assertEqual((claim.pane, claim.uuid, claim.config_dir, claim.cwd), ("", "", "", ""))
+        self.assertEqual(claim.seen, ())
         self.assertTrue(os.path.exists(self.claim_file()), "an old-format claim with a live pid is kept")
 
     def test_a_claim_with_a_dead_pid_reads_as_none_and_is_removed(self) -> None:
@@ -253,6 +255,7 @@ class ClaimFields(ClaimCase):
 
 
 NEW_UUID = "66666666-7777-8888-9999-000000000000"
+THIRD_UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 
 class MovedSessionTests(ClaimCase):
@@ -273,15 +276,219 @@ class MovedSessionTests(ClaimCase):
         self.assertEqual(terminal_claim.read_claim(self.view, THREAD).uuid, UUID, "a foreign pid changed the claim")
 
     def test_write_ended_then_take_ended_reads_and_removes_the_record(self) -> None:
-        terminal_claim.write_ended(self.view, THREAD, NEW_UUID, "/cfg", "/work", 42.5)
+        terminal_claim.write_ended(self.view, THREAD, THIRD_UUID, "/cfg", "/work", 42.5, started_uuid=UUID,
+                                   seen=[UUID, NEW_UUID])
         self.assertTrue(os.path.exists(os.path.join(self.view, f"{THREAD}.session")))
         ended = terminal_claim.take_ended(self.view, THREAD)
-        self.assertEqual(ended, terminal_claim.Ended(uuid=NEW_UUID, config_dir="/cfg", cwd="/work", ended=42.5))
+        self.assertEqual(ended, terminal_claim.Ended(uuid=THIRD_UUID, config_dir="/cfg", cwd="/work", ended=42.5,
+                                                     started_uuid=UUID, seen=(UUID, NEW_UUID)))
         self.assertIsNone(terminal_claim.take_ended(self.view, THREAD), "a record is read once")
         self.assertFalse(os.path.exists(os.path.join(self.view, f"{THREAD}.session")))
+
+    def test_an_old_record_without_started_uuid_reads_as_empty(self) -> None:
+        with open(os.path.join(self.view, f"{THREAD}.session"), "w", encoding="utf-8") as handle:
+            json.dump({"uuid": NEW_UUID, "config_dir": "/cfg", "cwd": "/work", "ended": 42.5}, handle)
+        ended = terminal_claim.take_ended(self.view, THREAD)
+        self.assertEqual(ended, terminal_claim.Ended(uuid=NEW_UUID, config_dir="/cfg", cwd="/work", ended=42.5))
+        self.assertEqual((ended.started_uuid, ended.seen), ("", ()))
 
     def test_a_garbled_ended_record_is_removed_and_reads_as_none(self) -> None:
         with open(os.path.join(self.view, f"{THREAD}.session"), "w", encoding="utf-8") as handle:
             handle.write("{not json")
         self.assertIsNone(terminal_claim.take_ended(self.view, THREAD))
         self.assertFalse(os.path.exists(os.path.join(self.view, f"{THREAD}.session")))
+
+    def test_claim_uuid_reads_only_the_claim_of_its_own_pid(self) -> None:
+        self.assertEqual(terminal_claim.claim_uuid(self.view, THREAD, os.getpid()), "", "no claim")
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, pane="%3", uuid=UUID))
+        self.assertEqual(terminal_claim.claim_uuid(self.view, THREAD, os.getpid()), UUID)
+        self.assertEqual(terminal_claim.claim_uuid(self.view, THREAD, os.getppid()), "", "another live pid")
+        self.assertTrue(os.path.exists(self.claim_file()), "a foreign pid must not remove the claim")
+        self.assertTrue(terminal_claim.release_claim(self.view, THREAD, os.getpid()))
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, dead_pid(), 7.0, uuid=UUID))
+        self.assertEqual(terminal_claim.claim_uuid(self.view, THREAD, os.getpid()), "", "a dead pid's claim")
+        self.assertFalse(os.path.exists(self.claim_file()), "the stale claim was not removed")
+
+    def test_update_uuid_remembers_the_sessions_the_tab_moved_off(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID))  # a /clear
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), THIRD_UUID))  # another /clear
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual((claim.seen, claim.uuid), ((UUID, NEW_UUID), THIRD_UUID))
+
+    def test_the_same_uuid_again_adds_nothing_to_seen(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID))  # a compact SessionStart
+        self.assertEqual(terminal_claim.read_claim(self.view, THREAD).seen, (UUID,))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), UUID))  # back to the first uuid
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual((claim.seen, claim.uuid), ((UUID, NEW_UUID), UUID), "the first uuid was added twice")
+
+    def test_seen_is_capped(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid="session-0"))
+        last = terminal_claim.SEEN_MAX + 5
+        for index in range(1, last + 1):
+            self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), f"session-{index}"))
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual(claim.uuid, f"session-{last}")
+        self.assertEqual(len(claim.seen), terminal_claim.SEEN_MAX)
+        # session-0 .. session-{last - 1} were moved off; the newest SEEN_MAX of them are kept, oldest first
+        self.assertEqual(claim.seen[0], f"session-{last - terminal_claim.SEEN_MAX}")
+        self.assertEqual(claim.seen[-1], f"session-{last - 1}")
+
+    def test_a_seen_list_keeps_only_its_strings_and_a_bad_value_reads_as_empty(self) -> None:
+        with open(self.claim_file(), "w", encoding="utf-8") as handle:
+            json.dump({"pid": os.getpid(), "started": 1.0, "seen": [UUID, 3, None, NEW_UUID]}, handle)
+        self.assertEqual(terminal_claim.read_claim(self.view, THREAD).seen, (UUID, NEW_UUID))
+        with open(self.claim_file(), "w", encoding="utf-8") as handle:
+            json.dump({"pid": os.getpid(), "started": 1.0, "seen": "not a list"}, handle)
+        self.assertEqual(terminal_claim.read_claim(self.view, THREAD).seen, ())
+
+    def test_own_claim_is_the_claim_of_that_pid_only(self) -> None:
+        self.assertIsNone(terminal_claim.own_claim(self.view, THREAD, os.getpid()), "no claim")
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, pane="%3", uuid=UUID))
+        claim = terminal_claim.own_claim(self.view, THREAD, os.getpid())
+        self.assertEqual((claim.pid, claim.uuid), (os.getpid(), UUID))
+        self.assertIsNone(terminal_claim.own_claim(self.view, THREAD, os.getppid()), "another live pid")
+        self.assertTrue(os.path.exists(self.claim_file()), "a foreign pid must not remove the claim")
+
+
+class HookedClaim(ClaimCase):
+    """The claim says whether its tab runs the SessionStart hook, and update_uuid can be compare-and-set on the uuid."""
+
+    def test_a_claim_records_whether_its_tab_is_hooked(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID))
+        self.assertFalse(terminal_claim.read_claim(self.view, THREAD).hooked, "the default is not hooked")
+        self.assertTrue(terminal_claim.release_claim(self.view, THREAD, os.getpid()))
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID, hooked=True))
+        self.assertTrue(terminal_claim.read_claim(self.view, THREAD).hooked)
+        self.assertTrue(terminal_claim.release_claim(self.view, THREAD, os.getpid()))
+        self.write_claim(os.getpid())  # the file written before the key existed
+        self.assertFalse(terminal_claim.read_claim(self.view, THREAD).hooked, "an old claim is not hooked")
+
+    def test_update_uuid_keeps_hooked_and_the_other_fields(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, pane="%3", uuid=UUID,
+                                                  config_dir="/cfg", cwd="/work", socket="/tmp/sock", hooked=True))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID))
+        self.assertEqual(terminal_claim.read_claim(self.view, THREAD), terminal_claim.Claim(
+            pid=os.getpid(), started=7.0, pane="%3", uuid=NEW_UUID, config_dir="/cfg", cwd="/work", socket="/tmp/sock",
+            seen=(UUID,), hooked=True))
+
+    def test_update_uuid_hooked_marks_the_claim_hooked_even_with_the_same_uuid(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID))
+        self.assertFalse(terminal_claim.read_claim(self.view, THREAD).hooked)
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), UUID, hooked=True))
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual((claim.uuid, claim.seen, claim.hooked), (UUID, (), True), "a startup must mark the claim")
+
+    def test_update_uuid_without_hooked_keeps_an_existing_hooked_claim_hooked(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), UUID, hooked=True))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID))
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual((claim.uuid, claim.seen, claim.hooked), (NEW_UUID, (UUID,), True),
+                         "a hooked claim turned back")
+
+    def test_update_uuid_with_a_stale_expected_uuid_changes_nothing(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID, hooked=True))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID))  # the hook's write
+        with open(self.claim_file(), "rb") as handle:
+            before = handle.read()
+        self.assertFalse(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), THIRD_UUID, expected=UUID))
+        with open(self.claim_file(), "rb") as handle:
+            self.assertEqual(handle.read(), before, "a stale expected uuid rewrote the claim")
+
+    def test_update_uuid_with_the_expected_uuid_moves_the_claim(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID, hooked=True))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID, expected=UUID))
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual((claim.uuid, claim.seen, claim.hooked), (NEW_UUID, (UUID,), True))
+
+    def test_update_uuid_only_unhooked_writes_nothing_to_a_hooked_claim(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID, hooked=True))
+        with open(self.claim_file(), "rb") as handle:
+            before = handle.read()
+        self.assertFalse(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID, only_unhooked=True))
+        with open(self.claim_file(), "rb") as handle:
+            self.assertEqual(handle.read(), before, "only_unhooked rewrote a hooked claim")
+
+    def test_update_uuid_only_unhooked_writes_to_an_unhooked_claim(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID, only_unhooked=True))
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual((claim.uuid, claim.seen, claim.hooked), (NEW_UUID, (UUID,), False))
+
+
+class ChildClaim(ClaimCase):
+    """The claim names the CLI child of its tab (child, 0 when unknown): set_child writes it for the claim's pid, and
+    signal_child ends that child with SIGTERM."""
+
+    def test_the_child_round_trips_through_the_claim(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID))
+        self.assertEqual(terminal_claim.read_claim(self.view, THREAD).child, 0, "a new claim has no child")
+        self.assertTrue(terminal_claim.set_child(self.view, THREAD, os.getpid(), 4242))
+        self.assertEqual(terminal_claim.read_claim(self.view, THREAD).child, 4242)
+
+    def test_a_child_that_is_not_an_int_reads_as_zero(self) -> None:
+        for value in (True, "7", None, 7.5):
+            with self.subTest(value=value):
+                with open(self.claim_file(), "w", encoding="utf-8") as handle:
+                    json.dump({"pid": os.getpid(), "started": 1.0, "child": value}, handle)
+                self.assertEqual(terminal_claim.read_claim(self.view, THREAD).child, 0)
+
+    def test_update_uuid_preserves_the_child(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID))
+        self.assertTrue(terminal_claim.set_child(self.view, THREAD, os.getpid(), 4242))
+        self.assertTrue(terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID))
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual((claim.uuid, claim.child), (NEW_UUID, 4242))
+
+    def test_set_child_refuses_another_pid(self) -> None:
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 7.0, uuid=UUID))
+        self.assertFalse(terminal_claim.set_child(self.view, THREAD, dead_pid(), 4242), "another pid")
+        self.assertEqual(terminal_claim.read_claim(self.view, THREAD).child, 0, "a foreign pid wrote the child")
+
+    def test_set_child_on_a_missing_claim_is_false(self) -> None:
+        self.assertFalse(terminal_claim.set_child(self.view, THREAD, os.getpid(), 4242))
+        self.assertFalse(os.path.exists(self.claim_file()))
+
+    def test_signal_child_without_a_child_is_false(self) -> None:
+        claim = terminal_claim.Claim(pid=os.getpid(), started=1.0, child=0)
+        self.assertFalse(terminal_claim.signal_child(claim))
+
+    def test_signal_child_of_a_dead_child_is_true(self) -> None:
+        child = subprocess.Popen(["true"])
+        child.wait()
+        claim = terminal_claim.Claim(pid=os.getpid(), started=1.0, child=child.pid)
+        self.assertTrue(terminal_claim.signal_child(claim))
+
+    def test_signal_child_ends_a_live_child(self) -> None:
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            claim = terminal_claim.Claim(pid=os.getpid(), started=1.0, child=child.pid)
+            self.assertTrue(terminal_claim.signal_child(claim))
+            self.assertEqual(child.wait(timeout=10), -signal.SIGTERM, "the child did not end on SIGTERM")
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+    def test_signal_child_ends_the_cli_behind_a_launcher_shell(self) -> None:
+        # The claim's pid is a shell that catches TERM and waits; the CLI is its grandchild (sleep stands in for it).
+        launcher = subprocess.Popen(["sh", "-c", "trap ':' TERM; sleep 30 & echo $!; wait; wait"],
+                                    stdout=subprocess.PIPE, start_new_session=True)
+        try:
+            cli = int(launcher.stdout.readline())
+            claim = terminal_claim.Claim(pid=os.getpid(), started=1.0, child=launcher.pid)
+            self.assertTrue(terminal_claim.signal_child(claim))
+            self.assertEqual(launcher.wait(timeout=10), 0, "the launcher did not end after its child")
+            with self.assertRaises(ProcessLookupError, msg="the CLI behind the launcher survived"):
+                os.kill(cli, 0)
+        finally:
+            try:
+                os.killpg(launcher.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            launcher.wait()
+            launcher.stdout.close()

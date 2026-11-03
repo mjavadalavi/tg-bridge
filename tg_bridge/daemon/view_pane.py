@@ -1,11 +1,17 @@
 """view-pane <thread>: the window of one topic in `tg-bridge view`, with three screens (spec: the three pane screens).
 
 ready: a header (topic, launcher, folder, session id short), the last FEED_TAIL_LINES lines of <thread>.feed, and the
-Enter line. Enter claims the topic (core/terminal_claim, under its flock) and runs the real CLI as a child of the pane, on
-the pane's own tty: argv = the launcher's argv + --resume <uuid> when the topic has one, else --session-id <new uuid>,
---model when it has one and the permission flags of its mode (permission_args, the tui transport's mapping). cwd is the
-topic's folder. The claim names the pane, the session uuid, the launcher's config folder and the cwd
-(core/terminal_claim). When the CLI exits the claim is removed and the pane is ready again.
+Enter line. Enter claims the topic (core/terminal_claim, under its flock) and runs the real CLI as a child of the pane,
+on the pane's own tty: argv = the launcher's argv + --resume <uuid> when the topic has one, else --session-id <new
+uuid>, --model when it has one and the permission flags of its mode (permission_args, the tui transport's mapping), and
+--settings with one SessionStart hook (`tg-bridge hook session-start <thread> <pid>`) that moves the claim to the
+session the tab is on after a /clear or /resume. cwd is the topic's folder. The claim names the pane, the session uuid,
+the launcher's config folder and the cwd (core/terminal_claim). The claim is taken unhooked: the SessionStart hook
+marks it hooked when it runs, so a hook that never runs (disabled, moved checkout, import error) leaves the claim
+unhooked and the bridge keeps searching for the session. When the CLI exits the pane records the session the tab ended
+on, the one it started with and the ones it moved off (seen) as the topic's ended record, then removes the claim; the
+pane is ready again. Once the CLI runs, the claim also names its child pid (set_child), so the bridge can end the tab's
+Claude Code.
 
 Number keys 1..9 on ready change the topic's launcher (daemon/view_launcher): the same change as Telegram's /launcher,
 under the topic's flock and refused while the topic is busy. The reply of the last change shows until the next key.
@@ -42,6 +48,7 @@ from functools import partial
 from pathlib import Path
 from typing import Protocol, TextIO
 
+from tg_bridge.agents.claude.session_hook import session_start_command, session_start_settings
 from tg_bridge.agents.claude.tui_helpers import permission_args
 from tg_bridge.clock import Clock, SystemClock
 from tg_bridge.config import BACKEND_CLAUDE, Config, LauncherError, LauncherSpec
@@ -91,6 +98,7 @@ class KeySource(Protocol):
 
 
 RunChild = Callable[[Sequence[str], str, Mapping[str, str]], int]  # argv, cwd, environment -> exit status
+ChildStart = Callable[[int], None]                                 # the CLI child's pid, once it runs
 
 
 @dataclass(frozen=True)
@@ -125,10 +133,12 @@ def read_topic(paths: Paths, thread_id: int) -> SessionRecord | None:
         return None
 
 
-def child_argv(config: Config, row: SessionRecord, launcher: LauncherSpec, session_uuid: str) -> tuple[str, ...]:
+def child_argv(config: Config, row: SessionRecord, launcher: LauncherSpec, session_uuid: str,
+               settings: str = "") -> tuple[str, ...]:
     """The CLI's argv for the topic: the launcher's argv, --resume <uuid> when the topic has one, else --session-id
-    <session_uuid> so the new session's id is known from the start, --model when the topic has one, and the permission
-    flags of its mode. Without the bridge's hook settings and system prompt."""
+    <session_uuid> so the new session's id is known from the start, --model when the topic has one, the permission
+    flags of its mode, and --settings <settings> when given. The settings install exactly one SessionStart hook and no
+    other hook settings; there is no system prompt."""
     args = [*launcher.argv]
     if row.uuid:
         args += ["--resume", row.uuid]
@@ -137,7 +147,10 @@ def child_argv(config: Config, row: SessionRecord, launcher: LauncherSpec, sessi
     model = topic_model(row)
     if model:
         args += ["--model", model]
-    return (*args, *permission_args(topic_mode(config, row)))
+    args += permission_args(topic_mode(config, row))
+    if settings:
+        args += ["--settings", settings]
+    return tuple(args)
 
 
 def child_env(environ: Mapping[str, str]) -> dict[str, str]:
@@ -165,13 +178,21 @@ def feed_tail(path: str) -> list[str]:
     return lines[-FEED_TAIL_LINES:]
 
 
-def _run_child(argv: Sequence[str], cwd: str, env: Mapping[str, str]) -> int:
-    """Runs the CLI on the pane's terminal and returns its exit status. A SIGINT during the run is caught here, so the pane
-    survives it while the CLI, which gets the default handler back on exec, takes it."""
+def _no_start(pid: int) -> None:
+    """The on_start of a run that needs no pid: nothing is done with it."""
+
+
+def _run_child(argv: Sequence[str], cwd: str, env: Mapping[str, str], on_start: ChildStart = _no_start) -> int:
+    """Runs the CLI on the pane's terminal and returns its exit status. on_start gets the child's pid once it runs, and
+    0 once the CLI has exited. A SIGINT during the run is caught here, so the pane survives it while the CLI, which
+    gets the default handler back on exec, takes it."""
     previous = signal.signal(signal.SIGINT, lambda _signum, _frame: None)
     try:
-        return subprocess.run(list(argv), cwd=cwd, env=dict(env), check=False).returncode
+        child = subprocess.Popen(list(argv), cwd=cwd, env=dict(env))
+        on_start(child.pid)
+        return child.wait()
     finally:
+        on_start(0)
         signal.signal(signal.SIGINT, previous)
 
 
@@ -259,7 +280,7 @@ class ViewPane:
         self._out = out
         self._clock = clock
         self._keys = keys
-        self._run = _run_child if run is None else run
+        self._run = partial(_run_child, on_start=self._child_started) if run is None else run
         self._switch = partial(switch_launcher, paths, load) if switch is None else switch
         self._new_uuid = (lambda: str(uuid.uuid4())) if new_uuid is None else new_uuid  # a fresh topic's session id
         self._follower = Follower(os.path.join(paths.view, str(thread_id)), out)
@@ -297,7 +318,8 @@ class ViewPane:
             problem = NO_BACKEND_LINE.format(backend=launcher.backend)
             return Topic(name, launcher.name, cwd, session, None, problem, choices)
         session_uuid = row.uuid or self._new_uuid()
-        argv = child_argv(config, row, launcher, session_uuid)
+        settings = session_start_settings(session_start_command(self._thread, os.getpid()))  # the pid take_claim gets too
+        argv = child_argv(config, row, launcher, session_uuid, settings)
         return Topic(name, launcher.name, cwd, session, argv, "", choices, session_uuid, launcher.config_dir)
 
     def _busy(self) -> bool:
@@ -377,11 +399,22 @@ class ViewPane:
             self._notice = START_FAILED_LINE.format(detail=exc)
         finally:
             terminal.raw()
-            terminal_claim.release_claim(view_dir, self._thread, pid)
+            try:  # the tab's live claim: a /clear or /resume in the tab moved its uuid and seen (SessionStart hook)
+                claim = terminal_claim.own_claim(view_dir, self._thread, pid)
+            except OSError:
+                claim = None
             if ran:  # the session the CLI ran is recorded, so a topic without a session can adopt it (no DB write here)
-                terminal_claim.write_ended(view_dir, self._thread, topic.uuid, topic.config_dir, topic.cwd,
-                                           self._clock.now())
+                terminal_claim.write_ended(view_dir, self._thread, (claim.uuid if claim else "") or topic.uuid,
+                                           topic.config_dir, topic.cwd, self._clock.now(), started_uuid=topic.uuid,
+                                           seen=claim.seen if claim else ())
+            terminal_claim.release_claim(view_dir, self._thread, pid)
             self._drawn = ""
+
+    def _child_started(self, child: int) -> None:
+        """Writes the CLI child's pid into the claim this pane took, so the bridge can end the tab's CLI. A claim that
+        is gone or names another pid is left as it is."""
+        with contextlib.suppress(OSError):
+            terminal_claim.set_child(self._paths.view, self._thread, os.getpid(), child)
 
     def _write(self, text: str) -> None:
         self._out.write(text)

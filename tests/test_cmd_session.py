@@ -9,7 +9,8 @@ turn to end (or says it is still stopping) and edits the same message; /resume r
 folder of a session becomes the cwd when it exists, a missing folder is said aloud and a session without a folder
 leaves the cwd alone; a session of a launcher sharing the folder keeps the launcher; another Claude folder gets a copy
 of the transcript; a missing transcript or a Codex session switches the launcher pick (and the backend) to the one
-that made it; a launcher that is not in config refuses the resume; the resume buttons follow the same rules.
+that made it; a launcher that is not in config refuses the resume; the resume buttons follow the same rules; while a
+terminal tab holds the topic's session, /new and /resume (typed or tapped) ask first with a run-it / cancel card.
 Every test runs against a migrated database in a TempHome, with a FakeClock and FakeTelegram; no subprocess starts.
 """
 
@@ -26,6 +27,7 @@ from tests.turn_support import wait_until
 from tg_bridge.agents.claude.history import encoded_cwd
 from tg_bridge.agents.defaults import build_default_registry
 from tg_bridge.bot.commands.base import CommandDeps, CommandRegistry
+from tg_bridge.bot.commands.change_guard import TERMINAL_TOAST_TEXT
 from tg_bridge.bot.commands.session import (
     BOUND_ELSEWHERE_TEXT,
     LINGER_STOPPED_TEXT,
@@ -42,10 +44,12 @@ from tg_bridge.bot.commands.session import (
     StopKind,
 )
 from tg_bridge.bot.pickers import STOP_CHOICE_TEXT, started_label
+from tg_bridge.bot.terminal_guard import TERMINAL_CLOSE_KIND, TERMINAL_LATER_KIND, TERMINAL_NO_KIND, TerminalGuard
 from tg_bridge.clock import utc_stamp
 from tg_bridge.config import Config
 from tg_bridge.core.handoff import HandoffService
 from tg_bridge.core.linger import LingerStatus
+from tg_bridge.core import terminal_claim
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.topic_queues import TopicQueues
 from tg_bridge.core.workers import WorkerPool
@@ -890,6 +894,105 @@ class KeptStopTests(SessionCase):
         self.assertEqual(self.commands.stop_now(THREAD).kind, StopKind.STOPPED)
         self.assertTrue(session.stopped.wait(2), "the close button did not stop the session")
         self.assertEqual(session.stops, 1)
+
+
+class TerminalCardTests(SessionCase):
+    """/new and /resume while a terminal tab (tg-bridge view) holds the topic's session (card H3): the change waits for
+    the run-it card, and without a tab it applies at once."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.view = os.path.join(self.base, "view")
+        os.makedirs(self.view, mode=0o700)
+        self.commands = self.build_terminal_commands()
+        self.registry = CommandRegistry()
+        self.commands.register(self.registry)
+
+    def build_terminal_commands(self) -> SessionCommands:
+        self.guard = TerminalGuard(view_dir=self.view)
+        return SessionCommands(config=self.config, sessions=self.sessions, history=self.history, live=self.live,
+                               backends=self.backends, messenger=self.messenger, clock=self.clock, logger=self.logger,
+                               handoff=HandoffService(KvRepo(self.db), self.backends, self.logger),
+                               terminal=self.guard)
+
+    def claim_terminal(self) -> None:
+        """A live claim of the topic: the tab runs this process, which is alive."""
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 1.0))
+
+    def assert_run_and_cancel_card(self) -> None:
+        callbacks = self.button_callbacks()
+        self.assertEqual(len(callbacks), 3, callbacks)
+        self.assertTrue(callbacks[0].startswith(f"cm:{THREAD}:{TERMINAL_CLOSE_KIND}:"), callbacks)
+        self.assertTrue(callbacks[1].startswith(f"cm:{THREAD}:{TERMINAL_LATER_KIND}:"), callbacks)
+        self.assertTrue(callbacks[2].startswith(f"cm:{THREAD}:{TERMINAL_NO_KIND}:"), callbacks)
+
+    def test_new_while_the_tab_is_open_asks_first(self) -> None:
+        """A live terminal claim: /new posts the run-it card and the session stays as it was."""
+        self.sessions.set_uuid(THREAD, U1)
+        self.claim_terminal()
+        self.assertTrue(self.run_cmd("/new"))
+        self.assert_run_and_cancel_card()
+        self.assertEqual((self.row().uuid, self.row().prev_uuid), (U1, ""))
+        self.assertNotEqual(self.last(), NEW_TEXT)
+
+    def test_resume_while_the_tab_is_open_asks_first(self) -> None:
+        """A live terminal claim: a typed /resume <uuid> posts the card and binds nothing."""
+        self.note(U2, CLAUDE_CMD)
+        self.sessions.set_uuid(THREAD, U1)
+        self.claim_terminal()
+        self.assertTrue(self.run_cmd(f"/resume {U2}"))
+        self.assert_run_and_cancel_card()
+        self.assertEqual((self.row().uuid, self.row().prev_uuid), (U1, ""))
+
+    def test_resume_tap_while_the_tab_is_open_asks_first(self) -> None:
+        """A live terminal claim: the picker tap answers with the toast and the card, and binds nothing."""
+        self.note(U2, CLAUDE_CMD)
+        self.sessions.set_uuid(THREAD, U1)
+        self.claim_terminal()
+        outcome = self.commands.resume_tap(THREAD, self.history.find(THREAD, U2).id)
+        self.assertEqual(outcome.toast, TERMINAL_TOAST_TEXT)
+        self.assertIsNotNone(outcome.picker)
+        self.assertEqual([len(row) for row in outcome.picker.rows], [1, 1, 1])
+        self.assertEqual(self.row().uuid, U1)
+
+    def test_new_without_a_tab_applies_at_once(self) -> None:
+        """No terminal claim: /new applies at once with its reply, and no card is posted."""
+        self.sessions.set_uuid(THREAD, U1)
+        self.assertTrue(self.run_cmd("/new"))
+        self.assertEqual(self.last(), NEW_TEXT)
+        self.assertEqual((self.row().uuid, self.row().prev_uuid), ("", U1))
+        self.assertEqual(self.button_callbacks(), [])
+
+    def run_it_token(self) -> str:
+        """The token of the card's run button (cm:<thread>:ty:<token>)."""
+        return self.button_callbacks()[0].rsplit(":", 1)[1]
+
+    def test_run_it_while_a_turn_runs_is_refused(self) -> None:
+        """A card posted while idle; a turn starts before the tap: the /new change is refused, the session stays."""
+        self.sessions.set_uuid(THREAD, U1)
+        self.claim_terminal()
+        self.assertTrue(self.run_cmd("/new"))
+        token = self.run_it_token()
+        self.start_turn()
+        os.remove(terminal_claim.claim_path(self.view, THREAD))  # the tab is gone: the close applies at once
+        reports: list[str] = []
+        self.assertEqual(self.guard.close_now(THREAD, token, reports.append), NOT_IDLE_TEXT)
+        self.assertEqual(reports, [])  # the tab was already free: the refusal is returned, not reported
+        self.assertEqual((self.row().uuid, self.row().prev_uuid), (U1, ""))
+
+    def test_run_it_for_resume_while_a_turn_runs_is_refused(self) -> None:
+        """A card posted while idle; a turn starts before the tap: the /resume change is refused, nothing binds."""
+        self.note(U2, CLAUDE_CMD)
+        self.sessions.set_uuid(THREAD, U1)
+        self.claim_terminal()
+        self.assertTrue(self.run_cmd(f"/resume {U2}"))
+        token = self.run_it_token()
+        self.start_turn()
+        os.remove(terminal_claim.claim_path(self.view, THREAD))  # the tab is gone: the close applies at once
+        reports: list[str] = []
+        self.assertEqual(self.guard.close_now(THREAD, token, reports.append), NOT_IDLE_TEXT)
+        self.assertEqual(reports, [])  # the tab was already free: the refusal is returned, not reported
+        self.assertEqual((self.row().uuid, self.row().prev_uuid), (U1, ""))
 
 
 if __name__ == "__main__":

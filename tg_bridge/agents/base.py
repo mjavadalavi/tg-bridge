@@ -52,6 +52,10 @@ def always_attached() -> bool:
     return True
 
 
+def no_claim_uuid() -> str:
+    return ""
+
+
 class TerminalNotReady(RuntimeError):
     """A terminal session cannot take a message now: its pane is busy, has text typed in it, or is gone. Nothing was
     pasted, so the message is not consumed; the owner waits for the terminal again (TerminalWait) and retries."""
@@ -62,8 +66,10 @@ class AttachSpec:
     """The terminal session a turn runs in: a Claude Code process that a `tg-bridge view` tab owns (its tmux pane, the
     session uuid it runs, the launcher's config folder and the topic's folder). The socket is the tmux server's socket
     path, '' for the default server. The backend opens an attached session for it; no process is spawned.
-    still_attached tells whether the tab's claim for this turn is still held (the CLI is still running in the pane); it
-    is not part of the spec's identity."""
+    still_attached tells whether the tab's claim for this turn is still held (the CLI is still running in the pane).
+    hooked tells whether the tab reports its session changes (the claim names the session it runs), and claim_uuid
+    reads the session the claim names right now ('' when unknown or the claim is gone). None of these is part of
+    the spec's identity."""
 
     socket: str
     pane: str
@@ -72,6 +78,8 @@ class AttachSpec:
     cwd: str
     pid: int = field(default=0, compare=False, hash=False)  # the view pane's pid that holds the claim (0: none)
     still_attached: Callable[[], bool] = field(default=always_attached, compare=False, hash=False)
+    hooked: bool = field(default=False, compare=False, hash=False)
+    claim_uuid: Callable[[], str] = field(default=no_claim_uuid, compare=False, hash=False)
 
 
 @dataclass(frozen=True, slots=True)

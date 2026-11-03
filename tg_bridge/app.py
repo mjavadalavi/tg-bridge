@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from tg_bridge.agents.claude.attached_session import pane_idle
+from tg_bridge.agents.claude.attached_session import pane_idle, pane_reason
 from tg_bridge.agents.defaults import build_default_registry, title_launcher_from_env
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.bot.callbacks.approvals import ApprovalTaps
@@ -23,12 +23,14 @@ from tg_bridge.bot.callbacks.handlers import QueueTaps, StatusTaps, StopChoiceTa
 from tg_bridge.bot.callbacks.keep_taps import KeepTaps
 from tg_bridge.bot.callbacks.picker_taps import PickerTaps
 from tg_bridge.bot.callbacks.router import CallbackRouter
+from tg_bridge.bot.callbacks.terminal_taps import TerminalTaps
 from tg_bridge.bot.commands.base import CommandDeps, CommandRegistry
 from tg_bridge.bot.commands.info import register_info_commands
 from tg_bridge.bot.commands.session import SessionCommands
 from tg_bridge.bot.commands.settings import SettingsCommands
 from tg_bridge.bot.inbound import MessageHandler
 from tg_bridge.bot.keep_guard import KeepGuard
+from tg_bridge.bot.terminal_guard import TerminalGuard
 from tg_bridge.clock import Clock, SystemClock
 from tg_bridge.config import BACKEND_CLAUDE, Config
 from tg_bridge.core.cards import ApprovalCards
@@ -252,11 +254,14 @@ class App:
         titles = TitleService(backend=registry.get(BACKEND_CLAUDE), sessions=sessions, messenger=messenger,
                               pool=title_pool, logger=logger)
         removals = Removals(clock)  # the marks of the topics being removed: the dispatcher and the remover share them
+        # the terminal guard: built before the dispatcher, whose before_turn hook settles a deferred change first
+        terminal = TerminalGuard(view_dir=paths.view if views_on else "", live=live, clock=clock)
         dispatcher = Dispatcher(
             turns=runner, slots=slots, inbox=inbox_rows, messenger=messenger, answers=answers, titles=titles,
             client=telegram, live=live, config=config, logger=logger, linger=linger,
             view_dir=paths.view if views_on else "", removals=removals,
-            pane_idle=lambda claim: pane_idle(claim.socket, claim.pane))  # a terminal claim's turns wait for its pane
+            pane_idle=lambda claim: pane_idle(claim.socket, claim.pane),  # a terminal claim's turns wait for its pane
+            pane_reason=lambda claim: pane_reason(claim.socket, claim.pane), before_turn=terminal.before_turn)
         remover = TopicRemover(
             live=live, linger=linger, dispatcher=dispatcher,
             forget=TopicForget(db=db, sessions=sessions, history=history, rules=rules, asks=asks, inbox=inbox_rows,
@@ -277,7 +282,7 @@ class App:
         keep = KeepGuard(linger=linger, live=live)  # one guard: its cards are answered by the taps below
         stops = SessionCommands(config=config, sessions=sessions, history=history, live=live, backends=registry,
                                 messenger=messenger, clock=clock, logger=logger, handoff=handoff, linger=linger,
-                                keep=keep)
+                                keep=keep, terminal=terminal)
         settings = SettingsCommands(config=config, sessions=sessions, live=live, backends=registry,
                                     permissions=permissions, launchers=launchers, cwd=cwd, logger=logger, keep=keep)
         commands = CommandRegistry()
@@ -297,7 +302,8 @@ class App:
                     PickerTaps(config=config, sessions=sessions, live=live, backends=registry,
                                permissions=permissions, launchers=launchers, stops=stops, rules=rules,
                                folders=cwd, logger=logger, keep=keep),
-                    KeepTaps(keep=keep)):
+                    KeepTaps(keep=keep),
+                    TerminalTaps(terminal=terminal)):
             tap.register(router)
         panes = Panes(clock=clock)
         media = MediaService(paths, telegram, messenger, openers, SonioxTranscriber(paths, openers, clock), clock)

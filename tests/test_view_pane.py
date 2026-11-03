@@ -33,6 +33,7 @@ from tg_bridge.daemon.view_pane import (
     READY_HINT,
     SWITCH_FAILED_LINE,
     KeySource,
+    ViewPane,
     _run_child,
     _TerminalKeys,
     child_env,
@@ -127,13 +128,21 @@ class PaneCase(HomeCase):
             return [json.loads(line) for line in handle if line.strip()]
 
 
+def session_start_hook(argv: Sequence[str]) -> dict:
+    """The settings the CLI argv carries in its last two arguments: --settings and the JSON of the SessionStart hook."""
+    return json.loads(argv[-1])
+
+
 class ReadyTests(PaneCase):
     def test_enter_runs_the_launcher_with_resume_model_and_the_mode_flags_in_the_folder(self) -> None:
         self.make_topic(model="opus", mode="acceptEdits")
         self.pane([ENTER], rounds=1)
         [child] = self.children()
-        self.assertEqual(child["argv"], ["claude-work", "--resume", UUID, "--model", "opus", "--permission-mode", "acceptEdits",
-                                         "--allow-dangerously-skip-permissions"])
+        self.assertEqual(child["argv"][:-2], ["claude-work", "--resume", UUID, "--model", "opus", "--permission-mode",
+                                              "acceptEdits", "--allow-dangerously-skip-permissions"])
+        self.assertEqual(child["argv"][-2], "--settings")
+        command = session_start_hook(child["argv"])["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        self.assertEqual(shlex.split(command)[-4:], ["hook", "session-start", str(THREAD), str(os.getpid())])
         self.assertEqual(os.path.realpath(child["cwd"]), os.path.realpath(self.folder))
 
     def test_each_launcher_kind_and_mode_has_its_own_argv_and_session_id_without_a_uuid(self) -> None:
@@ -145,8 +154,21 @@ class ReadyTests(PaneCase):
                     self.make_topic(launcher=fake_command(kind), uuid="", mode=mode)
                     self.pane([ENTER], rounds=1)
                     [child] = self.children()
-                    self.assertEqual(child["argv"], [kind, "--session-id", FRESH_UUID, "--permission-mode", mode,
-                                                     "--allow-dangerously-skip-permissions"])
+                    self.assertEqual(child["argv"][:-2], [kind, "--session-id", FRESH_UUID, "--permission-mode", mode,
+                                                          "--allow-dangerously-skip-permissions"])
+                    self.assertEqual(child["argv"][-2], "--settings")
+
+    def test_the_cli_gets_the_session_start_hook_and_no_other_settings(self) -> None:
+        self.make_topic()
+        self.pane([ENTER], rounds=1)
+        [child] = self.children()
+        settings = session_start_hook(child["argv"])
+        self.assertEqual(list(settings), ["hooks"])
+        self.assertEqual(list(settings["hooks"]), ["SessionStart"])
+        [entry] = settings["hooks"]["SessionStart"]
+        [hook] = entry["hooks"]
+        self.assertEqual(hook["type"], "command")
+        self.assertEqual(shlex.split(hook["command"])[-4:], ["hook", "session-start", str(THREAD), str(os.getpid())])
 
     def run_claims(self, *, uuid: str = UUID, env: dict[str, str] | None = None) -> list[tuple[list[str], object]]:
         """Runs the pane once on Enter and returns (argv, the claim read while the CLI runs) for each run."""
@@ -171,6 +193,20 @@ class ReadyTests(PaneCase):
         self.assertEqual(os.path.realpath(claim.cwd), os.path.realpath(self.folder))
         self.assertEqual(claim.pid, os.getpid())
 
+    def test_the_claim_a_new_tab_takes_is_not_hooked_until_the_hook_runs(self) -> None:
+        seen: list[bool] = []
+
+        def run_cli(argv: Sequence[str], cwd: str, environ: Mapping[str, str]) -> int:
+            seen.append(terminal_claim.read_claim(self.view, THREAD).hooked is False)
+            return 0
+
+        self.make_topic(uuid=UUID)
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%7"}):
+            run_topic_pane(self.paths, THREAD, self.make_config, out=io.StringIO(), clock=FakeClock(), stop_after=1,
+                           stdin=io.StringIO(), keys=ScriptedKeys([ENTER]), run=run_cli,
+                           new_uuid=lambda: FRESH_UUID)
+        self.assertEqual(seen, [True])
+
     def test_open_session_names_the_tmux_socket_of_the_pane(self) -> None:
         [(_argv, claim)] = self.run_claims(env={"TMUX_PANE": "%7", "TMUX": "/tmp/tmux-1000/default,4242,0"})
         self.assertEqual(claim.socket, "/tmp/tmux-1000/default")
@@ -187,9 +223,30 @@ class ReadyTests(PaneCase):
         ended = terminal_claim.take_ended(self.view, THREAD)
         self.assertIsNotNone(ended, "the pane did not record the session its CLI ran")
         self.assertEqual(ended.uuid, FRESH_UUID)
+        self.assertEqual(ended.started_uuid, FRESH_UUID)
         self.assertEqual(ended.config_dir, os.path.join(self.home, ".claude"))
         self.assertEqual(os.path.realpath(ended.cwd), os.path.realpath(self.folder))
         self.assertGreater(ended.ended, 0.0)
+
+    def test_a_session_moved_while_the_cli_ran_is_recorded_with_its_last_uuid(self) -> None:
+        NEW_UUID = "2d4f6a8c-0e1b-4a3c-9d5e-7f9a1b3c5d7e"
+        THIRD_UUID = "3e5a7b9d-1f2c-4b4d-8e6f-0a1b2c3d4e5f"
+
+        def run_cli(argv: Sequence[str], cwd: str, environ: Mapping[str, str]) -> int:
+            terminal_claim.update_uuid(self.view, THREAD, os.getpid(), NEW_UUID)  # the SessionStart hook after /clear
+            terminal_claim.update_uuid(self.view, THREAD, os.getpid(), THIRD_UUID)  # and after a /resume
+            return 0
+
+        self.make_topic(uuid=UUID)
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%9"}):
+            run_topic_pane(self.paths, THREAD, self.make_config, out=io.StringIO(), clock=FakeClock(), stop_after=1,
+                           stdin=io.StringIO(), keys=ScriptedKeys([ENTER]), run=run_cli,
+                           new_uuid=lambda: FRESH_UUID)
+        ended = terminal_claim.take_ended(self.view, THREAD)
+        self.assertIsNotNone(ended, "the pane did not record the session its CLI ran")
+        self.assertEqual(ended.uuid, THIRD_UUID)
+        self.assertEqual(ended.started_uuid, UUID)
+        self.assertEqual(ended.seen, (UUID, NEW_UUID))
 
     def test_a_cli_that_could_not_start_records_no_session(self) -> None:
         def run_fails(argv: Sequence[str], cwd: str, environ: Mapping[str, str]) -> int:
@@ -366,6 +423,47 @@ class EndOfInputTests(PaneCase):
                                         stop_after=1000, stdin=io.StringIO(), keys=keys), 0)
         self.assertEqual(keys.reads, 1, "the pane kept reading an input that had ended")
         self.assertEqual(self.children(), [])
+
+
+class ChildPidTests(PaneCase):
+    """The CLI child's pid: _run_child reports it, and the default runner writes it into the claim the pane took."""
+
+    def new_pane(self) -> ViewPane:
+        return ViewPane(self.paths, THREAD, self.make_config, io.StringIO(), FakeClock(), ScriptedKeys([]))
+
+    def test_run_child_reports_the_started_child_pid_then_0_once_it_exited(self) -> None:
+        started: list[int] = []
+        status = _run_child(["true"], self.home, {"PATH": os.environ.get("PATH", "")}, on_start=started.append)
+        self.assertEqual(status, 0)
+        [pid, exited] = started
+        self.assertGreater(pid, 0)
+        self.assertEqual(exited, 0)
+
+    def test_child_started_writes_the_child_into_the_claim_the_pane_took(self) -> None:
+        self.make_topic()
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getpid(), 1.0, uuid=UUID, cwd=self.folder))
+        self.new_pane()._child_started(4321)
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertEqual((claim.pid, claim.child, claim.uuid), (os.getpid(), 4321, UUID))
+
+    def test_child_started_leaves_a_claim_that_names_another_pid_alone(self) -> None:
+        self.make_topic()
+        self.assertTrue(terminal_claim.take_claim(self.view, THREAD, os.getppid(), 1.0, uuid=UUID))
+        self.new_pane()._child_started(4321)
+        self.assertEqual(terminal_claim.read_claim(self.view, THREAD).child, 0)
+
+    def test_the_default_runner_hands_the_started_child_to_the_claim_and_clears_it_on_exit(self) -> None:
+        self.make_topic()
+        with mock.patch.object(terminal_claim, "set_child", wraps=terminal_claim.set_child) as set_child:
+            self.pane([ENTER], rounds=1)
+        [child] = self.children()
+        self.assertTrue(child["claim"])
+        first, last = set_child.call_args_list[0][0], set_child.call_args_list[-1][0]
+        self.assertEqual((first[0], first[1], first[2]), (self.view, THREAD, os.getpid()))
+        self.assertGreater(first[3], 0)
+        self.assertEqual((last[0], last[1], last[2], last[3]), (self.view, THREAD, os.getpid(), 0))
+        claim = terminal_claim.read_claim(self.view, THREAD)
+        self.assertTrue(claim is None or claim.child == 0)
 
 
 class ChildEnvTests(PaneCase):

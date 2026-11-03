@@ -2,8 +2,8 @@
 
 The DispatcherCase of test_dispatcher.py with a view folder: a live claim (the test's own pid) makes the head message
 wait, the topic is told TERMINAL_NOTICE once, and the message runs after the claim file is removed. A stale claim (a
-reaped child's pid) is removed and the message runs at once. While a turn runs, its meta says 'running'; after it, 'idle'.
-Without a view folder the claim file is not read at all. Polls are POLL seconds; every wait is a bounded poll.
+reaped child's pid) is removed and the message runs at once. While a turn runs, its meta says 'running'; after it,
+'idle'. Without a view folder the claim file is not read at all. Polls are POLL seconds; every wait is a bounded poll.
 """
 
 import json
@@ -227,3 +227,68 @@ class ViewsOff(DispatcherCase):
         self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the message did not run")
         self.assertNotIn(terminal_claim.TERMINAL_NOTICE, self.tg.texts(THREAD))
         self.assertTrue(os.path.exists(self.claim), "the claim file was touched with views off")
+
+
+class BeforeTurnHook(TerminalDispatcherCase):
+    """The before_turn hook: it runs after the terminal wait and before a turn the bridge spawns itself. An attached
+    turn does not run it, and a hook that raises is logged while the turn runs."""
+
+    def setUp(self) -> None:
+        self.hook_calls: list[tuple[int, list[str]]] = []  # (thread, the texts run when the hook was called)
+        self.hook_error: Exception | None = None
+        self.pane_idle = False
+        super().setUp()
+
+    def _hook(self, thread_id: int) -> None:
+        self.hook_calls.append((thread_id, self.turns.texts_run(THREAD)))
+        if self.hook_error is not None:
+            raise self.hook_error
+
+    def _make_dispatcher(self, media_wait: float | None = None) -> Dispatcher:
+        return Dispatcher(
+            turns=self.turns, slots=self.slots, inbox=self.inbox, messenger=self.messenger, answers=self.answers,
+            titles=self.titles, client=self.tg, live=self.live, config=self.config, logger=self.logger,
+            media_wait_seconds=self.media_wait if media_wait is None else media_wait,
+            start_thread=self.thread_log, clock=self.clock, poll_seconds=POLL, view_dir=self.view,
+            pane_idle=lambda claim: self.pane_idle, before_turn=self._hook)
+
+    def write_attached(self, pid: int) -> None:
+        """A claim with a pane and a session uuid: attachable, so an idle pane takes the message into its session."""
+        with open(self.claim_file(), "w", encoding="utf-8") as handle:
+            json.dump({"pid": pid, "started": 1.0, "pane": "%3", "uuid": "0a1b2c3d-0000-4000-8000-000000000001",
+                       "config_dir": "/srv/claude-config", "cwd": "/srv/work", "socket": "", "hooked": False}, handle)
+
+    def test_the_hook_runs_before_the_turn_the_bridge_spawns(self) -> None:
+        self.ingest(1)
+        self.deliver(1, "first")
+        self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the message did not run")
+        self.assertEqual(self.hook_calls, [(THREAD, [])], "the hook did not run once before the turn")
+
+    def test_the_hook_runs_after_a_terminal_wait_and_before_the_turn(self) -> None:
+        self.write_claim(os.getpid())  # a live claim holds the message until it is removed
+        self.ingest(1)
+        self.deliver(1, "first")
+        self.assertTrue(wait_until(lambda: self.notices() == 1), "the topic was not told about the terminal")
+        self.assertEqual(self.hook_calls, [], "the hook ran while the terminal held the topic")
+        os.remove(self.claim_file())
+        self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the message never ran")
+        self.assertEqual(self.hook_calls, [(THREAD, [])], "the hook did not run once before the turn")
+
+    def test_the_hook_is_not_called_for_an_attached_turn(self) -> None:
+        self.write_attached(os.getpid())
+        self.pane_idle = True
+        self.ingest(1)
+        self.deliver(1, "first")
+        self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the message did not run")
+        self.assertIsNotNone(self.turns.attached("first"), "the turn was not attached to the terminal")
+        self.assertEqual(self.hook_calls, [], "the hook ran for an attached turn")
+
+    def test_a_hook_that_raises_does_not_stop_the_turn(self) -> None:
+        self.hook_error = RuntimeError("hook broke")
+        self.ingest(1)
+        self.deliver(1, "first")
+        self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]),
+                        "the raising hook stopped the turn")
+        self.assertTrue(wait_until(lambda: "answer to first" in self.tg.texts(THREAD)), "no answer was sent")
+        self.assertEqual(len(self.hook_calls), 1)
+        self.assertEqual(self.state(1), STATE_DONE)

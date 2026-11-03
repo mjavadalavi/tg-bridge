@@ -221,7 +221,8 @@ class TurnRunner:
                                    known_uuid=plan.stored_uuid)
         attempt = self._attempt(plan, recorder, attach.uuid, None, slot)
         if not attempt.refused and recorder.known not in ("", attach.uuid):  # the turn moved to another transcript
-            terminal_handoff.move_claim(self._view_dir, plan.thread_id, attach.pid, recorder.known, self._logger)
+            terminal_handoff.move_claim(self._view_dir, plan.thread_id, attach.pid, recorder.known, self._logger,
+                                        expected=attach.uuid)
         return self._closer.close(plan, attempt, "")
 
     def _relaunch_fresh(self, attempt: _Attempt) -> bool:

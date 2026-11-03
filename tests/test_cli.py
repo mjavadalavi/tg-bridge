@@ -34,6 +34,7 @@ from tg_bridge import cli
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.app import App
 from tg_bridge.config import BACKEND_CLAUDE, Config
+from tg_bridge.core import terminal_claim
 from tg_bridge.core.turn_runner import active_key
 from tg_bridge.daemon.inbox import GROUP_KEY
 from tg_bridge.daemon.lifecycle import ALREADY_RUNNING, acquire_lock
@@ -75,7 +76,8 @@ class StubRunners:
 
         return cli.Runners(daemon=lambda: self.calls.append(("daemon", ())), send=record("send"),
                            sendfile=record("sendfile"), type_text=record("type"), spawn=record("spawn"),
-                           hook_permission=record("hook"), view=record("view"),
+                           hook_permission=record("hook"), hook_session_start=record("hook-session-start"),
+                           view=record("view"),
                            view_sync=record("view-sync"), view_pane=record("view-pane"),
                            view_delete=record("view-delete"))
 
@@ -158,6 +160,15 @@ class RouteTests(unittest.TestCase):
             self.assertEqual((status, err.strip()), (1, cli.USAGE["hook"]), args)
         self.assertEqual(self.stub.calls, [])
 
+    def test_hook_session_start_passes_thread_and_pid(self) -> None:
+        self.assertEqual(cli.route(["hook", "session-start", "9201", "4242"], self.runners), 0)
+        self.assertEqual(self.stub.calls, [("hook-session-start", ("9201", "4242"))])
+
+    def test_hook_session_start_without_a_pid_is_usage_and_1(self) -> None:
+        status, _, err = _run_quietly(lambda: cli.route(["hook", "session-start", "9201"], self.runners))
+        self.assertEqual((status, err.strip()), (1, cli.USAGE["hook"]))
+        self.assertEqual(self.stub.calls, [])
+
     def test_view_runs_the_viewer_without_arguments(self) -> None:
         self.assertEqual(cli.route(["view"], self.runners), 0)
         self.assertEqual(self.stub.calls, [("view", ())])
@@ -226,6 +237,26 @@ class HookPermissionProcessTests(unittest.TestCase):
         decision = json.loads(proc.stdout)["hookSpecificOutput"]["decision"]
         self.assertEqual(decision["behavior"], "deny")
         self.assertTrue(decision["message"].startswith("tg-bridge is not reachable: "), decision)
+
+
+class HookSessionStartProcessTests(unittest.TestCase):
+    """`tg-bridge hook session-start <thread> <pid>` as a view tab's SessionStart hook runs it: a real child process, no
+    lock, no App; it moves the live claim of the pid to the session named on stdin."""
+
+    def test_moves_the_claim_of_the_pane_pid_prints_nothing_and_takes_no_lock(self) -> None:
+        old, new = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+        with TempHome() as home:
+            paths = Paths.from_home(home.home)
+            os.makedirs(paths.view, exist_ok=True)
+            self.assertTrue(terminal_claim.take_claim(paths.view, THREAD, os.getpid(), time.time(), uuid=old))
+            env = {"HOME": home.home, "PATH": os.environ.get("PATH", "")}
+            proc = subprocess.run([sys.executable, "-I", ENTRY, "hook", "session-start", str(THREAD), str(os.getpid())],
+                                  input=json.dumps({"session_id": new, "source": "clear"}), capture_output=True,
+                                  text=True, env=env, timeout=30, check=False)
+            claim = terminal_claim.read_claim(paths.view, THREAD)
+            self.assertFalse(os.path.exists(paths.lock))
+        self.assertEqual((proc.returncode, proc.stdout), (0, ""), proc.stderr)
+        self.assertEqual(claim.uuid, new)
 
 
 class ConfigLogTests(unittest.TestCase):

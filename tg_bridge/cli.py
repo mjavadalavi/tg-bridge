@@ -6,6 +6,7 @@
   type <pane> <text>                 type text into a live tmux pane (no App, no database)
   spawn <command> <name> <text>      open a live seat in a new tmux window (no App, no database)
   hook permission                    the TUI's PermissionRequest hook: stdin JSON to the session socket (no App)
+  hook session-start <thread> <pid>  the view tab's SessionStart hook: moves the tab's claim to the session (no App)
   view                               opens the tg-bridge tmux session: one read-only window per topic (no App)
   view-sync / view-pane <thread>     the view's own helpers, run by its windows (no App)
   view-delete <thread>               the view's Delete topic: the daemon deletes the topic here and in Telegram (no App)
@@ -31,6 +32,7 @@ from tg_bridge.daemon.inbox import GROUP_KEY
 from tg_bridge.daemon.lifecycle import acquire_lock, ignore_stop_signals, install_stop_handlers
 from tg_bridge.daemon.panes import Panes
 from tg_bridge.daemon.permission_hook import run_hook_client
+from tg_bridge.daemon.session_hook import run_session_start_hook
 from tg_bridge.daemon.view_delete import request_topic_delete, show_in_tmux
 from tg_bridge.daemon.view_pane import run_topic_pane
 from tg_bridge.daemon.viewer import Viewer, attach, run_sync
@@ -53,7 +55,7 @@ USAGE = MappingProxyType({
     "sendfile": "usage: tg-bridge sendfile <topic> <path> [caption]",
     "type": "usage: tg-bridge type <pane> <text>",
     "spawn": "usage: tg-bridge spawn <command> <name> <text>",
-    "hook": "usage: tg-bridge hook permission",
+    "hook": "usage: tg-bridge hook permission | tg-bridge hook session-start <thread> <pid>",
     "view-pane": "usage: tg-bridge view-pane <thread>",
     "view-delete": "usage: tg-bridge view-delete <thread>",
 })
@@ -72,6 +74,7 @@ class Runners:
     type_text: Callable[[str, str], int]
     spawn: Callable[[str, str, str], int]
     hook_permission: Callable[[], int]
+    hook_session_start: Callable[[str, str], int]
     view: Callable[[], int]
     view_sync: Callable[[], int]
     view_pane: Callable[[str], int]
@@ -96,6 +99,9 @@ def route(args: Sequence[str], runners: Runners) -> int:
     if command == "hook":
         if rest[:1] == ["permission"]:
             return runners.hook_permission()
+        if rest[:1] == ["session-start"]:
+            return _with_arguments("hook", rest[1:], lambda: runners.hook_session_start(rest[1], rest[2]),
+                                   required=2)
         print(USAGE["hook"], file=sys.stderr)
         return 1
     if command == "view":
@@ -110,9 +116,9 @@ def route(args: Sequence[str], runners: Runners) -> int:
     return 0
 
 
-def _with_arguments(command: str, rest: Sequence[str], call: Callable[[], int]) -> int:
+def _with_arguments(command: str, rest: Sequence[str], call: Callable[[], int], required: int | None = None) -> int:
     """Runs the subcommand when it has the arguments it needs; otherwise prints its usage line and exits 1."""
-    if len(rest) < REQUIRED_ARGUMENTS[command]:
+    if len(rest) < (REQUIRED_ARGUMENTS[command] if required is None else required):
         print(USAGE[command], file=sys.stderr)
         return 1
     return call()
@@ -250,6 +256,7 @@ def _live_runners(paths: Paths) -> Runners:
         type_text=lambda pane, text: type_into_pane(panes, pane, text),
         spawn=lambda command, name, text: spawn_in_tmux(panes, command, name, text),
         hook_permission=lambda: run_hook_client(sys.stdin, sys.stdout, os.environ),
+        hook_session_start=lambda thread, pid: run_session_start_hook(sys.stdin, thread, pid, paths),
         view=lambda: open_view(paths),
         view_sync=lambda: run_sync(paths, lambda: load_config(paths), SystemClock()),
         view_pane=lambda thread: view_topic_pane(paths, thread),
