@@ -168,6 +168,12 @@ class TranscriptTurns:
                              daemon=True).start()
         return sent
 
+    def is_open(self, gen: int) -> bool:
+        """True when generation gen is the current turn and has not ended: a message pasted for it may still be in the CLI's
+        input box after an Escape."""
+        with self._turn_lock:
+            return gen == self._gen and not self._done
+
     # ---- tail thread ----------------------------------------------------------------------------------
 
     def on_transcript(self, tail_gen: int, line: dict) -> None:

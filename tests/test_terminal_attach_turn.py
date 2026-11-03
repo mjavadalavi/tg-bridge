@@ -45,8 +45,12 @@ def assistant_line(text: str) -> dict:
     return {"type": "assistant", "isSidechain": False, "message": message}
 
 
+SHORT_SLEEP_SECONDS = 2.0  # a sleep up to this long is real: the paste gap and the restore's polls
+
+
 class BlockingClock:
-    """Real time for now and monotonic; sleep() blocks until the test ends, so no timer fires by itself."""
+    """Real time for now and monotonic; sleep() blocks until the test ends, so no timer fires by itself. A short sleep
+    (a paste gap, a poll of the restore after an Escape) passes in real time, so the keys and the restore still run."""
 
     def __init__(self) -> None:
         self.release = threading.Event()
@@ -58,6 +62,9 @@ class BlockingClock:
         return time.monotonic()
 
     def sleep(self, seconds: float) -> None:
+        if seconds <= SHORT_SLEEP_SECONDS:
+            time.sleep(seconds)
+            return
         self.release.wait(TURN_WAIT)
 
 

@@ -8,18 +8,22 @@ import subprocess
 import threading
 import time
 import unittest
+from unittest import mock
 
+from tests.fakes.clock import FakeClock
 from tests.support import TempHome
 from tests.turn_support import wait_until
 from tg_bridge.agents.base import AttachSpec, SessionSpec, TerminalNotReady
-from tg_bridge.agents.claude import history
-from tg_bridge.agents.claude.attached_session import (ATTACHED_CAPABILITIES, UNREACHABLE_ERROR, AttachedSession,
-                                                     pane_reason)
-from tg_bridge.agents.claude.tmux_pane import REASON_GONE, REASON_IDLE, REASON_TYPED
+from tg_bridge.agents.claude import attached_session, history
+from tg_bridge.agents.claude.attached_session import (ATTACHED_CAPABILITIES, RESTORE_CAP_SECONDS, RESTORE_JOIN_SECONDS,
+                                                     RESTORE_POLL_SECONDS, RESTORE_WAIT_SECONDS, UNREACHABLE_ERROR,
+                                                     AttachedSession, _still_ours, is_restored, pane_reason)
+from tg_bridge.agents.claude.tmux_pane import (CLEAR_KEY_GAP_SECONDS, REASON_GONE, REASON_IDLE, REASON_TYPED,
+                                               input_empty)
 from tg_bridge.agents.claude.transcript_turns import ATTACH_QUEUED_MAX_SECONDS, ATTACH_RELOCATE_SECONDS
 from tg_bridge.agents.claude.tui_turn import ATTACH_ECHO_MISSED_ERROR, ECHO_MISSED_SUBTYPE, USER_ECHO_SECONDS
 from tg_bridge.agents.events import (ApprovalRequest, Decision, SessionStarted, TextEvent, ToolStart,
-                                    TurnResult, TurnStatus)
+                                    TurnBegan, TurnResult, TurnStatus)
 from tg_bridge.config import LauncherSpec
 
 UUID = "11111111-2222-3333-4444-555555555555"
@@ -40,7 +44,8 @@ def assistant_line(text: str) -> dict:
 
 
 class BlockingClock:
-    """sleep() blocks until the test ends, so no echo net or interrupt fallback fires during a test by itself."""
+    """sleep() blocks until the test ends on the other threads, so no echo net or interrupt fallback fires during a test
+    by itself. The test's own thread (the gap after a paste) does not wait."""
 
     def __init__(self) -> None:
         self.release = threading.Event()
@@ -52,19 +57,24 @@ class BlockingClock:
         return time.monotonic()
 
     def sleep(self, seconds: float) -> None:
+        if threading.current_thread() is threading.main_thread():
+            return
         self.release.wait(WAIT_SECONDS)
 
 
 class FakeTmux:
     """Stands in for tmux. display-message answers with the pane id, capture-pane with screen, and paste-buffer runs on_paste
-    (the CLI writing its echo and answer). The subcommands named in fail exit 1."""
+    (the CLI writing its echo and answer). send-keys records its key in keys_sent and runs on_keys(key), which may
+    change the screen. The subcommands named in fail exit 1."""
 
-    def __init__(self, *, screen: str = CLI_BOX, fail: tuple[str, ...] = (), on_paste=None) -> None:
+    def __init__(self, *, screen: str = CLI_BOX, fail: tuple[str, ...] = (), on_paste=None, on_keys=None) -> None:
         self.pane_shown = PANE  # the pane tmux shows under this id; another id means the pane is gone
         self.screen = screen
         self.fail = fail
         self.on_paste = on_paste
+        self.on_keys = on_keys
         self.calls: list[tuple[str, str | None]] = []
+        self.keys_sent: list[str] = []
 
     def __call__(self, args, timeout, text=None):
         args = list(args)
@@ -79,11 +89,108 @@ class FakeTmux:
             out = self.screen
         elif sub == "paste-buffer" and self.on_paste is not None:
             self.on_paste()
+        elif sub == "send-keys":
+            self.keys_sent.append(args[-1])
+            if self.on_keys is not None:
+                self.on_keys(args[-1])
         return subprocess.CompletedProcess(args, 0, out, "")
 
     def keys(self) -> list[str]:
         """The subcommands that type into the pane."""
         return [sub for sub, _text in self.calls if sub in ("load-buffer", "paste-buffer", "send-keys")]
+
+
+def box_screen(text: str) -> str:
+    """The CLI's screen with text in its input box."""
+    return "─" * 40 + "\n❯ " + text + "\n" + "─" * 40 + "\n  ? for shortcuts\n"
+
+
+def box_rows(*rows: str) -> str:
+    """The CLI's screen with a multi-line input box: the first row on the prompt line, the rest indented below it."""
+    body = [f"❯ {rows[0]}", *(f"  {row}" for row in rows[1:])]
+    return "\n".join(["─" * 40, *body, "─" * 40, "  ? for shortcuts", ""])
+
+
+def busy_screen(text: str) -> str:
+    """The CLI's screen while it works: the busy hint above its input box, with text in the box."""
+    return "✻ Thinking… (esc to interrupt)\n" + box_screen(text)
+
+
+class RestoreClock(FakeClock):
+    """The restore runs in the test's own thread (its spawn is synchronous), so its polls are the sleeps of the main
+    thread: they move the fake time at once and are recorded. Every other thread (the echo net, the interrupt fallback)
+    blocks until the test ends, so none of them fires by itself."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+
+    def sleep(self, seconds: float) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            self.release.wait(WAIT_SECONDS)
+            return
+        super().sleep(seconds)
+
+
+class PollClock(RestoreClock):
+    """RestoreClock for a restore run on the test's own thread (its spawn defers it to run_restores). Before each poll's
+    sleep, on_poll(the sleeps so far) may change the screen, so a test says what the CLI shows while the window runs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.on_poll = lambda polls: None
+
+    def sleep(self, seconds: float) -> None:
+        if threading.current_thread() is threading.main_thread():
+            self.on_poll(len(self.sleeps))
+        super().sleep(seconds)
+
+
+class GatedRestoreClock(RestoreClock):
+    """RestoreClock for a restore on a thread of its own ('restored-prompt', see threaded_spawn): each of its polls
+    waits for gate first, so a test decides when the restore goes on. The other threads are RestoreClock's."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = threading.Event()
+
+    def sleep(self, seconds: float) -> None:
+        if threading.current_thread().name == "restored-prompt":
+            self.gate.wait(WAIT_SECONDS)
+            FakeClock.sleep(self, seconds)  # the poll moves the fake time on, as any sleep does
+            return
+        super().sleep(seconds)
+
+
+def threaded_spawn(work) -> None:
+    """The production spawn: the restore runs on a thread of its own."""
+    threading.Thread(target=work, name="restored-prompt", daemon=True).start()
+
+
+class NamedGateClock(RestoreClock):
+    """RestoreClock for several restores at once: the restore thread named n waits at its polls for gates[n], so a test
+    lets one restore go on while another still waits. Threads not named in gates are RestoreClock's."""
+
+    def __init__(self, names) -> None:
+        super().__init__()
+        self.gates = {name: threading.Event() for name in names}
+
+    def sleep(self, seconds: float) -> None:
+        gate = self.gates.get(threading.current_thread().name)
+        if gate is not None:
+            gate.wait(WAIT_SECONDS)
+            FakeClock.sleep(self, seconds)
+            return
+        super().sleep(seconds)
+
+
+def named_spawn(names):
+    """A spawn that starts each restore on a thread of its own, named by the next of names (in the order they start)."""
+    pending = iter(names)
+
+    def spawn(work) -> None:
+        threading.Thread(target=work, name=next(pending), daemon=True).start()
+    return spawn
 
 
 class AttachedSessionTests(unittest.TestCase):
@@ -100,18 +207,35 @@ class AttachedSessionTests(unittest.TestCase):
         self.addCleanup(self.clock.release.set)
         self.events: list[object] = []
         self.logs: list[str] = []
+        self.restores: list = []  # the restore work the deferred spawn kept, until run_restores runs it
         self.tmux = FakeTmux(on_paste=self.cli_answers)
         self.spec = SessionSpec(thread_id=1, chat_id=2, topic="t", launcher=LauncherSpec(
             name="l", backend="claude", command="c", argv=("c",), config_dir=self.config_dir), cwd=self.cwd,
             mode="default", model=None, resume_id=UUID, new_id=None, allow_rules=(), deny_tools=(), system_rules="",
             env={}, errfile_dir=self.cwd)
 
-    def make(self, still_attached=None) -> AttachedSession:
+    def make(self, still_attached=None, spawn=None) -> AttachedSession:
         session = AttachedSession(self.spec, self.events.append, socket="", pane=PANE, uuid=UUID,
                                   config_dir=self.config_dir, cwd=self.cwd, logger=self, clock=self.clock,
-                                  run=self.tmux, still_attached=still_attached or (lambda: True))
+                                  run=self.tmux, still_attached=still_attached or (lambda: True),
+                                  spawn=spawn or self.defer_restore)
         self.addCleanup(session.stop)
+        self.addCleanup(self.run_restores)  # runs before stop (LIFO): a deferred restore must not hold stop() up
         return session
+
+    def defer_restore(self, work) -> None:
+        """The restore's spawn in most tests: the work is kept. A restore takes _keys, and the Escape that starts it
+        holds _keys, so the work runs after interrupt() returned: run_restores() does that on the test's own thread."""
+        self.restores.append(work)
+
+    def run_restores(self) -> None:
+        while self.restores:
+            self.restores.pop(0)()
+
+    def interrupt_and_restore(self, session: AttachedSession) -> bool:
+        sent = session.interrupt()
+        self.run_restores()
+        return sent
 
     def log(self, msg: object) -> None:  # the Logger protocol of the session
         self.logs.append(str(msg))
@@ -131,6 +255,11 @@ class AttachedSessionTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual(len(self.results()), 1, "no turn result came from the transcript")
         return self.results()[0]
+
+    def wait_restores(self, session: AttachedSession, count: int) -> bool:
+        """True when the running restores of session reach count within WAIT_SECONDS."""
+        with session._restores_idle:
+            return session._restores_idle.wait_for(lambda: session._restores == count, WAIT_SECONDS)
 
     def test_start_reports_the_session_as_resumed_when_the_pane_exists(self) -> None:
         session = self.make()
@@ -276,6 +405,406 @@ class AttachedSessionTests(unittest.TestCase):
         self.assertTrue(session.interrupt())
         self.assertEqual(self.tmux.calls[-1], ("send-keys", None))
 
+    def ctrl_u_clears_the_line(self, key: str) -> None:
+        """What the CLI's box does with C-u: its line is emptied."""
+        if key == "C-u":
+            self.tmux.screen = CLI_BOX
+
+    def paste_then_escape_with_the_turn_open(self, screen: str, *, text: str = "hello", clock=None,
+                                             spawn=None) -> tuple[AttachedSession, int]:
+        """Pastes text while the CLI has not answered, then puts screen up as the box after the Escape. Returns the
+        session and the count of keys sent before the interrupt. clock and spawn are the session's (the RestoreClock
+        and the deferred spawn by default)."""
+        self.tmux.on_paste = None  # the CLI answers later: the Escape comes while the turn is open
+        self.tmux.on_keys = self.ctrl_u_clears_the_line
+        self.clock = clock if clock is not None else RestoreClock()
+        self.addCleanup(self.clock.release.set)
+        session = self.make(spawn=spawn)
+        session.start()
+        session.send_user(text)
+        self.tmux.screen = screen
+        return session, len(self.tmux.keys_sent)
+
+    def test_interrupt_after_a_paste_empties_the_message_the_cli_put_back(self) -> None:
+        session, typed = self.paste_then_escape_with_the_turn_open(box_screen("hello"))
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape", "C-u"])
+        self.assertTrue(input_empty(self.tmux.screen), "the box still holds the message")
+        self.assertTrue(any("cleared the message" in line for line in self.logs), self.logs)
+
+    def test_a_long_paste_put_back_as_its_placeholder_is_emptied_too(self) -> None:
+        twelve_lines = "\n".join(["line"] * 12)  # 12 lines: the placeholder's count is checked against them
+        session, typed = self.paste_then_escape_with_the_turn_open(box_screen("[Pasted text #2 +12 lines]"),
+                                                                   text=twelve_lines)
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape", "C-u"])
+        self.assertTrue(input_empty(self.tmux.screen), "the placeholder is still in the box")
+
+    def test_text_the_user_typed_in_the_tab_is_left_alone(self) -> None:
+        session, typed = self.paste_then_escape_with_the_turn_open(box_screen("my own draft"))
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"], "a clear key reached the user's text")
+        self.assertEqual(self.tmux.screen, box_screen("my own draft"))
+        self.assertTrue(any("holds other text" in line for line in self.logs), self.logs)
+
+    def test_an_empty_box_for_the_whole_wait_sends_no_clear_keys(self) -> None:
+        session, typed = self.paste_then_escape_with_the_turn_open(CLI_BOX)  # the CLI never put the message back
+        polls = len(self.clock.sleeps)
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"])
+        rounds = round(RESTORE_WAIT_SECONDS / RESTORE_POLL_SECONDS)
+        self.assertEqual(self.clock.sleeps[polls:], [RESTORE_POLL_SECONDS] * rounds)
+
+    def test_an_escape_after_a_paste_starts_one_restore(self) -> None:
+        self.tmux.on_paste = None
+        self.clock = RestoreClock()
+        session = self.make()
+        session.start()
+        session.send_user("hello")
+
+        self.assertTrue(session.interrupt())
+        self.assertTrue(session.interrupt())  # the paste's restore is taken by the first Escape
+        self.assertEqual(len(self.restores), 1)
+
+    def test_an_interrupt_with_nothing_pasted_sends_only_escape(self) -> None:
+        self.clock = RestoreClock()
+        self.addCleanup(self.clock.release.set)
+        session = self.make()
+        session.start()
+
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent, ["Escape"])
+        self.assertEqual(self.clock.sleeps, [])
+
+    def test_a_failed_escape_starts_no_restore(self) -> None:
+        self.tmux.on_paste = None
+        session = self.make()
+        session.start()
+        session.send_user("hello")
+        self.tmux.fail = ("send-keys",)  # the Escape cannot be sent
+
+        self.assertFalse(session.interrupt())
+        self.assertEqual(self.restores, [])
+
+    def test_an_interrupt_after_the_bridges_turn_ended_sends_only_escape(self) -> None:
+        """The CLI answered the pasted message, so the bridge's turn is over: an Escape now restores nothing, even when
+        the message is in the box."""
+        session = self.make()
+        session.start()
+        session.send_user("hello")
+        self.wait_for_result()
+        self.tmux.screen = box_screen("hello")
+        typed = len(self.tmux.keys_sent)
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"])
+        self.assertEqual(self.restores, [])
+
+    def test_an_interrupt_during_a_turn_the_tab_started_sends_only_escape(self) -> None:
+        notification = {"type": "user", "origin": {"kind": "task-notification"},
+                        "message": {"role": "user", "content": "<task-notification><task-id>b1</task-id>"
+                                                               "</task-notification>"}}
+        session = self.make()
+        session.start()
+        session.send_user("hello")
+        self.wait_for_result()
+        with open(self.transcript, "a", encoding="utf-8") as handle:  # the tab starts a turn of its own, still busy
+            for line in (notification, assistant_line("WORKING")):
+                handle.write(json.dumps(line) + "\n")
+        self.assertTrue(wait_until(lambda: any(isinstance(e, TurnBegan) for e in self.events)),
+                        "the tab's own turn did not begin")
+        self.tmux.screen = box_screen("hello")
+        typed = len(self.tmux.keys_sent)
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"])
+        self.assertEqual(self.restores, [])
+
+    def test_stop_waits_for_a_running_restore(self) -> None:
+        """The restore thread waits at its first look (the box is empty). stop() returns only when that restore has
+        finished, so the next turn's paste cannot meet its keys."""
+        session, _typed = self.paste_then_escape_with_the_turn_open(CLI_BOX, clock=GatedRestoreClock(),
+                                                                    spawn=threaded_spawn)
+        self.addCleanup(self.clock.gate.set)
+        self.assertTrue(session.interrupt())
+        stopper = threading.Thread(target=session.stop)
+        stopper.start()
+        stopper.join(0.3)
+        self.assertTrue(stopper.is_alive(), "stop() returned while the restore was still running")
+
+        self.clock.gate.set()
+        stopper.join(WAIT_SECONDS)
+        self.assertFalse(stopper.is_alive(), "stop() did not return after the restore finished")
+        self.assertEqual(session._restores, 0)
+
+    def test_stop_logs_a_restore_that_does_not_finish_in_time(self) -> None:
+        session, _typed = self.paste_then_escape_with_the_turn_open(CLI_BOX, clock=GatedRestoreClock(),
+                                                                    spawn=threaded_spawn)
+        self.addCleanup(self.clock.gate.set)
+        self.assertTrue(session.interrupt())
+
+        with mock.patch.object(attached_session, "RESTORE_JOIN_SECONDS", 0.2):
+            session.stop()
+        self.assertTrue(any("did not finish" in line for line in self.logs), self.logs)
+
+    def test_stop_waits_until_both_overlapping_restores_have_finished(self) -> None:
+        """A second Escape after a new paste starts a second restore while the first one's window is still open. The
+        first restore ending must not end stop()'s wait: it waits for both."""
+        clock = NamedGateClock(["restore-1", "restore-2"])
+        session, _typed = self.paste_then_escape_with_the_turn_open(CLI_BOX, clock=clock,
+                                                                    spawn=named_spawn(["restore-1", "restore-2"]))
+        self.addCleanup(clock.gates["restore-2"].set)
+        self.addCleanup(clock.gates["restore-1"].set)
+        self.assertTrue(session.interrupt())  # restore-1 waits at its first look
+        session.send_user("hello")  # a new paste while that window is open
+        self.assertTrue(session.interrupt())  # the second Escape starts restore-2 for it
+        self.assertEqual(session._restores, 2)
+
+        stopper = threading.Thread(target=session.stop)
+        stopper.start()
+        clock.gates["restore-1"].set()
+        self.assertTrue(self.wait_restores(session, 1), "the first restore did not end")
+        stopper.join(0.3)
+        self.assertTrue(stopper.is_alive(), "stop() returned while the second restore was still running")
+
+        clock.gates["restore-2"].set()
+        stopper.join(WAIT_SECONDS)
+        self.assertFalse(stopper.is_alive(), "stop() did not return after both restores finished")
+        self.assertEqual(session._restores, 0)
+
+    def test_a_restore_still_running_when_the_wait_ends_is_abandoned_and_presses_no_key(self) -> None:
+        session, _typed = self.paste_then_escape_with_the_turn_open(CLI_BOX, clock=GatedRestoreClock(),
+                                                                   spawn=threaded_spawn)
+        self.addCleanup(self.clock.gate.set)
+        self.assertTrue(session.interrupt())  # the restore waits at its first look, the box still empty
+
+        with mock.patch.object(attached_session, "RESTORE_JOIN_SECONDS", 0.2):
+            session.stop()  # the wait ends with the restore still running: it is abandoned
+        self.assertTrue(any("abandoned" in line for line in self.logs), self.logs)
+
+        after_timeout = len(self.tmux.keys_sent)
+        self.tmux.screen = box_screen("hello")  # the message is in the box when the restore wakes up
+        self.clock.gate.set()
+        self.assertTrue(self.wait_restores(session, 0), "the abandoned restore did not end")
+        self.assertEqual(self.tmux.keys_sent[after_timeout:], [], "a key was pressed after the abandon")
+        self.assertEqual(self.tmux.screen, box_screen("hello"))
+
+    def test_a_clear_started_after_the_abandon_presses_no_key(self) -> None:
+        session, typed = self.paste_then_escape_with_the_turn_open(box_screen("hello"))
+        session._abandoned = True  # what stop() sets when its wait has ended
+
+        session._clear_box("hello", "hello", session._paste_seq)  # the box the restore read: the pasted text
+        self.assertEqual(self.tmux.keys_sent[typed:], [], "a clear key was pressed after the abandon")
+
+    def test_stop_with_no_restore_returns_at_once(self) -> None:
+        session = self.make()
+        session.start()
+        began = time.monotonic()
+
+        session.stop()
+        self.assertLess(time.monotonic() - began, 1.0)
+        self.assertFalse(any("did not finish" in line for line in self.logs), self.logs)
+
+    def test_a_newer_paste_during_the_restore_wins_even_with_the_same_words(self) -> None:
+        """The restore is for the first 'hello'. The same words are pasted again while it waits, and the box then holds
+        them: the restore is for a paste, not for a text, so it empties nothing."""
+        session, _typed = self.paste_then_escape_with_the_turn_open(CLI_BOX, clock=GatedRestoreClock(),
+                                                                    spawn=threaded_spawn)
+        self.addCleanup(self.clock.gate.set)
+        self.assertTrue(session.interrupt())  # the restore thread waits at its first look
+        session.send_user("hello")  # a newer paste of the same words
+        typed = len(self.tmux.keys_sent)
+        self.tmux.screen = box_screen("hello")
+
+        self.clock.gate.set()
+        self.assertTrue(self.wait_restores(session, 0))
+        self.assertNotIn("C-u", self.tmux.keys_sent[typed:], "the restore cleared the newer paste")
+        self.assertEqual(self.tmux.screen, box_screen("hello"))
+
+    def test_a_busy_cli_holds_the_window_open_until_the_message_is_put_back(self) -> None:
+        """The CLI works for five seconds before it puts the message back. The look is pushed on while it is busy, so
+        the message is found, although the window is only RESTORE_WAIT_SECONDS long when the CLI is idle."""
+        session, typed = self.paste_then_escape_with_the_turn_open(busy_screen(""), clock=PollClock())
+        first = len(self.clock.sleeps)
+
+        def cli_puts_it_back(polls: int) -> None:
+            if polls - first == 20:  # 5 s of work, then the CLI is idle with the message in its box
+                self.tmux.screen = box_screen("hello")
+        self.clock.on_poll = cli_puts_it_back
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape", "C-u"])
+        self.assertTrue(input_empty(self.tmux.screen), "the message the CLI put back is still in the box")
+
+    def test_no_key_is_typed_while_the_cli_works_even_with_the_message_in_the_box(self) -> None:
+        session, typed = self.paste_then_escape_with_the_turn_open(busy_screen("hello"), clock=PollClock())
+        first = len(self.clock.sleeps)
+        typed_while_busy: list[str] = []
+
+        def record_key(key: str) -> None:
+            if key != "Escape" and self.tmux.screen == busy_screen("hello"):
+                typed_while_busy.append(key)
+            self.ctrl_u_clears_the_line(key)
+
+        def cli_idle_from_the_fourth_look(polls: int) -> None:
+            if polls - first == 4:
+                self.tmux.screen = box_screen("hello")
+        self.tmux.on_keys = record_key
+        self.clock.on_poll = cli_idle_from_the_fourth_look
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(typed_while_busy, [], "a key was typed while the CLI was working")
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape", "C-u"])
+
+    def test_a_cli_busy_beyond_the_cap_gives_up_without_a_clear(self) -> None:
+        session, typed = self.paste_then_escape_with_the_turn_open(busy_screen(""), clock=PollClock())
+        first = len(self.clock.sleeps)
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"])
+        self.assertEqual(sum(self.clock.sleeps[first:]), RESTORE_CAP_SECONDS)
+
+    def test_a_clear_that_fails_once_is_tried_again_after_one_poll_gap(self) -> None:
+        session, typed = self.paste_then_escape_with_the_turn_open(box_screen("hello"))
+        presses: list[str] = []
+
+        def the_fifth_clear_key_empties_the_box(key: str) -> None:  # the first clear (two rounds) does not empty it
+            if key == "Escape":
+                return
+            presses.append(key)
+            if len(presses) == 5:
+                self.tmux.screen = CLI_BOX
+
+        self.tmux.on_keys = the_fifth_clear_key_empties_the_box
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape", "C-u", "BSpace", "C-u", "BSpace", "C-u"])
+        self.assertIn(CLEAR_KEY_GAP_SECONDS, self.clock.sleeps, "the clear's gaps did not run on the session's clock")
+        self.assertTrue(any("cleared the message" in line for line in self.logs), self.logs)
+
+    def test_a_box_that_stays_full_after_both_clears_is_logged(self) -> None:
+        session, typed = self.paste_then_escape_with_the_turn_open(box_screen("hello"))
+        self.tmux.on_keys = None  # nothing empties the box
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(len(self.tmux.keys_sent[typed:]), 1 + 2 * 2 * 2, "Escape, then two clears of two rounds")
+        self.assertTrue(any("could not clear" in line for line in self.logs), self.logs)
+
+    def clear_keys_redraw(self, *screens: str) -> None:
+        """on_keys for the keys after the Escape: after each one the screen is the next of screens (the last stays)."""
+        pending = list(screens)
+
+        def redraw(key: str) -> None:
+            if key != "Escape":
+                self.tmux.screen = pending.pop(0) if len(pending) > 1 else pending[0]
+        self.tmux.on_keys = redraw
+
+    def test_a_turn_closed_during_the_escape_still_gets_its_restore(self) -> None:
+        """The transcript answers the turn while the Escape is in flight. The target was decided before the Escape,
+        while the turn was open, so the restore still starts and empties the box."""
+        session, typed = self.paste_then_escape_with_the_turn_open(box_screen("hello"))
+
+        def answer_during_the_escape(key: str) -> None:
+            if key == "Escape":
+                self.cli_answers()
+                self.wait_for_result()
+            else:
+                self.ctrl_u_clears_the_line(key)
+        self.tmux.on_keys = answer_during_the_escape
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(len(self.results()), 1)
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape", "C-u"])
+        self.assertTrue(input_empty(self.tmux.screen), "the message put back is still in the box")
+
+    def test_an_escape_after_stop_starts_no_restore_but_is_still_pressed(self) -> None:
+        session, typed = self.paste_then_escape_with_the_turn_open(box_screen("hello"))
+        session.stop()
+
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"])
+        self.assertEqual(self.restores, [])
+
+    def test_stop_during_an_escape_in_flight_waits_for_the_restore_that_escape_starts(self) -> None:
+        escape_sent, escape_released = threading.Event(), threading.Event()
+
+        def hold_the_escape(key: str) -> None:
+            if key == "Escape":
+                escape_sent.set()
+                escape_released.wait(WAIT_SECONDS)
+            else:
+                self.ctrl_u_clears_the_line(key)
+        session, _typed = self.paste_then_escape_with_the_turn_open(CLI_BOX, clock=GatedRestoreClock(),
+                                                                    spawn=threaded_spawn)
+        self.addCleanup(self.clock.gate.set)
+        self.tmux.on_keys = hold_the_escape
+        interrupter = threading.Thread(target=session.interrupt)
+        interrupter.start()
+        self.assertTrue(escape_sent.wait(WAIT_SECONDS))
+        stopper = threading.Thread(target=session.stop)
+        stopper.start()
+        stopper.join(0.2)  # stop() waits for the Escape's keys
+        escape_released.set()
+        interrupter.join(WAIT_SECONDS)
+
+        self.assertEqual(session._restores, 1, "the Escape started no restore")
+        stopper.join(0.3)
+        self.assertTrue(stopper.is_alive(), "stop() returned while the restore the Escape started was still running")
+        self.clock.gate.set()
+        stopper.join(WAIT_SECONDS)
+        self.assertFalse(stopper.is_alive(), "stop() did not return after the restore finished")
+
+    def test_a_restore_that_cannot_start_is_logged_and_stop_returns_at_once(self) -> None:
+        def cannot_start(work) -> None:
+            raise RuntimeError("no thread can be started")
+        session, typed = self.paste_then_escape_with_the_turn_open(box_screen("hello"), spawn=cannot_start)
+
+        self.assertTrue(session.interrupt(), "the Escape is still sent")
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"])
+        began = time.monotonic()
+        session.stop()
+        self.assertLess(time.monotonic() - began, 1.0)
+        self.assertEqual(session._restores, 0, "a restore that never started is still counted")
+        self.assertTrue(any("could not start the restore" in line for line in self.logs), self.logs)
+        self.assertFalse(any("did not finish" in line for line in self.logs), self.logs)
+
+    def test_a_box_that_turns_into_the_users_own_text_between_clear_keys_gets_no_further_key(self) -> None:
+        session, typed = self.paste_then_escape_with_the_turn_open(box_screen("hello"))
+
+        def the_user_types_after_the_first_clear_key(key: str) -> None:
+            if key == "C-u":
+                self.tmux.screen = box_screen("my own draft")
+        self.tmux.on_keys = the_user_types_after_the_first_clear_key
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape", "C-u"], "a clear key reached the user's text")
+        self.assertEqual(self.tmux.screen, box_screen("my own draft"))
+
+    def test_a_box_partly_cleared_by_the_clear_keeps_being_cleared(self) -> None:
+        """C-u removes the last row first, so the box is a prefix of the pasted text after the first key: it is still
+        the bridge's, and the clear goes on until the box is empty."""
+        session, typed = self.paste_then_escape_with_the_turn_open(box_rows("hello", "world"), text="hello\nworld")
+        self.clear_keys_redraw(box_rows("hello", ""), box_rows("hello"), box_rows(""))
+
+        self.assertTrue(self.interrupt_and_restore(session))
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape", "C-u", "BSpace", "C-u"])
+        self.assertTrue(input_empty(self.tmux.screen))
+        self.assertTrue(any("cleared the message" in line for line in self.logs), self.logs)
+
+    def test_still_ours_accepts_the_pasted_text_and_its_prefixes_only(self) -> None:
+        self.assertTrue(_still_ours("hello\nworld", "hello\nworld"))
+        self.assertTrue(_still_ours("hello", "hello\nworld"))
+        self.assertTrue(_still_ours("[Pasted text #2 +12 lines]", "\n".join(["line"] * 12)))
+        self.assertFalse(_still_ours("my own draft", "hello\nworld"))
+        self.assertFalse(_still_ours("", "hello\nworld"))
+        self.assertFalse(_still_ours("[Pasted text #2 +12 lines]", "[Pasted text #2 +12 lines] and more"))
+
+    def test_the_join_outlasts_the_restore_look_so_a_normal_restore_is_not_abandoned(self) -> None:
+        self.assertGreater(RESTORE_JOIN_SECONDS, RESTORE_CAP_SECONDS)
+
     def test_stop_and_end_never_send_a_key(self) -> None:
         session = self.make()
         session.start()
@@ -382,6 +911,8 @@ class RelocateClock(BlockingClock):
         self.after = threading.Event()
 
     def sleep(self, seconds: float) -> None:
+        if threading.current_thread() is threading.main_thread():  # the test's own thread (a paste's gap) does not wait
+            return
         if threading.current_thread().name != "user-echo":  # the locate timer of the transcript is not the echo window
             self.release.wait(WAIT_SECONDS)
             return
@@ -682,6 +1213,34 @@ class RelocationTests(unittest.TestCase):
         self.assertEqual(sum(self.clock.sleeps), 600.0)
         self.assertEqual([sub for sub, _ in self.tmux.calls if sub == "paste-buffer"], ["paste-buffer"],
                          "the message was pasted again")
+
+
+class IsRestoredTests(unittest.TestCase):
+    def test_the_placeholder_of_a_long_paste_is_the_message_when_its_line_count_matches(self) -> None:
+        twelve_lines = "\n".join(["line"] * 12)
+        self.assertTrue(is_restored("[Pasted text #2 +12 lines]", twelve_lines))
+        self.assertTrue(is_restored("[Pasted text #2 +11 lines]", twelve_lines))  # within one line of the count
+        self.assertTrue(is_restored("[Pasted text #2 +13 lines]", twelve_lines))
+        self.assertFalse(is_restored("[Pasted text #2 +5 lines]", twelve_lines))
+
+    def test_a_bare_placeholder_is_the_message_only_for_a_one_line_text(self) -> None:
+        self.assertTrue(is_restored("[Pasted text #1]", "short"))
+        self.assertFalse(is_restored("[Pasted text #1]", "two\nlines"))
+
+    def test_a_url_wrapped_in_the_middle_of_a_word_is_the_message(self) -> None:
+        url = "see https://example.com/a/very/long/path/that/wraps?with=query"
+        self.assertTrue(is_restored("see https://example.com/a/very/long/pa\n    th/that/wraps?with=query", url))
+
+    def test_the_same_words_wrapped_and_indented_are_the_message(self) -> None:
+        self.assertTrue(is_restored("hello there,\n    how are\n    you", "hello there, how are you"))
+
+    def test_other_text_is_not_the_message(self) -> None:
+        self.assertFalse(is_restored("hello there", "hello"))
+        self.assertFalse(is_restored("[Pasted text #2 +12 lines] and more", "a long message"))
+
+    def test_a_blank_box_holds_nothing(self) -> None:
+        self.assertFalse(is_restored("", ""))
+        self.assertFalse(is_restored("  \n ", "hello"))
 
 
 if __name__ == "__main__":

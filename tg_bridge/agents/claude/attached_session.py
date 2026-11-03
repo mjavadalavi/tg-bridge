@@ -15,17 +15,30 @@ looks: a claim that names another session moves the turn to that session's trans
 SessionStart hook keeps the claim current) never scans the other transcripts of the folder. Only a tab started without
 the hook scans the folder for the echo, as before the hook existed.
 
+After the bridge's own Escape, the CLI may put the pasted message back into its input box, where it blocks every queued
+message (TmuxPane.ready is False for typed text). When that Escape interrupted the bridge's open turn, _press_escape
+starts a restore thread (_clear_restored). It empties the box, but only when the box holds that message (is_restored)
+and no newer paste came since; each key of the clear checks the box again (_still_ours), so text the user typed in the
+tab is never touched. The restore waits while the CLI works, up to RESTORE_CAP_SECONDS. stop() stops new restores, then
+waits for the running ones (RESTORE_JOIN_SECONDS). A restore still running then is abandoned: it presses no further key,
+so the next turn's paste cannot meet its keys.
+
 Threads: the transcript tail thread delivers the lines (TranscriptTurns); the owner's thread calls the methods, and an
-interrupt may come from another thread (the ⏹ tap). Lock map: _keys serialises the keys typed into the pane (the paste and
-the Escape); the turn state is TranscriptTurns' own. No lock is held while a turn is opened or followed.
+interrupt may come from another thread (the ⏹ tap). The restore thread (_clear_restored) starts after an Escape.
+Lock map: _keys serialises the keys typed into the pane (the paste, the Escape and the restore's clear). It guards
+_pasted, _paste_seq and _stopped, and the restore target is decided under it, before the Escape. _restores (the count
+of running restores) is guarded by _restores_idle, a Condition that stop() waits on outside _keys; _keys is taken first
+when both are held. _abandoned is set by stop() without _keys: a one-way flag that the restore reads before each key.
+The turn state is TranscriptTurns' own. No lock is held while a turn is opened or followed.
 """
 
+import re
 import threading
 from collections.abc import Callable
 
 from tg_bridge.agents.base import AgentSession, Capabilities, EventSink, SessionSpec, TerminalNotReady, always_attached
 from tg_bridge.agents.claude import session_finder
-from tg_bridge.agents.claude.tmux_pane import TmuxPane, TmuxRunner, run_tmux
+from tg_bridge.agents.claude.tmux_pane import TmuxPane, TmuxRunner, input_text, run_tmux, working
 from tg_bridge.agents.claude.transcript_turns import TranscriptTurns
 from tg_bridge.agents.claude.translate import ClaudeTranslator
 from tg_bridge.agents.events import ApprovalRequest, Decision, SessionStarted
@@ -36,6 +49,13 @@ UNREACHABLE_ERROR = "the terminal session could not be reached"
 ATTACHED_CAPABILITIES = Capabilities(live_mode=False, live_model=False, questions=False, cost_usd=False, images=False,
                                      preassigned_id=True, linger=False,  # the process belongs to the terminal
                                      readable_tail=False)  # and its output is a terminal screen, not a log
+RESTORE_WAIT_SECONDS = 3.0  # how long after its Escape the bridge looks for its message put back in the box
+RESTORE_CAP_SECONDS = 20.0  # the look is pushed on while the CLI works, but never past this long after the Escape
+RESTORE_POLL_SECONDS = 0.25  # between two looks at the box while it is empty
+# stop() waits this long for the running restores, so the next paste cannot meet their keys. A restore still
+# running then is abandoned: it presses no further key.
+RESTORE_JOIN_SECONDS = 30.0
+PASTED_PLACEHOLDER = re.compile(r"\[Pasted text #\d+(?: \+(\d+) lines)?\]")  # a long paste's box text (M: group 1)
 
 
 def pane_idle(socket: str, pane: str, run: TmuxRunner = run_tmux) -> bool:
@@ -56,12 +76,48 @@ def _no_requests(message: str, *, main_only: bool = False) -> list[str]:
     return []
 
 
+def _spawn_daemon(work: Callable[[], None]) -> None:
+    """Runs work in a daemon thread of its own: the restore waits for the CLI, and the owner's thread does not."""
+    threading.Thread(target=work, name="restored-prompt", daemon=True).start()
+
+
+def is_restored(box: str, text: str) -> bool:
+    """True when the input box holds the message the bridge pasted. The CLI shows a long paste as a placeholder:
+    '[Pasted text #N +M lines]' when M is within one of the lines of text (the CLI counts them its own way), or
+    '[Pasted text #N]' when text is one line. Otherwise the box holds the same characters as text, with all whitespace
+    removed: the CLI wraps and indents the lines, and a long token such as a URL can wrap mid-word. A blank box holds
+    nothing."""
+    shown = box.strip()
+    if not shown:
+        return False
+    placeholder = PASTED_PLACEHOLDER.fullmatch(shown)
+    if placeholder is not None:
+        if placeholder.group(1) is None:
+            return "\n" not in text
+        return abs(int(placeholder.group(1)) - (text.count("\n") + 1)) <= 1
+    return "".join(box.split()) == "".join(text.split())
+
+
+def _still_ours(box: str, text: str) -> bool:
+    """True when a clear may still empty this box: it holds the pasted message (is_restored), or a part of it cut
+    from the end. C-u deletes from the end, so a box that a clear has partly emptied is a prefix of the text. A
+    placeholder is only ever the whole message (is_restored), never a prefix. Whitespace is not compared, as in
+    is_restored."""
+    if is_restored(box, text):
+        return True
+    shown = box.strip()
+    if not shown or PASTED_PLACEHOLDER.fullmatch(shown):
+        return False
+    return "".join(text.split()).startswith("".join(shown.split()))
+
+
 class AttachedSession(AgentSession):
     """One Claude Code session of a terminal tab, driven through its tmux pane and read from its transcript."""
 
     def __init__(self, spec: SessionSpec, sink: EventSink, *, socket: str, pane: str, uuid: str, config_dir: str,
                  cwd: str, logger: Logger, clock: Clock, run: TmuxRunner = run_tmux,
-                 still_attached: Callable[[], bool] = always_attached) -> None:
+                 still_attached: Callable[[], bool] = always_attached,
+                 spawn: Callable[[Callable[[], None]], None] = _spawn_daemon) -> None:
         self.session_id = uuid  # the claim's session; moves to the new one when a /clear or /resume in the tab moves it
         self._config_dir = config_dir
         self._still_attached = still_attached  # the owner's check that the tab's claim is still held (the CLI runs)
@@ -69,9 +125,17 @@ class AttachedSession(AgentSession):
         self._cwd = cwd
         self._emit = sink
         self._logger = logger
+        self._clock = clock
+        self._spawn = spawn  # starts the restore thread after an Escape
         self._pane_id = pane
-        self._pane = TmuxPane(socket, pane, run=run)
+        self._pane = TmuxPane(socket, pane, run=run, clock=clock)
         self._open = False
+        self._pasted: tuple[str, int] | None = None  # the last paste and its turn's gen, until an Escape takes it
+        self._paste_seq = 0  # counts the pastes: a restore is for the one it was started after
+        self._restores = 0  # the restore threads running; guarded by _restores_idle, which stop() waits on
+        self._restores_idle = threading.Condition()  # notified each time a restore ends
+        self._stopped = False  # set by stop(), under _keys: no restore starts after it
+        self._abandoned = False  # set by stop() when a restore outlived its wait: no further key is pressed
         self._keys = threading.Lock()  # the paste and an Escape never interleave: an Escape waits for the Enter of the paste
         self._turns = TranscriptTurns(config_dir=config_dir, cwd=cwd, session_id=uuid,
                                       translator=ClaudeTranslator(cwd=cwd), emit=sink, log=logger.log,
@@ -91,8 +155,19 @@ class AttachedSession(AgentSession):
                                   cwd=self._cwd, resumed=True))
 
     def stop(self, grace: float = 5.0) -> int | None:
-        """Closes the transcript follow (its final drain runs first). Sends no key: the CLI in the pane keeps running.
-        Returns None, as there is no process of this session to report a code for."""
+        """Stops any restore from starting, then waits up to RESTORE_JOIN_SECONDS for the running ones. A restore still
+        running when the wait ends is abandoned and logged: it presses no further key, so the next turn's paste cannot
+        meet its keys. Then closes the transcript follow (its final drain runs first). Sends no key: the CLI keeps
+        running in the pane. Returns None, as there is no process of this session to report a code for."""
+        with self._keys:  # an Escape in flight finishes first: the restore it starts is then one of those waited for
+            self._stopped = True
+        with self._restores_idle:  # outside _keys: a restore's clear holds _keys while it types
+            idle = self._restores_idle.wait_for(lambda: self._restores == 0, timeout=RESTORE_JOIN_SECONDS)
+        if not idle:
+            # a plain flag, not under _keys: a clear in flight stops at its next key instead of at its end
+            self._abandoned = True
+            self._logger.log(f"terminal: tmux pane {self._pane_id}: the restore after the Escape did not finish in "
+                             f"{RESTORE_JOIN_SECONDS:g} s: abandoned, no further key is pressed")
         self._turns.mark_ending()
         self._turns.close()
         self._open = False
@@ -132,6 +207,9 @@ class AttachedSession(AgentSession):
         armed = self._turns.follow_turn(gen, primary, follows)
         with self._keys:
             pasted = self._pane.paste(text)
+            if pasted:
+                self._paste_seq += 1
+                self._pasted = (text, gen)
         if not pasted:
             self._logger.log(f"message not pasted into tmux pane {self._pane_id}")
             self._turns.finish(gen, error=UNREACHABLE_ERROR)
@@ -174,12 +252,108 @@ class AttachedSession(AgentSession):
                                   resumed=True))
 
     def interrupt(self) -> bool:
-        """Escape in the pane. The interrupt line of the transcript, or else the fallback, ends the turn as INTERRUPTED."""
+        """Escape in the pane. The interrupt line of the transcript, or else the fallback, ends the turn as INTERRUPTED.
+        The Escape may start a restore of the message pasted for the interrupted turn (_press_escape)."""
         return self._turns.interrupt(self._press_escape)
 
     def _press_escape(self) -> bool:
+        """Presses Escape under _keys. The restore's target is decided before the Escape (_restore_target): the
+        transcript may close the turn while the Escape is in flight, and the restore still starts when the Escape was
+        sent. The restore thread starts before _keys is released, so no paste comes in between. The target is taken
+        once: a second Escape starts no second restore for the same paste."""
         with self._keys:
-            return self._pane.escape()
+            target = self._restore_target()
+            if not self._pane.escape():
+                return False
+            self._pasted = None
+            if target is not None:
+                self._start_restore(*target)
+            return True
+
+    def _restore_target(self) -> tuple[str, int] | None:
+        """The paste an Escape now would restore: (text, seq) of the last paste while its turn is still open and
+        stop() has not begun, else None. Called under _keys."""
+        if self._stopped or self._pasted is None or not self._turns.is_open(self._pasted[1]):
+            return None
+        return self._pasted[0], self._paste_seq
+
+    def _start_restore(self, text: str, seq: int) -> None:
+        """Starts the restore thread for the paste seq, under _keys. The running count goes up before the spawn, so
+        stop() waits for the restore. A spawn that raises is logged and the count goes back down at once; nothing is
+        raised to the Escape's caller."""
+        with self._restores_idle:
+            self._restores += 1
+        try:
+            self._spawn(lambda: self._clear_restored(text, seq))
+        except Exception as exc:
+            self._restore_ended()
+            self._logger.log(f"terminal: tmux pane {self._pane_id}: could not start the restore after the Escape: "
+                             f"{exc}")
+
+    def _restore_ended(self) -> None:
+        """Counts one restore as over and wakes stop() when none is left."""
+        with self._restores_idle:
+            self._restores -= 1
+            self._restores_idle.notify_all()
+
+    def _clear_restored(self, text: str, seq: int) -> None:
+        """Restore thread, after the bridge's Escape; seq is the paste it was started for. For RESTORE_WAIT_SECONDS it
+        reads the input box. While the CLI works the window is pushed on, but never past RESTORE_CAP_SECONDS after the
+        Escape. A box that holds the pasted text (is_restored) is emptied by _clear_box, unless a newer paste came
+        since; a box with other text is left as it is, since the user typed it. Once stop() has abandoned the restore
+        (_abandoned), the look ends and no key is pressed. The running count goes down when it returns, however it
+        ends. Nothing raised here leaves the thread: a failure is logged."""
+        try:
+            start = self._clock.monotonic()
+            deadline = start + RESTORE_WAIT_SECONDS
+            while True:
+                if self._abandoned:
+                    return
+                screen = self._pane.screen()
+                box = input_text(screen)
+                busy = working(screen)
+                now = self._clock.monotonic()
+                if busy:  # the CLI's answer may still put the message back, and no key is typed while it works: wait
+                    deadline = min(now + RESTORE_WAIT_SECONDS, start + RESTORE_CAP_SECONDS)
+                if box:
+                    if not is_restored(box, text):
+                        self._logger.log(f"terminal: tmux pane {self._pane_id} holds other text after the Escape; "
+                                         "left as is")
+                        return
+                    if not busy:
+                        self._clear_box(box, text, seq)
+                        return
+                if now >= deadline:
+                    return
+                self._clock.sleep(RESTORE_POLL_SECONDS)
+        except Exception as exc:  # the restore is best effort: a failure is logged, the owner's thread is not affected
+            self._logger.log(f"terminal: tmux pane {self._pane_id}: restoring the message after the Escape failed: "
+                             f"{exc}")
+        finally:
+            self._restore_ended()
+
+    def _owned_by(self, text: str) -> Callable[[str], bool]:
+        """The owned check of clear_input for the pasted text: a box that still holds it (or a part of it) may be
+        cleared, unless stop() abandoned the restore. Called under _keys, so it takes no lock."""
+        return lambda shown: not self._abandoned and _still_ours(shown, text)
+
+    def _clear_box(self, box: str, text: str, seq: int) -> None:
+        """Empties the input box that holds the restored message, under _keys. Nothing is typed when a newer paste
+        (seq) came since: the box is that paste's then. Each key checks the box again (_still_ours, in clear_input): a
+        box that changed to other text gets no further key, and neither does a restore that stop() abandoned
+        (_abandoned, read there as a plain bool: this method already holds _keys). A clear that fails is tried once more
+        after one poll gap, and logged if it fails again."""
+        with self._keys:
+            if self._paste_seq != seq:
+                return
+            rounds = box.count("\n") + text.count("\n") + 2  # input_text drops blank lines: the box may hold more rows
+            cleared = self._pane.clear_input(rounds, owned=self._owned_by(text))
+            if not cleared:
+                self._clock.sleep(RESTORE_POLL_SECONDS)
+                cleared = self._pane.clear_input(rounds, owned=self._owned_by(text))
+        outcome = "cleared the message the CLI put back after the Escape" if cleared else \
+            "could not clear the message the CLI put back after the Escape"
+        self._logger.log(f"terminal: tmux pane {self._pane_id}: {outcome}")
 
     def halt_turn(self) -> None:
         """A ⏹ tap or /stop: Escape in the pane, so the turn ends as interrupted. The session stays open for the next

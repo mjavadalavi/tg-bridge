@@ -7,14 +7,21 @@ run, a call that times out, a non-zero exit and an empty pane id are answers, no
 The pure functions at the end read a captured screen: input_empty (the input box holds no text), working (the CLI is busy,
 or a dialog of its own waits for a key), shows_cli (the screen is the CLI's: its box, or one of the states above) and idle
 (input box empty and not working: a message can be pasted now), and screen_reason (why it cannot be, as one REASON_ value).
+ready() and reason() read the screen with its colours (capture-pane -e) through plain_screen: the CLI draws a prompt
+suggestion as faint (dim) text in the empty input box, and that text is dropped there, so it never reads as typed.
 A pane in a tmux mode (copy-mode) takes no keys for the app, so ready() is False there, and paste() leaves the mode first;
 reason() gives the same answer for the pane itself, with REASON_GONE and REASON_MODE too.
+input_text gives the text in the input box ('' when it is empty), and clear_input(rounds) empties that box with C-u and
+BSpace presses, and sends none while the screen has no box, the CLI works, or the owner's owned check refuses the box
+(the text the box holds is not the owner's to clear): after an Escape, the CLI puts the submitted message back into
+its box.
 
 Threads: none of its own; the owner calls it from its own thread. Lock map: none.
 """
 
+import re
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
 from tg_bridge.clock import Clock, SystemClock
@@ -32,12 +39,18 @@ BUSY_HINT = "esc to interrupt"    # the spinner line while a turn runs
 DIALOG_FOOTER = "Enter to confirm · Esc to cancel"  # a selection dialog of the CLI waits for a key
 TAIL_LINES = 6                    # without an input box, the busy hint and the dialog footer are looked for in the last lines
 SPINNER_ABOVE_BOX = 3             # with a box, the spinner line is looked for from this many lines above its top rule
+CLEAR_KEY_GAP_SECONDS = 0.2       # the TUI redraws the box between the keys of a clear
+CLEAR_ROUNDS_MAX = 20             # a clear never presses more than this many key pairs
 REASON_IDLE = "idle"              # a message can be pasted now
 REASON_BUSY = "busy"              # the CLI runs a turn (its spinner shows BUSY_HINT)
 REASON_DIALOG = "dialog"          # a selection dialog of the CLI waits for a key (its footer is DIALOG_FOOTER)
 REASON_TYPED = "typed"            # the input box holds text
 REASON_NO_CLI = "no-cli"          # the screen has no input box of the CLI
 REASON_MODE = "mode"              # the pane is in a tmux mode (copy-mode): keys do not reach the app
+ESCAPE = re.compile(r"\x1b\[([0-9;:]*)([A-Za-z])")  # a CSI sequence of capture-pane -e; only SGR ('m') sets the style
+FAINT_ON = "2"                    # SGR faint, the style of the CLI's prompt suggestion
+FAINT_OFF = ("", "0", "22")       # SGR reset, and normal intensity (ends bold and faint)
+EXTENDED_COLOUR = ("38", "48", "58")  # SGR colour introducers (text, background, underline): their arguments follow
 REASON_GONE = "gone"              # tmux does not show the pane
 
 
@@ -68,6 +81,11 @@ class TmuxPane:
         """The pane's visible text, one line per row. '' when tmux cannot show it."""
         return self._call(["capture-pane", "-p", "-t", self._pane]) or ""
 
+    def screen(self) -> str:
+        """The pane's text as capture shows it, without the faint prompt suggestion in the input box (plain_screen). ''
+        when tmux cannot show it."""
+        return plain_screen(self._call(["capture-pane", "-p", "-e", "-t", self._pane]) or "")
+
     def paste(self, text: str) -> bool:
         """Leaves a tmux mode first (copy-mode would take the keys), pastes text as a bracketed paste (the TUI takes it as
         typed text; -r keeps the newlines, which tmux would otherwise turn into carriage returns), waits paste_gap, then
@@ -87,7 +105,7 @@ class TmuxPane:
 
     def ready(self) -> bool:
         """True when a message can be pasted into the pane now: it exists, it is in no tmux mode, and its screen is idle."""
-        return self.exists() and not self.in_mode() and idle(self.capture())
+        return self.exists() and not self.in_mode() and idle(self.screen())
 
     def reason(self) -> str:
         """Why a message cannot be pasted into the pane now, one of the REASON_ values; REASON_IDLE when it can. The pane
@@ -96,11 +114,36 @@ class TmuxPane:
             return REASON_GONE
         if self.in_mode():
             return REASON_MODE
-        return screen_reason(self.capture())
+        return screen_reason(self.screen())
 
     def escape(self) -> bool:
         """Presses Escape in the pane (the CLI's interrupt key)."""
         return self._call(["send-keys", "-t", self._pane, "Escape"]) is not None
+
+    def clear_input(self, rounds: int, owned: Callable[[str], bool] | None = None) -> bool:
+        """Empties the input box: C-u (clears the line the cursor is on), then BSpace (joins an empty line to the one
+        above), up to min(max(rounds, 1), CLEAR_ROUNDS_MAX) key pairs, a redraw gap after each key. True at once when
+        the box is empty already. False in a tmux mode, when the screen has no input box or the CLI is working (no key
+        is sent then), when owned is given and refuses the box text (input_text of the screen read just before the key;
+        no key is sent then), when a key cannot be sent, or when the box is still not empty after the last round. The
+        screen is read once before the first key and once after each key: that read is the check before the next key,
+        the owned check and the emptiness check."""
+        screen = self.screen()
+        if input_empty(screen):
+            return True
+        if self.in_mode():
+            return False
+        for _ in range(min(max(rounds, 1), CLEAR_ROUNDS_MAX)):
+            for key in ("C-u", "BSpace"):
+                if not _editable(screen) or (owned is not None and not owned(input_text(screen))):
+                    return False
+                if self._call(["send-keys", "-t", self._pane, key]) is None:
+                    return False
+                self._clock.sleep(CLEAR_KEY_GAP_SECONDS)
+                screen = self.screen()
+                if input_empty(screen):
+                    return True
+        return False
 
     def exists(self) -> bool:
         """True when tmux shows the pane under its id."""
@@ -132,6 +175,48 @@ def _is_rule(line: str) -> bool:
     return line.strip().startswith(RULE * RULE_MIN_RUN)
 
 
+def plain_screen(escaped: str) -> str:
+    """The text of a screen captured with its escape sequences, the sequences removed. On a prompt line (one that starts
+    with the prompt glyph) the faint text is dropped too: the CLI shows its prompt suggestion there, in faint, while the
+    box is empty. Faint text on any other line is kept."""
+    return "\n".join(_plain_line(line) for line in escaped.split("\n"))
+
+
+def _plain_line(line: str) -> str:
+    plain = ESCAPE.sub("", line)
+    if not plain.lstrip().startswith(PROMPT):
+        return plain
+    kept, faint, at = [], False, 0
+    for match in ESCAPE.finditer(line):
+        if not faint:
+            kept.append(line[at:match.start()])
+        at = match.end()
+        if match.group(2) == "m":
+            faint = _faint_after(match.group(1), faint)
+    if not faint:
+        kept.append(line[at:])
+    return "".join(kept)
+
+
+def _faint_after(params: str, faint: bool) -> bool:
+    """The faint state after one SGR sequence, given its parameters (the text between ESC[ and m). A colour introducer
+    (38, 48, 58) is followed by its arguments, 5 and n or 2 and r, g, b, which are skipped: a '2' among them is no
+    faint. A parameter with ':' (the colon form of a colour) is one unit that changes nothing."""
+    items = params.split(";")
+    index = 0
+    while index < len(items):
+        item = items[index]
+        if item in EXTENDED_COLOUR:
+            index += {"5": 3, "2": 5}.get(items[index + 1] if index + 1 < len(items) else "", 1)
+            continue
+        if item == FAINT_ON:
+            faint = True
+        elif item in FAINT_OFF:
+            faint = False
+        index += 1
+    return faint
+
+
 def _blank(text: str) -> bool:
     return not text.replace(NBSP, " ").strip()
 
@@ -145,30 +230,57 @@ def _last_lines(screen: str, count: int) -> list[str]:
 
 
 def _input_box(lines: list[str]) -> tuple[int, int] | None:
-    """The (top, bottom) rule rows of the input box: the last two rules, with a prompt line between them. None when the
+    """The (top, bottom) rule rows of the input box: the last two rules, with a prompt row between them. None when the
     screen has no such box."""
     rules = [index for index, line in enumerate(lines) if _is_rule(line)]
     if len(rules) < 2:
         return None
     top, bottom = rules[-2], rules[-1]
-    if not any(lines[index].lstrip().startswith(PROMPT) for index in range(top + 1, bottom)):
+    if _prompt_row(lines, top, bottom) is None:
         return None
     return top, bottom
 
 
+def _prompt_row(lines: list[str], top: int, bottom: int) -> int | None:
+    """The index of the prompt row inside the box (between its rules): the last row that starts with the glyph at
+    column 0, since the CLI draws the prompt there and indents the rows below it. A restored message may hold a line
+    that starts with the glyph, indented: that row is text. Only when no row starts at column 0 is the last row whose
+    stripped start is the glyph taken (an indented prompt). None when neither exists."""
+    rows = range(top + 1, bottom)
+    at_column_0 = [index for index in rows if lines[index].startswith(PROMPT)]
+    if at_column_0:
+        return at_column_0[-1]
+    indented = [index for index in rows if lines[index].lstrip().startswith(PROMPT)]
+    return indented[-1] if indented else None
+
+
 def input_empty(screen: str) -> bool:
     """True when the input box of the CLI holds no text. The box is the text between the last two horizontal rules; its
-    prompt line is the last line starting with the glyph, and any line below the prompt, up to the bottom rule, counts
-    as text too. No box on the screen is not empty: the screen is not an idle prompt then."""
+    prompt row is _prompt_row, and any row below the prompt, up to the bottom rule, counts as text too. No box on the
+    screen is not empty: the screen is not an idle prompt then."""
     lines = screen.splitlines()
     box = _input_box(lines)
     if box is None:
         return False
     top, bottom = box
-    prompts = [index for index in range(top + 1, bottom) if lines[index].lstrip().startswith(PROMPT)]
-    first = prompts[-1]
+    first = _prompt_row(lines, top, bottom)
     typed = lines[first].lstrip()[len(PROMPT):]
     return _blank(typed) and all(_blank(line) for line in lines[first + 1:bottom])
+
+
+def input_text(screen: str) -> str:
+    """The text in the input box of the CLI, '' when there is no box or it is empty. The text starts after the glyph of
+    the prompt row (_prompt_row, as in input_empty) and runs over the rows below it, up to the bottom rule. Each row is
+    stripped (NBSP counts as a space) and blank rows are dropped; the rest are joined with newlines."""
+    lines = screen.splitlines()
+    box = _input_box(lines)
+    if box is None:
+        return ""
+    top, bottom = box
+    first = _prompt_row(lines, top, bottom)
+    parts = [lines[first].lstrip()[len(PROMPT):], *lines[first + 1:bottom]]
+    kept = [part.replace(NBSP, " ").strip() for part in parts]
+    return "\n".join(line for line in kept if line)
 
 
 def _scanned(screen: str) -> list[str]:
@@ -193,6 +305,11 @@ def shows_cli(screen: str) -> bool:
 def idle(screen: str) -> bool:
     """True when a message can be pasted now: the input box is empty and the CLI is not working."""
     return input_empty(screen) and not working(screen)
+
+
+def _editable(screen: str) -> bool:
+    """True when the screen shows the CLI's input box and the CLI is not working: keys can clear that box."""
+    return _input_box(screen.splitlines()) is not None and not working(screen)
 
 
 def screen_reason(screen: str) -> str:

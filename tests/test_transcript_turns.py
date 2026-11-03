@@ -69,6 +69,14 @@ class TranscriptTurnsTests(unittest.TestCase):
                                      deny_requests=self.deny)
         self.addCleanup(self.turns.close)
 
+    def test_is_open_only_for_the_current_turn_until_it_ends(self) -> None:
+        gen, _primary, _follows = self.turns.begin()
+        self.assertTrue(self.turns.is_open(gen))
+        self.assertFalse(self.turns.is_open(gen + 1))
+        self.turns.on_transcript(0, echo_line("hello"))
+        self.turns.on_transcript(0, TURN_DURATION_LINE)
+        self.assertFalse(self.turns.is_open(gen))
+
     def deny(self, reason: str, *, main_only: bool = False) -> list[str]:
         self.denied.append((reason, main_only))
         return []
