@@ -34,6 +34,7 @@ from tg_bridge.daemon.panes import Panes
 from tg_bridge.daemon.permission_hook import run_hook_client
 from tg_bridge.daemon.session_hook import run_session_start_hook
 from tg_bridge.daemon.view_delete import request_topic_delete, show_in_tmux
+from tg_bridge.daemon.code_watch import RESTART_STATUS, CodeWatch, reexec
 from tg_bridge.daemon.view_pane import run_topic_pane
 from tg_bridge.daemon.viewer import Viewer, attach, run_sync
 from tg_bridge.logging_ import Logger
@@ -222,11 +223,16 @@ def open_view(paths: Paths) -> int:
 
 def view_topic_pane(paths: Paths, thread: str) -> int:
     """`view-pane <thread>`: the pane of one topic's window (the ready, claude and busy screens). A thread that is not a
-    number is usage."""
+    number is usage. When the tg_bridge code on disk changes, the pane execs itself again on it (daemon/code_watch)."""
     if not thread.isdigit():
         print(VIEW_THREAD_NOT_A_NUMBER.format(thread=thread), file=sys.stderr)
         return 1
-    return run_topic_pane(paths, int(thread), lambda: load_config(paths))
+    clock = SystemClock()
+    status = run_topic_pane(paths, int(thread), lambda: load_config(paths), clock=clock,
+                            code_changed=CodeWatch(clock).changed)
+    if status == RESTART_STATUS:
+        reexec()
+    return status
 
 
 def view_delete_topic(paths: Paths, thread: str, environ: Mapping[str, str], clock: Clock,

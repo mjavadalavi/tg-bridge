@@ -33,7 +33,6 @@ this module writes to the terminal.
 
 import contextlib
 import errno
-import itertools
 import os
 import select
 import signal
@@ -42,7 +41,7 @@ import subprocess
 import sys
 import termios
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -56,8 +55,9 @@ from tg_bridge.core import terminal_claim
 from tg_bridge.core.topic_key import topic_cwd, topic_launcher, topic_mode, topic_model
 from tg_bridge.core.turn_text import TIMEZONE
 from tg_bridge.core.view_recorder import FEED_SUFFIX
+from tg_bridge.daemon.code_watch import RESTART_STATUS
 from tg_bridge.daemon.view_launcher import CHOICE_HINT_LINE, choice_line, claude_choices, switch_launcher
-from tg_bridge.daemon.viewer import FOLLOW_SECONDS, Follower
+from tg_bridge.daemon.viewer import FOLLOW_SECONDS, Follower, rounds
 from tg_bridge.paths import Paths
 from tg_bridge.store.sessions import SessionRecord
 
@@ -424,19 +424,22 @@ class ViewPane:
 def run_topic_pane(paths: Paths, thread_id: int, load: Callable[[], Config], out: TextIO | None = None,
                    clock: Clock = SystemClock(), stop_after: int | None = None, stdin: TextIO | None = None,
                    keys: KeySource | None = None, run: RunChild | None = None, switch: SwitchFn | None = None,
-                   new_uuid: Callable[[], str] | None = None) -> int:
+                   new_uuid: Callable[[], str] | None = None, code_changed: Callable[[], bool] | None = None) -> int:
     """view-pane <thread>: runs the pane until its window closes. out is stdout when omitted; stdin (stdin when omitted)
-    is the terminal the keys come from when it is one, and the keys argument replaces it when given. run replaces the
-    CLI runner and switch the launcher change (tests; the default is view_launcher.switch_launcher), new_uuid the
-    session id a fresh topic starts with (tests; the default is uuid4). stop_after rounds
-    (for tests) end the loop. Returns 0."""
+    is the terminal the keys come from, unless keys is given. Tests replace run (the CLI runner), switch (the launcher
+    change, default view_launcher.switch_launcher), new_uuid (a fresh topic's session id, default uuid4) and stop_after
+    (the rounds before the loop ends). code_changed (daemon/code_watch) is asked before each round, when no CLI runs:
+    True ends the pane with RESTART_STATUS and the terminal restored, so the caller execs it on the new code. Returns 0
+    otherwise."""
     terminal = _Terminal(sys.stdin if stdin is None else stdin)
     source = keys if keys is not None else (
         _TerminalKeys(terminal.fd) if terminal.fd is not None else _Unattended(clock))
     pane = ViewPane(paths, thread_id, load, sys.stdout if out is None else out, clock, source, run, switch, new_uuid)
     try:
         terminal.raw()
-        for _ in _rounds(stop_after):
+        for _ in rounds(stop_after):
+            if code_changed is not None and code_changed():
+                return RESTART_STATUS
             busy, topic = pane.show()
             pane.handle_key(source.read(FOLLOW_SECONDS), busy, topic, terminal)
     except InputClosed:  # the terminal is gone: no key comes again, so the pane ends instead of spinning on it
@@ -444,7 +447,3 @@ def run_topic_pane(paths: Paths, thread_id: int, load: Callable[[], Config], out
     finally:
         terminal.cooked()
     return 0
-
-
-def _rounds(stop_after: int | None) -> Iterable[int]:
-    return itertools.count() if stop_after is None else range(stop_after)

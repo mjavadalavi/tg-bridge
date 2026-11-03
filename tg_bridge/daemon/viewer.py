@@ -241,7 +241,7 @@ def run_sync(paths: Paths, load: Callable[[], Config], clock: Clock, stop_after:
     once. One Viewer serves every round, so each window is set to follow the terminal once for the whole run. Returns 0."""
     viewer = Viewer(paths, load(), run)
     try:
-        for _ in _rounds(stop_after):
+        for _ in rounds(stop_after):
             for window in viewer.sync_windows():
                 print(SYNC_ADDED.format(window=window), flush=True)
             clock.sleep(SYNC_SECONDS)
@@ -259,7 +259,7 @@ def run_pane(paths: Paths, thread_id: int, out: TextIO | None = None, clock: Clo
     name = dict(list_topics(paths) or []).get(thread_id, str(thread_id))
     with _quiet_terminal(sys.stdin if stdin is None else stdin) as fd:
         try:
-            for _ in _rounds(stop_after):
+            for _ in rounds(stop_after):
                 if fd is not None:
                     _drop_input(fd)  # unread input is dropped, never piles up
                 follower.tick(name)
@@ -408,6 +408,6 @@ def _read_meta(path: str) -> dict | None:
     return meta if isinstance(meta, dict) else None
 
 
-def _rounds(stop_after: int | None) -> Iterable[int]:
+def rounds(stop_after: int | None) -> Iterable[int]:
     """The loop counter: endless when stop_after is None, else stop_after rounds (for tests)."""
     return itertools.count() if stop_after is None else range(stop_after)

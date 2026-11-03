@@ -25,6 +25,7 @@ from tg_bridge.config import Config
 from tg_bridge.core import terminal_claim
 from tg_bridge.core.turn_text import TIMEZONE
 from tg_bridge.core.view_recorder import FEED_SUFFIX, META_SUFFIX
+from tg_bridge.daemon.code_watch import RESTART_STATUS
 from tg_bridge.daemon.view_launcher import CHOICE_HINT_LINE, switch_launcher
 from tg_bridge.daemon.view_pane import (
     BUSY_LINE,
@@ -654,3 +655,21 @@ class SwitchTests(PaneCase):
         self.make_topic(uuid="")
         self.pane([b"2", ENTER], rounds=2)
         self.assertEqual([child["kind"] for child in self.children()], ["claude-alt"])
+
+
+class CodeChangeTests(PaneCase):
+    def run_pane(self, changed: list[bool], rounds: int) -> tuple[int, int]:
+        """The pane's status and how often code_changed was asked."""
+        asked = []
+        answers = iter(changed)
+        self.make_topic()
+        status = run_topic_pane(self.paths, THREAD, self.make_config, out=io.StringIO(), clock=FakeClock(),
+                                stop_after=rounds, stdin=io.StringIO(), keys=ScriptedKeys([]),
+                                code_changed=lambda: asked.append(1) or next(answers))
+        return status, len(asked)
+
+    def test_changed_code_ends_the_pane_with_the_restart_status(self) -> None:
+        self.assertEqual(self.run_pane([False, True, False], rounds=3), (RESTART_STATUS, 2))
+
+    def test_unchanged_code_keeps_the_pane_running(self) -> None:
+        self.assertEqual(self.run_pane([False, False, False], rounds=3), (0, 3))
