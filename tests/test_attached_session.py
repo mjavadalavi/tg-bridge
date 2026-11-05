@@ -15,9 +15,10 @@ from tests.support import TempHome
 from tests.turn_support import wait_until
 from tg_bridge.agents.base import AttachSpec, SessionSpec, TerminalNotReady
 from tg_bridge.agents.claude import attached_session, history
-from tg_bridge.agents.claude.attached_session import (ATTACHED_CAPABILITIES, RESTORE_CAP_SECONDS, RESTORE_JOIN_SECONDS,
-                                                     RESTORE_POLL_SECONDS, RESTORE_WAIT_SECONDS, UNREACHABLE_ERROR,
-                                                     AttachedSession, _still_ours, is_restored, pane_reason)
+from tg_bridge.agents.claude.attached_session import (ATTACHED_CAPABILITIES, ESCAPE_REPEAT_SECONDS, RESTORE_CAP_SECONDS,
+                                                     RESTORE_JOIN_SECONDS, RESTORE_POLL_SECONDS, RESTORE_WAIT_SECONDS,
+                                                     UNREACHABLE_ERROR, AttachedSession, _still_ours, is_restored,
+                                                     pane_reason)
 from tg_bridge.agents.claude.tmux_pane import (CLEAR_KEY_GAP_SECONDS, REASON_GONE, REASON_IDLE, REASON_TYPED,
                                                input_empty)
 from tg_bridge.agents.claude.transcript_turns import ATTACH_QUEUED_MAX_SECONDS, ATTACH_RELOCATE_SECONDS
@@ -65,11 +66,13 @@ class BlockingClock:
 class FakeTmux:
     """Stands in for tmux. display-message answers with the pane id, capture-pane with screen, and paste-buffer runs on_paste
     (the CLI writing its echo and answer). send-keys records its key in keys_sent and runs on_keys(key), which may
-    change the screen. The subcommands named in fail exit 1."""
+    change the screen. The first Escape also puts after_escape up (the CLI stops working once it is interrupted). The
+    subcommands named in fail exit 1."""
 
     def __init__(self, *, screen: str = CLI_BOX, fail: tuple[str, ...] = (), on_paste=None, on_keys=None) -> None:
         self.pane_shown = PANE  # the pane tmux shows under this id; another id means the pane is gone
         self.screen = screen
+        self.after_escape: str | None = None  # the screen once an Escape is sent; None keeps the screen
         self.fail = fail
         self.on_paste = on_paste
         self.on_keys = on_keys
@@ -91,6 +94,8 @@ class FakeTmux:
             self.on_paste()
         elif sub == "send-keys":
             self.keys_sent.append(args[-1])
+            if args[-1] == "Escape" and self.after_escape is not None:
+                self.screen, self.after_escape = self.after_escape, None
             if self.on_keys is not None:
                 self.on_keys(args[-1])
         return subprocess.CompletedProcess(args, 0, out, "")
@@ -402,6 +407,7 @@ class AttachedSessionTests(unittest.TestCase):
     def test_interrupt_presses_escape_in_the_pane(self) -> None:
         session = self.make()
         session.start()
+        self.tmux.screen = busy_screen("")  # the CLI works: its spinner shows
         self.assertTrue(session.interrupt())
         self.assertEqual(self.tmux.calls[-1], ("send-keys", None))
 
@@ -412,9 +418,9 @@ class AttachedSessionTests(unittest.TestCase):
 
     def paste_then_escape_with_the_turn_open(self, screen: str, *, text: str = "hello", clock=None,
                                              spawn=None) -> tuple[AttachedSession, int]:
-        """Pastes text while the CLI has not answered, then puts screen up as the box after the Escape. Returns the
-        session and the count of keys sent before the interrupt. clock and spawn are the session's (the RestoreClock
-        and the deferred spawn by default)."""
+        """Pastes text while the CLI has not answered; the CLI works (busy_screen) until the Escape, and shows screen
+        once the Escape is sent. Returns the session and the count of keys sent before the interrupt.
+        clock and spawn are the session's (the RestoreClock and the deferred spawn by default)."""
         self.tmux.on_paste = None  # the CLI answers later: the Escape comes while the turn is open
         self.tmux.on_keys = self.ctrl_u_clears_the_line
         self.clock = clock if clock is not None else RestoreClock()
@@ -422,7 +428,8 @@ class AttachedSessionTests(unittest.TestCase):
         session = self.make(spawn=spawn)
         session.start()
         session.send_user(text)
-        self.tmux.screen = screen
+        self.tmux.screen = busy_screen("")  # an Escape is pressed only while the CLI works
+        self.tmux.after_escape = screen
         return session, len(self.tmux.keys_sent)
 
     def test_interrupt_after_a_paste_empties_the_message_the_cli_put_back(self) -> None:
@@ -465,6 +472,7 @@ class AttachedSessionTests(unittest.TestCase):
         session = self.make()
         session.start()
         session.send_user("hello")
+        self.tmux.screen = busy_screen("")  # the CLI works, so the first Escape is pressed
 
         self.assertTrue(session.interrupt())
         self.assertTrue(session.interrupt())  # the paste's restore is taken by the first Escape
@@ -475,6 +483,7 @@ class AttachedSessionTests(unittest.TestCase):
         self.addCleanup(self.clock.release.set)
         session = self.make()
         session.start()
+        self.tmux.screen = busy_screen("")
 
         self.assertTrue(session.interrupt())
         self.assertEqual(self.tmux.keys_sent, ["Escape"])
@@ -485,6 +494,7 @@ class AttachedSessionTests(unittest.TestCase):
         session = self.make()
         session.start()
         session.send_user("hello")
+        self.tmux.screen = busy_screen("")
         self.tmux.fail = ("send-keys",)  # the Escape cannot be sent
 
         self.assertFalse(session.interrupt())
@@ -497,7 +507,7 @@ class AttachedSessionTests(unittest.TestCase):
         session.start()
         session.send_user("hello")
         self.wait_for_result()
-        self.tmux.screen = box_screen("hello")
+        self.tmux.screen = busy_screen("hello")  # a turn of the tab's own, still working, with the text in its box
         typed = len(self.tmux.keys_sent)
 
         self.assertTrue(self.interrupt_and_restore(session))
@@ -517,12 +527,148 @@ class AttachedSessionTests(unittest.TestCase):
                 handle.write(json.dumps(line) + "\n")
         self.assertTrue(wait_until(lambda: any(isinstance(e, TurnBegan) for e in self.events)),
                         "the tab's own turn did not begin")
-        self.tmux.screen = box_screen("hello")
+        self.tmux.screen = busy_screen("hello")  # still working, the text in the box
         typed = len(self.tmux.keys_sent)
 
         self.assertTrue(self.interrupt_and_restore(session))
         self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"])
         self.assertEqual(self.restores, [])
+
+    def paste_on_an_idle_cli(self, clock) -> AttachedSession:
+        """Pastes hello into the idle CLI, with clock as the session's clock. The CLI has not answered, so the turn is
+        open; the screen is left to the test (the CLI's spinner shows or not)."""
+        self.tmux.on_paste = None
+        self.clock = clock
+        self.addCleanup(clock.release.set)
+        session = self.make()
+        session.start()
+        session.send_user("hello")
+        return session
+
+    def test_three_interrupts_within_three_seconds_during_one_paste_turn_press_escape_once(self) -> None:
+        """Three taps of ⏭ Now within two seconds during one turn: the first Escape interrupts it, and the next two
+        press nothing (one Escape per pasted message, and no second Escape within ESCAPE_REPEAT_SECONDS)."""
+        clock = RestoreClock()
+        session = self.paste_on_an_idle_cli(clock)
+        self.tmux.screen = busy_screen("")
+        typed = len(self.tmux.keys_sent)
+        waited = len(clock.sleeps)
+
+        self.assertEqual(session.interrupt(), True)
+        clock.advance(1.0)
+        self.assertEqual(session.interrupt(), True)
+        clock.advance(1.0)
+        self.assertEqual(session.interrupt(), True)
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"])
+        self.assertEqual(clock.sleeps[waited:], [], "an interrupt waited for the screen")
+
+    def test_an_idle_screen_during_the_paste_turn_still_gets_its_one_escape(self) -> None:
+        clock = RestoreClock()
+        session = self.paste_on_an_idle_cli(clock)  # the box is empty and no spinner shows: the CLI may not show it yet
+        typed = len(self.tmux.keys_sent)
+        waited = len(clock.sleeps)
+
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"], "the open paste turn got no Escape")
+        self.assertEqual(clock.sleeps[waited:], [])
+
+    def test_a_dialog_on_screen_gets_one_escape(self) -> None:
+        """A selection dialog of the CLI: the Escape cancels it, as it always did, and the turn ends."""
+        clock = RestoreClock()
+        session = self.paste_on_an_idle_cli(clock)
+        self.tmux.screen = CLI_BOX + "  Enter to confirm · Esc to cancel\n"
+        typed = len(self.tmux.keys_sent)
+        waited = len(clock.sleeps)
+
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"], "the dialog got no Escape")
+        self.assertEqual(clock.sleeps[waited:], [], "the dialog was waited for")
+
+    def test_a_new_paste_more_than_three_seconds_after_an_escape_gets_one_escape(self) -> None:
+        clock = RestoreClock()
+        session = self.paste_on_an_idle_cli(clock)
+        self.tmux.screen = busy_screen("")
+        self.assertTrue(session.interrupt())
+        self.tmux.screen = CLI_BOX  # the CLI stopped: the next message can be pasted
+        clock.advance(ESCAPE_REPEAT_SECONDS)
+        session.send_user("again")
+        self.tmux.screen = busy_screen("")
+        typed = len(self.tmux.keys_sent)
+
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"], "the new message got no Escape of its own")
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"], "the new message got a second Escape")
+
+    def test_a_paste_within_three_seconds_of_an_escape_gets_one_escape_and_a_repeat_presses_nothing(self) -> None:
+        """Escape interrupts turn A, then message B is pasted 1 s later (inside ESCAPE_REPEAT_SECONDS). B's first interrupt
+        presses one Escape: the paste lifts the throttle of A's Escape. A second interrupt right after presses nothing."""
+        clock = RestoreClock()
+        session = self.paste_on_an_idle_cli(clock)  # paste A
+        self.tmux.screen = busy_screen("")
+        self.assertTrue(session.interrupt())  # Escape for A
+        self.tmux.screen = CLI_BOX  # the CLI stopped: B can be pasted
+        clock.advance(1.0)
+        session.send_user("again")  # paste B, within 3 s of the Escape
+        self.tmux.screen = busy_screen("")
+        typed = len(self.tmux.keys_sent)
+
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"], "turn B got no Escape of its own")
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"], "a repeat tap on turn B pressed a second Escape")
+
+    def test_a_failed_escape_returns_false(self) -> None:
+        session = self.paste_on_an_idle_cli(RestoreClock())
+        self.tmux.screen = busy_screen("")
+        self.tmux.fail = ("send-keys",)
+
+        self.assertFalse(session.interrupt())
+
+    def test_a_turn_the_tab_started_takes_one_escape_and_a_second_within_three_seconds_presses_nothing(self) -> None:
+        clock = RestoreClock()
+        self.clock = clock
+        self.addCleanup(clock.release.set)
+        session = self.make()
+        session.start()  # no paste in this session: the turn is the tab's own
+        self.tmux.screen = busy_screen("")
+        typed = len(self.tmux.keys_sent)
+
+        self.assertTrue(session.interrupt())
+        clock.advance(1.0)
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"], "a second Escape came within 3 s")
+        clock.advance(ESCAPE_REPEAT_SECONDS)
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape", "Escape"], "no Escape after the 3 s")
+
+    def test_a_tab_turn_after_an_escaped_paste_takes_one_escape_and_a_second_within_3_s_presses_nothing(self) -> None:
+        """The paste's own turn is over, and the tab then starts a turn of its own: the paste's Escape does not cover
+        it. Its first interrupt, more than three seconds after the last Escape, presses one Escape; a second one within
+        three seconds presses nothing."""
+        clock = RestoreClock()
+        session = self.paste_on_an_idle_cli(clock)
+        self.tmux.screen = busy_screen("")
+        self.assertTrue(session.interrupt())
+        self.cli_answers()  # the paste's turn ends
+        self.wait_for_result()
+        clock.advance(ESCAPE_REPEAT_SECONDS)  # the tab's turn is a later turn than the Escape
+        notification = {"type": "user", "origin": {"kind": "task-notification"},
+                        "message": {"role": "user", "content": "<task-notification><task-id>b1</task-id>"
+                                                               "</task-notification>"}}
+        with open(self.transcript, "a", encoding="utf-8") as handle:
+            for line in (notification, assistant_line("WORKING")):
+                handle.write(json.dumps(line) + "\n")
+        self.assertTrue(wait_until(lambda: any(isinstance(e, TurnBegan) for e in self.events)),
+                        "the tab's own turn did not begin")
+        self.tmux.screen = busy_screen("")
+        typed = len(self.tmux.keys_sent)
+
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"], "the tab's own busy turn got no Escape")
+        clock.advance(1.0)
+        self.assertTrue(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"], "a second Escape came within 3 s")
 
     def test_stop_waits_for_a_running_restore(self) -> None:
         """The restore thread waits at its first look (the box is empty). stop() returns only when that restore has
@@ -561,6 +707,8 @@ class AttachedSessionTests(unittest.TestCase):
         self.addCleanup(clock.gates["restore-1"].set)
         self.assertTrue(session.interrupt())  # restore-1 waits at its first look
         session.send_user("hello")  # a new paste while that window is open
+        self.clock.advance(ESCAPE_REPEAT_SECONDS)  # the second Escape is more than 3 s after the first
+        self.tmux.screen = busy_screen("")  # the CLI works on it
         self.assertTrue(session.interrupt())  # the second Escape starts restore-2 for it
         self.assertEqual(session._restores, 2)
 
@@ -720,12 +868,12 @@ class AttachedSessionTests(unittest.TestCase):
         self.assertEqual(self.tmux.keys_sent[typed:], ["Escape", "C-u"])
         self.assertTrue(input_empty(self.tmux.screen), "the message put back is still in the box")
 
-    def test_an_escape_after_stop_starts_no_restore_but_is_still_pressed(self) -> None:
+    def test_an_interrupt_after_stop_presses_nothing_starts_no_restore_and_returns_false(self) -> None:
         session, typed = self.paste_then_escape_with_the_turn_open(box_screen("hello"))
         session.stop()
 
-        self.assertTrue(session.interrupt())
-        self.assertEqual(self.tmux.keys_sent[typed:], ["Escape"])
+        self.assertFalse(session.interrupt())
+        self.assertEqual(self.tmux.keys_sent[typed:], [], "an Escape was sent after stop()")
         self.assertEqual(self.restores, [])
 
     def test_stop_during_an_escape_in_flight_waits_for_the_restore_that_escape_starts(self) -> None:

@@ -2,10 +2,11 @@
 
 Nothing is spawned here. The CLI is the process of the terminal's own pane; this session types into that pane and reads
 the session's transcript. start() checks that the pane exists and reports the session as resumed. send_user() pastes the
-message into the pane (TmuxPane: bracketed paste, then Enter) and follows the transcript for the turn (TranscriptTurns: the
-echo line, the answer, the turn_duration). interrupt() presses Escape in the pane. The permissions are asked in the terminal
-itself, outside this process, so answer() is False. stop() closes the transcript follow and nothing else: the terminal's CLI
-is never signalled or typed into.
+message into the pane (TmuxPane: bracketed paste, then Enter) and follows the transcript for the turn (TranscriptTurns:
+the echo line, the answer, the turn_duration). interrupt() presses one Escape in the pane (_press_escape), by a rule
+that reads no screen: no Escape while one already covers the bridge's open turn, and none within ESCAPE_REPEAT_SECONDS
+of the last one (a new paste lifts that wait). The permissions are asked in the terminal itself, outside this process, so answer() is False. stop()
+closes the transcript follow and nothing else: the terminal's CLI is never signalled or typed into.
 
 The owner passes plain strings (the tmux socket, the pane id, the session uuid, the launcher's config folder, the topic's
 folder), never a core type. idle() tells the owner whether a message can be pasted now (TmuxPane.ready).
@@ -23,12 +24,19 @@ tab is never touched. The restore waits while the CLI works, up to RESTORE_CAP_S
 waits for the running ones (RESTORE_JOIN_SECONDS). A restore still running then is abandoned: it presses no further key,
 so the next turn's paste cannot meet its keys.
 
+An Escape is sent whatever the screen shows: a single Escape is harmless at an idle prompt, and it cancels a dialog of
+the CLI as it always did. Two Escapes close together are not: at an idle prompt the second opens the CLI's Rewind
+dialog. So the taps that follow are held back (_covered). One Escape covers the bridge's open paste turn: while that
+turn is open, no further Escape is sent for it. Whatever the turn, no Escape is sent within ESCAPE_REPEAT_SECONDS of the
+last one sent, unless a paste came after that Escape: the paste makes the CLI busy, so its turn is judged on its own.
+
 Threads: the transcript tail thread delivers the lines (TranscriptTurns); the owner's thread calls the methods, and an
 interrupt may come from another thread (the ⏹ tap). The restore thread (_clear_restored) starts after an Escape.
 Lock map: _keys serialises the keys typed into the pane (the paste, the Escape and the restore's clear). It guards
-_pasted, _paste_seq and _stopped, and the restore target is decided under it, before the Escape. _restores (the count
-of running restores) is guarded by _restores_idle, a Condition that stop() waits on outside _keys; _keys is taken first
-when both are held. _abandoned is set by stop() without _keys: a one-way flag that the restore reads before each key.
+_pasted, _paste_seq, _escaped_seq, _escaped_gen, _escaped_at and _stopped, and the restore target is decided under it,
+before the Escape. _restores (the count of running restores) is guarded by _restores_idle, a Condition that stop() waits
+on outside _keys; _keys is taken first when both are held. _abandoned is set by stop() without _keys: a one-way flag
+that the restore reads before each key.
 The turn state is TranscriptTurns' own. No lock is held while a turn is opened or followed.
 """
 
@@ -55,6 +63,7 @@ RESTORE_POLL_SECONDS = 0.25  # between two looks at the box while it is empty
 # stop() waits this long for the running restores, so the next paste cannot meet their keys. A restore still
 # running then is abandoned: it presses no further key.
 RESTORE_JOIN_SECONDS = 30.0
+ESCAPE_REPEAT_SECONDS = 3.0  # a turn with no paste of its own takes one Escape per this many seconds
 PASTED_PLACEHOLDER = re.compile(r"\[Pasted text #\d+(?: \+(\d+) lines)?\]")  # a long paste's box text (M: group 1)
 
 
@@ -132,6 +141,9 @@ class AttachedSession(AgentSession):
         self._open = False
         self._pasted: tuple[str, int] | None = None  # the last paste and its turn's gen, until an Escape takes it
         self._paste_seq = 0  # counts the pastes: a restore is for the one it was started after
+        self._escaped_seq = -1  # the _paste_seq an Escape was pressed for (-1: none yet)
+        self._escaped_gen = -1  # that paste's turn: its Escape covers the paste only while the turn is open
+        self._escaped_at: float | None = None  # monotonic time of the last Escape sent; None after a paste (send_user)
         self._restores = 0  # the restore threads running; guarded by _restores_idle, which stop() waits on
         self._restores_idle = threading.Condition()  # notified each time a restore ends
         self._stopped = False  # set by stop(), under _keys: no restore starts after it
@@ -210,6 +222,7 @@ class AttachedSession(AgentSession):
             if pasted:
                 self._paste_seq += 1
                 self._pasted = (text, gen)
+                self._escaped_at = None  # a paste is typed into a busy CLI: its own turn gets its Escape, not a repeat
         if not pasted:
             self._logger.log(f"message not pasted into tmux pane {self._pane_id}")
             self._turns.finish(gen, error=UNREACHABLE_ERROR)
@@ -252,23 +265,48 @@ class AttachedSession(AgentSession):
                                   resumed=True))
 
     def interrupt(self) -> bool:
-        """Escape in the pane. The interrupt line of the transcript, or else the fallback, ends the turn as INTERRUPTED.
-        The Escape may start a restore of the message pasted for the interrupted turn (_press_escape)."""
+        """Escape in the pane (_press_escape). The interrupt line of the transcript, or else the fallback, ends the turn
+        as INTERRUPTED. True when an Escape was sent, or one already covers the turn or was sent too recently to repeat;
+        False when the session is stopped or the Escape could not be sent. The Escape may start a restore of the
+        message pasted for the interrupted turn."""
         return self._turns.interrupt(self._press_escape)
 
     def _press_escape(self) -> bool:
-        """Presses Escape under _keys. The restore's target is decided before the Escape (_restore_target): the
-        transcript may close the turn while the Escape is in flight, and the restore still starts when the Escape was
-        sent. The restore thread starts before _keys is released, so no paste comes in between. The target is taken
-        once: a second Escape starts no second restore for the same paste."""
+        """Presses one Escape, by a rule that reads no screen. Under _keys: after stop(), nothing is sent and False is
+        returned. When an Escape already covers the bridge's open paste turn, or the last Escape of any kind was sent
+        less than ESCAPE_REPEAT_SECONDS ago (_covered), nothing is sent and True is returned. Otherwise the Escape is
+        sent (_send_escape), and its result is returned: False when the send-keys failed."""
         with self._keys:
-            target = self._restore_target()
-            if not self._pane.escape():
+            if self._stopped:
                 return False
-            self._pasted = None
-            if target is not None:
-                self._start_restore(*target)
+            if self._covered(self._clock.monotonic()):
+                return True
+            return self._send_escape()
+
+    def _covered(self, now: float) -> bool:
+        """True when an Escape already covers the turn, so none is sent: the Escape sent for the last paste while that
+        paste's turn is still open (one per pasted message), or an Escape of any kind sent less than
+        ESCAPE_REPEAT_SECONDS before now, with no paste since (a second Escape that soon could open the CLI's Rewind
+        dialog at an idle prompt; send_user clears the time at each paste). Called under _keys."""
+        if self._escaped_seq == self._paste_seq and self._turns.is_open(self._escaped_gen):
             return True
+        return self._escaped_at is not None and now - self._escaped_at < ESCAPE_REPEAT_SECONDS
+
+    def _send_escape(self) -> bool:
+        """Sends the Escape under _keys and records it for _covered. The restore's target is decided before the Escape
+        (_restore_target): the transcript may close the turn while the Escape is in flight, and the restore still starts
+        when the Escape was sent. The restore thread starts before _keys is released, so no paste comes in between. The
+        target is taken once: a second Escape starts no second restore for the same paste."""
+        target = self._restore_target()
+        if not self._pane.escape():
+            return False
+        if self._pasted is not None:
+            self._escaped_seq, self._escaped_gen = self._paste_seq, self._pasted[1]
+        self._escaped_at = self._clock.monotonic()
+        self._pasted = None
+        if target is not None:
+            self._start_restore(*target)
+        return True
 
     def _restore_target(self) -> tuple[str, int] | None:
         """The paste an Escape now would restore: (text, seq) of the last paste while its turn is still open and
@@ -356,8 +394,8 @@ class AttachedSession(AgentSession):
         self._logger.log(f"terminal: tmux pane {self._pane_id}: {outcome}")
 
     def halt_turn(self) -> None:
-        """A ⏹ tap or /stop: Escape in the pane, so the turn ends as interrupted. The session stays open for the next
-        message, and the terminal's CLI is never closed."""
+        """A ⏹ tap or /stop: interrupt(), which presses one Escape under the rule of _press_escape, so the turn ends as
+        interrupted. The session stays open for the next message, and the terminal's CLI is never closed."""
         self.interrupt()
 
     def answer(self, req: ApprovalRequest, decision: Decision, *, updated_input: dict | None = None,
