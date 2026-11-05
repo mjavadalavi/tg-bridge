@@ -358,6 +358,7 @@ class DispatcherQueueScenarios(DispatcherCase):
         self.deliver(self.ingest(1001), "x1")
         self.assertTrue(self.turns.started("x1").wait(WAIT))
         self.deliver(self.ingest(1002), "x2")
+        self.clock.advance(BURST_GAP_SECONDS + 1)  # x3 comes after the gap: it is no follower of x2
         third = self.deliver(self.ingest(1003), "x3")
         self.assertTrue(self.dispatcher.to_front(THREAD, third.nid or ""))
         self.assertEqual([item.text for item in self.dispatcher.queue_snapshot(THREAD)], ["x3", "x2"])
@@ -442,6 +443,25 @@ class DispatcherMediaScenarios(DispatcherCase):
         self.deliver(self.ingest(4003), "voice first", reserved=voice.nid)
         self.assertTrue(self.idle())
         self.assertEqual(self.turns.texts_run(THREAD), [burst_text(["voice first", "typed second"])])
+
+    def test_now_ends_the_wait_on_a_burst_member_behind_the_head(self) -> None:
+        """The runner waits for the voice of burst [a, voice]; ⏭ Now on a later message b makes b the head, so the wait
+        ends at once: b runs alone while the voice is still being transcribed, then the burst runs whole."""
+        self.turns.gates["x1"] = threading.Event()
+        self.deliver(self.ingest(4300), "x1")
+        self.assertTrue(self.turns.started("x1").wait(WAIT))
+        self.deliver(self.ingest(4301), "a")
+        voice = self.dispatcher.reserve(THREAD, TOPIC, CHAT, SENDER, self.ingest(4302))
+        self.assertTrue(voice.burst)
+        self.clock.advance(BURST_GAP_SECONDS + 1)
+        later = self.deliver(self.ingest(4303), "b")
+        self.turns.gates["x1"].set()
+        time.sleep(0.2)  # the runner settles and waits on the voice behind a
+        self.assertTrue(self.dispatcher.to_front(THREAD, later.nid or ""))
+        self.assertTrue(self.turns.started("b").wait(WAIT), "the runner kept waiting on the voice")
+        self.deliver(self.ingest(4304), "voice text", reserved=voice.nid)
+        self.assertTrue(self.idle())
+        self.assertEqual(self.turns.texts_run(THREAD), ["x1", "b", burst_text(["a", "voice text"])])
 
     def test_media_timeout_releases_the_place_and_tells_the_topic(self) -> None:
         """2: dispatcher moved on after the placeholder timed out

@@ -98,6 +98,13 @@ class ArrivalsTests(unittest.TestCase):
         self.assertFalse(self.arrivals.admitted(THREAD, full, burst=True).burst, "the accepted message cleared it")
         self.assertFalse(self.arrivals.admitted(THREAD, full, burst=False).burst, "after the gap: a new burst")
 
+    def test_a_filled_placeholder_keeps_the_refusal_state(self) -> None:
+        """A fill is an earlier message, not a new arrival: the overflow notice is still given only once."""
+        full, filled = Delivery(Admission.FULL), Delivery(Admission.FILLED, "n1", 1, True, True)
+        self.arrivals.admitted(THREAD, full, burst=False)
+        self.assertEqual(self.arrivals.admitted(THREAD, filled, burst=False), filled)
+        self.assertTrue(self.arrivals.admitted(THREAD, full, burst=True).burst, "the fill cleared the refusal")
+
     def test_a_reversed_clock_call_order_never_moves_the_topic_time_backward(self) -> None:
         """Two marks whose clock reads come out of order: the topic keeps the later time, so the next mark still
         counts from it (10.0 is kept, not 5.0), and 11.5 is a follower of the message read at 10.0."""

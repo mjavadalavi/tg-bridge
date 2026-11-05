@@ -5,7 +5,7 @@ Port of the live file's _dispatchers, _dispatch and the runner part of _continue
 message's placeholder is waited for (at most MEDIA_WAIT_SECONDS) when it reaches the head of the queue.
 
 Batches: before it takes a turn, the runner settles (core/arrivals): it waits while messages keep arriving, so a
-forwarded batch is all queued. TopicQueues.take_head then hands over the head and the ready messages behind it as one
+forwarded batch is all queued. TopicQueues.take_head then hands over the head and the rest of its burst group as one
 turn, with the merged text and images, and every inbox row of the batch is marked, replayed or dropped together.
 
 Dispatcher starts one daemon runner thread per idle topic. The runner marks the inbox row done when its turn starts,
@@ -228,7 +228,7 @@ class Dispatcher:
                 failures = self._hold_tick(thread_id, failures)
                 continue
             if head.kind is _HeadKind.WAIT:
-                self._await_media(thread_id, head.entry)
+                self._await_media(thread_id, head.entry, head.lead)
                 continue
             if head.entry is None or head.text is None:  # READY always carries both; guards the type only
                 return
@@ -247,27 +247,27 @@ class Dispatcher:
             left = self._arrivals.remaining(thread_id, started)
         return failures
 
-    def _await_media(self, thread_id: int, entry: _Entry | None) -> None:
-        """Wait for the head placeholder for at most the media wait. While the topic holds a kept session, the wait runs
-        in slices of poll_seconds and a hold tick runs between them; when the hold ends, the rest is one plain wait. On
-        timeout the place is released and the topic is told; the job still runs, and its late result is queued at the
-        back by the inbound handler. The slices are real waits on the event; only the deadline reads the injected
-        clock, so a FakeClock moves the deadline while the slices stay real."""
+    def _await_media(self, thread_id: int, entry: _Entry | None, lead: str | None) -> None:
+        """Wait for a placeholder of the next batch for at most the media wait. The wait runs in slices of poll_seconds
+        while the topic holds a kept session (a hold tick runs between them) or while the placeholder is a burst member
+        behind the head lead (it ends early once the head changes: a Now or a Drop made another batch next). Otherwise
+        the rest is one plain wait. On timeout the place is released and the topic is told; the late result is queued at
+        the back. The slices are real waits; only the deadline reads the injected clock (a FakeClock moves it)."""
         if entry is None or not isinstance(entry.body, Placeholder):
             return
-        ev = entry.body.ev
+        ev, behind = entry.body.ev, lead is not None and lead != entry.nid
         deadline = self._clock.monotonic() + self._media_wait
         failures = 0
-        while self._holding(thread_id):
-            left = deadline - self._clock.monotonic()
-            if left <= 0:
-                break  # the media wait is over: time out below
-            if ev.wait(min(self._poll, left)):
+        while (left := deadline - self._clock.monotonic()) > 0:
+            holding = self._holding(thread_id)
+            if not (holding or behind):  # the rest of the wait is plain
+                if ev.wait(left):
+                    return
+                break
+            if ev.wait(min(self._poll, left)) or (behind and self._queues.head_nid(thread_id) != lead):
                 return
-            failures = self._hold_tick(thread_id, failures)
-        else:  # the topic is not held (any more): the rest of the wait is plain
-            if ev.wait(max(0.0, deadline - self._clock.monotonic())):
-                return
+            if holding:
+                failures = self._hold_tick(thread_id, failures)
         self._media_timed_out(thread_id, entry)
 
     def _media_timed_out(self, thread_id: int, entry: _Entry) -> None:

@@ -56,6 +56,7 @@ from tg_bridge.bot.commands.session import (
     SessionCommands,
 )
 from tg_bridge.bot.pickers import STATUS_STOP, STOP_CHOICE_TEXT
+from tg_bridge.core.arrivals import BURST_GAP_SECONDS
 from tg_bridge.core.topic_queues import Admission
 
 
@@ -182,8 +183,10 @@ class QueueTapTests(CallbackCase):
     """now / jump / drop on the queued messages of the topic (the Dispatcher's queue, driven directly)."""
 
     def queue_two(self) -> tuple[str, str]:
-        """The first message starts the (idle) topic's runner; the second waits behind it as a queued item."""
+        """The first message starts the (idle) topic's runner; the second, sent after the burst gap (no follower, so a
+        group of its own), waits behind it as a queued item."""
         first = self.dispatcher.deliver(THREAD, TOPIC, CHAT, "sender", None, "first")
+        self.clock.advance(BURST_GAP_SECONDS)
         second = self.dispatcher.deliver(THREAD, TOPIC, CHAT, "sender", None, "second")
         self.assertEqual(first.admission, Admission.STARTED)
         self.assertEqual(second.admission, Admission.QUEUED)
@@ -253,8 +256,12 @@ class QueueTapTests(CallbackCase):
         self.assertEqual(self.answers(), [])
 
     def queue_five(self) -> list[str]:
-        """Five queued messages 'item 0' .. 'item 4' of the topic; the first one starts (idle topic), the rest wait."""
-        results = [self.dispatcher.deliver(THREAD, TOPIC, CHAT, "sender", None, f"item {n}") for n in range(5)]
+        """Five queued messages 'item 0' .. 'item 4' of the topic, each sent after the burst gap (so each is a group of
+        its own); the first one starts (idle topic), the rest wait."""
+        results = []
+        for n in range(5):
+            self.clock.advance(BURST_GAP_SECONDS)
+            results.append(self.dispatcher.deliver(THREAD, TOPIC, CHAT, "sender", None, f"item {n}"))
         self.assertEqual([r.admission for r in results][1:], [Admission.QUEUED] * 4)
         return [r.nid or "" for r in results]
 

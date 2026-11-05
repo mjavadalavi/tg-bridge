@@ -160,7 +160,7 @@ class CallbackCase(unittest.TestCase):
         self.dispatcher = Dispatcher(
             turns=object(), slots=object(), inbox=InboxRepo(self.db, self.clock), messenger=self.messenger,
             answers=object(), titles=object(), client=self.telegram, live=self.live, config=self.config,
-            logger=self.logger, start_thread=no_start)
+            logger=self.logger, start_thread=no_start, clock=self.clock)
         self.stops = SessionCommands(config=self.config, sessions=self.sessions, history=self.history,
                                      live=self.live, backends=self.backends, messenger=self.messenger,
                                      clock=self.clock, logger=self.logger, stop_wait=0.6,

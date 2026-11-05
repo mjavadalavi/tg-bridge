@@ -257,5 +257,93 @@ class BatchTakeTests(unittest.TestCase):
         self.assertEqual(second.text, burst_text([f"m{i}" for i in range(MERGE_MAX, total)]))
 
 
+class GroupTests(unittest.TestCase):
+    """A burst is a group identity: moves, drops, releases and refusals never merge two groups."""
+
+    def setUp(self) -> None:
+        self.queues = TopicQueues()
+        self.queues.deliver(THREAD, CHAT, SENDER, 1, "running")
+        self.queues.take_head(THREAD)
+
+    def texts(self) -> list[str | None]:
+        return [item.text for item in self.queues.snapshot(THREAD)]
+
+    def test_now_on_a_burst_member_moves_the_whole_group_in_order(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 11, "a")
+        self.queues.deliver(THREAD, CHAT, SENDER, 12, "b", burst=True)
+        self.queues.deliver(THREAD, CHAT, SENDER, 13, "c")
+        d = self.queues.deliver(THREAD, CHAT, SENDER, 14, "d", burst=True)
+
+        self.assertTrue(self.queues.to_front(THREAD, d.nid))
+
+        self.assertEqual(self.texts(), ["c", "d", "a", "b"])
+        self.assertEqual(self.queues.take_head(THREAD).text, burst_text(["c", "d"]))
+        self.assertEqual(self.queues.take_head(THREAD).text, burst_text(["a", "b"]))
+
+    def test_now_on_a_lone_message_moves_only_it_and_no_group_is_split(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 21, "a")
+        self.queues.deliver(THREAD, CHAT, SENDER, 22, "b", burst=True)
+        lone = self.queues.deliver(THREAD, CHAT, SENDER, 23, "lone")
+
+        self.assertTrue(self.queues.to_front(THREAD, lone.nid))
+
+        self.assertEqual(self.queues.take_head(THREAD).text, "lone")
+        self.assertEqual(self.queues.take_head(THREAD).text, burst_text(["a", "b"]))
+
+    def test_dropping_a_group_lead_does_not_merge_its_follower_into_the_group_before(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 31, "a")
+        lead = self.queues.deliver(THREAD, CHAT, SENDER, 32, "b")
+        self.queues.deliver(THREAD, CHAT, SENDER, 33, "c", burst=True)
+
+        self.assertIsNotNone(self.queues.drop(THREAD, lead.nid))
+
+        self.assertEqual(self.queues.take_head(THREAD).text, "a")
+        self.assertEqual(self.queues.take_head(THREAD).text, "c")
+
+    def test_a_released_placeholder_does_not_merge_two_groups(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 41, "a")
+        voice = self.queues.reserve(THREAD, CHAT, SENDER, 42)
+        self.queues.deliver(THREAD, CHAT, SENDER, 43, "after the voice", burst=True)
+
+        self.assertTrue(self.queues.unreserve(THREAD, voice.nid))
+
+        self.assertEqual(self.queues.take_head(THREAD).text, "a")
+        self.assertEqual(self.queues.take_head(THREAD).text, "after the voice")
+
+    def test_a_refusal_ends_the_chain(self) -> None:
+        queues = TopicQueues(max_items=2)
+        queues.deliver(THREAD, CHAT, SENDER, 1, "running")
+        queues.take_head(THREAD)
+        queues.deliver(THREAD, CHAT, SENDER, 51, "a")
+        b = queues.deliver(THREAD, CHAT, SENDER, 52, "b", burst=True)
+        self.assertIs(queues.deliver(THREAD, CHAT, SENDER, 53, "refused", burst=True).admission, Admission.FULL)
+        queues.drop(THREAD, b.nid)
+
+        queues.deliver(THREAD, CHAT, SENDER, 54, "after the refusal", burst=True)
+
+        self.assertEqual(queues.take_head(THREAD).text, "a")
+        self.assertEqual(queues.take_head(THREAD).text, "after the refusal")
+
+    def test_a_wait_on_a_member_behind_the_head_names_the_head_as_lead(self) -> None:
+        a = self.queues.deliver(THREAD, CHAT, SENDER, 61, "a")
+        voice = self.queues.reserve(THREAD, CHAT, SENDER, 62, burst=True)
+
+        head = self.queues.take_head(THREAD)
+
+        self.assertIs(head.kind, _HeadKind.WAIT)
+        self.assertEqual((head.entry.nid, head.lead), (voice.nid, a.nid))
+        self.assertEqual(self.queues.head_nid(THREAD), a.nid)
+
+    def test_a_wait_on_the_head_itself_names_it_as_lead(self) -> None:
+        voice = self.queues.reserve(THREAD, CHAT, SENDER, 71)
+
+        head = self.queues.take_head(THREAD)
+
+        self.assertEqual((head.entry.nid, head.lead), (voice.nid, voice.nid))
+
+    def test_head_nid_of_an_empty_queue_is_none(self) -> None:
+        self.assertIsNone(self.queues.head_nid(THREAD))
+
+
 if __name__ == "__main__":
     unittest.main()

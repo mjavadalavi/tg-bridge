@@ -54,8 +54,10 @@ class Arrivals:
 
     def admitted(self, thread_id: int | str, delivery: Delivery, burst: bool) -> Delivery:
         """The delivery of a message handed to the topic's queue. A refusal (queue full) carries burst when it follows a
-        refused message within the gap, so a burst of overflow gets one queue-full notice. Every message updates the
-        topic's refusal state, under the lock."""
+        refused message within the gap, so a burst of overflow gets one queue-full notice. Every new message updates the
+        topic's refusal state, under the lock; a filled placeholder is an earlier message, so it leaves the state alone."""
+        if delivery.admission is Admission.FILLED:
+            return delivery
         refused = delivery.admission is Admission.FULL
         with self._lock:
             follows = refused and burst and thread_id in self._refused

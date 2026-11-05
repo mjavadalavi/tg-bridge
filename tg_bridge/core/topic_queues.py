@@ -5,10 +5,12 @@ flag. Port of the live file's _queues, _queue_lk, QUEUE_MAX and _reserve_slot's 
 A topic runs one turn at a time. Messages that arrive while a turn runs wait in the topic's queue, in order, at most
 QUEUE_MAX of them. A media message reserves its place at once as a Placeholder; its download and transcription fill it
 later. The runner, in dispatcher.py, waits for an unfilled placeholder when it reaches the head of the queue.
-A turn takes a batch: the head and the following burst messages (those that arrived within the burst gap of the one
-before, see arrivals.py), at most MERGE_MAX, merged into one text, so a forwarded batch of messages runs as one turn.
-A message that is a command (its first non-space character is "/" or "!") always runs alone. A message that was not
-part of a burst is never merged into the turn before it.
+Groups: every queued message carries a group id. A burst follower (it arrived within the burst gap of the topic's
+previous message, see arrivals.py) takes the group of that message; any other message starts a group of its own. A
+refused message (queue full) ends the chain, so the next follower starts a new group. A turn takes a batch: the head and
+the later messages of its group, at most MERGE_MAX, merged into one text, so a forwarded batch runs as one turn. The
+group is an identity, not a position: ⏭ Now / ⏩ Next move a whole group, and a Drop or a released placeholder never
+lets two groups merge. A message that is a command (its first non-space character is "/" or "!") always runs alone.
 
 TopicQueues holds the queue data only. It starts no thread and sends nothing. Its lock guards the queues and the set of
 busy topics, and no caller of it ever holds that lock while calling another service.
@@ -90,7 +92,12 @@ class _Entry:
     sender: str
     update_id: int | None
     images: tuple[str, ...] = ()  # local image paths of a text entry; a placeholder keeps its own (Placeholder.images)
-    burst: bool = False  # the message followed the previous one within the burst gap: only such a message joins its turn
+    group: str = ""  # the burst this message belongs to: its own nid, or the group of the message it followed
+
+    @property
+    def follower(self) -> bool:
+        """The message joined the group of an earlier one (it arrived within the burst gap)."""
+        return bool(self.group) and self.group != self.nid
 
 
 class _HeadKind(enum.Enum):
@@ -107,6 +114,7 @@ class _Head:
     images: tuple[str, ...] = ()  # the images of every popped entry, in order
     entries: tuple[_Entry, ...] = ()  # every popped entry, in order (a READY head has at least one)
     first_text: str | None = None  # the first entry's own text, not the merged one (the topic title is taken from it)
+    lead: str | None = None  # WAIT: the nid of the queue head when the wait began (the awaited entry may be behind it)
 
 
 def _new_id() -> str:
@@ -153,9 +161,10 @@ class TopicQueues:
 
     def __init__(self, max_items: int = QUEUE_MAX) -> None:
         self._max = max_items
-        self._lock = threading.Lock()  # guards _queues and _busy
+        self._lock = threading.Lock()  # guards _queues, _busy and _groups
         self._queues: dict[int | str, list[_Entry]] = {}
         self._busy: set[int | str] = set()  # topics whose runner is running (or about to run)
+        self._groups: dict[int | str, str] = {}  # the group of each topic's latest queued message; gone after a refusal
 
     def busy(self, thread_id: int | str) -> bool:
         with self._lock:
@@ -171,9 +180,10 @@ class TopicQueues:
         with self._lock:
             queue = self._queues.setdefault(thread_id, [])
             if len(queue) >= self._max:
-                return Delivery(Admission.FULL)
+                return self._refuse(thread_id)
             busy = thread_id in self._busy
-            queue.append(_Entry(nid, Placeholder(busy and not quiet), chat_id, sender, update_id, burst=burst))
+            queue.append(_Entry(nid, Placeholder(busy and not quiet), chat_id, sender, update_id,
+                                group=self._group(thread_id, nid, burst)))
             if busy:
                 return Delivery(Admission.RESERVED, nid, len(queue), burst=burst)
             self._busy.add(thread_id)
@@ -198,15 +208,15 @@ class TopicQueues:
                     entry.body.text = text
                     entry.body.images = images
                     entry.body.ev.set()
-                    return Delivery(Admission.FILLED, entry.nid, idx + 1, entry.body.busy, entry.burst)
+                    return Delivery(Admission.FILLED, entry.nid, idx + 1, entry.body.busy, entry.follower)
             if thread_id in self._busy:
                 if len(queue) >= self._max:
-                    return Delivery(Admission.FULL)
-                queue.append(_Entry(nid, text, chat_id, sender, update_id, images, burst))
+                    return self._refuse(thread_id)
+                queue.append(_Entry(nid, text, chat_id, sender, update_id, images, self._group(thread_id, nid, burst)))
                 if quiet:
                     return Delivery(Admission.HANDED, nid, len(queue), burst=burst)
                 return Delivery(Admission.QUEUED, nid, len(queue), burst=burst)
-            queue.append(_Entry(nid, text, chat_id, sender, update_id, images, burst))
+            queue.append(_Entry(nid, text, chat_id, sender, update_id, images, self._group(thread_id, nid, burst)))
             self._busy.add(thread_id)
             return Delivery(Admission.STARTED, nid, len(queue), burst=burst)
 
@@ -225,14 +235,23 @@ class TopicQueues:
         return False
 
     def to_front(self, thread_id: int | str, nid: str) -> bool:
-        """Move a queued message to the front (⏭ Now and ⏩ Next). False when it is not queued."""
+        """Move a queued message to the front (⏭ Now and ⏩ Next), with every message of its group, in their order: the
+        group runs as one turn, so it moves as one. False when it is not queued."""
         with self._lock:
             queue = self._queues.get(thread_id) or []
             idx = self._index_of(queue, nid)
             if idx is None:
                 return False
-            queue.insert(0, queue.pop(idx))
+            group = queue[idx].group
+            moved = {entry.nid for entry in queue if entry.group == group} if group else {nid}
+            queue[:] = [entry for entry in queue if entry.nid in moved] + [e for e in queue if e.nid not in moved]
             return True
+
+    def head_nid(self, thread_id: int | str) -> str | None:
+        """The nid of the topic's queue head, or None for an empty queue."""
+        with self._lock:
+            queue = self._queues.get(thread_id) or []
+            return queue[0].nid if queue else None
 
     def drop(self, thread_id: int | str, nid: str) -> QueuedItem | None:
         """Remove a queued message (❌ Drop) and return it, or None when it is not queued. A placeholder is woken so
@@ -252,6 +271,7 @@ class TopicQueues:
         Placeholders are woken so no runner waits on them."""
         with self._lock:
             queue = self._queues.pop(thread_id, None) or []
+            self._groups.pop(thread_id, None)
             for entry in queue:
                 if isinstance(entry.body, Placeholder):
                     entry.body.ev.set()
@@ -269,12 +289,12 @@ class TopicQueues:
     def take_head(self, thread_id: int | str, keep_busy: bool = False) -> _Head:
         """The next turn for the runner.
 
-        An unfilled placeholder at the head is left in place (WAIT, with that entry). Otherwise the head is taken, and it
-        merges the following entries only while each one is a burst follower (burst=True) and not a command; a command
-        head runs alone. The batch stops at the first entry that is not a follower, at MERGE_MAX, or at a command. When
-        the next follower is an unfilled burst placeholder, nothing is popped and the runner waits on it (WAIT with that
-        entry), so the burst is taken whole. A non-burst placeholder never blocks the batch. The taken entries are
-        removed as one batch (READY) whose text is burst_text() of them.
+        An unfilled placeholder at the head is left in place (WAIT, with that entry). Otherwise the head is taken with the
+        later entries of its group, in order; a command head runs alone. The batch stops at a command of the group (it
+        stays for the next turn) or at MERGE_MAX. When a member of the group is an unfilled placeholder, nothing is
+        popped and the runner waits on it (WAIT with that entry, and lead: the head's nid), so the burst is taken whole.
+        A placeholder of another group never blocks the batch. The taken entries are removed as one batch (READY) whose
+        text is burst_text() of them.
 
         An empty queue ends the topic's busy state (EMPTY), unless keep_busy is set: the runner then hands the topic to a
         kept idle session, which stays busy until its next turn ends."""
@@ -284,24 +304,39 @@ class TopicQueues:
                 if not keep_busy:
                     self._busy.discard(thread_id)
                 return _Head(_HeadKind.EMPTY)
-            if not _ready(queue[0]):
-                return _Head(_HeadKind.WAIT, queue[0])
-            count = 1
-            if not _stands_alone(_text_of(queue[0])):
-                while count < MERGE_MAX and count < len(queue) and queue[count].burst:
-                    follower = queue[count]
-                    if not _ready(follower):
-                        return _Head(_HeadKind.WAIT, follower)  # a burst media message: wait for it, pop nothing
-                    if _stands_alone(_text_of(follower)):
+            head = queue[0]
+            if not _ready(head):
+                return _Head(_HeadKind.WAIT, head, lead=head.nid)
+            taken = [head]
+            if head.group and not _stands_alone(_text_of(head)):
+                for member in (entry for entry in queue[1:] if entry.group == head.group):
+                    if len(taken) >= MERGE_MAX:
                         break
-                    count += 1
-            taken = [queue.pop(0) for _ in range(count)]
+                    if not _ready(member):
+                        return _Head(_HeadKind.WAIT, member, lead=head.nid)  # a burst media message: pop nothing
+                    if _stands_alone(_text_of(member)):
+                        break
+                    taken.append(member)
+            taken_ids = {entry.nid for entry in taken}
+            queue[:] = [entry for entry in queue if entry.nid not in taken_ids]
             for entry in taken:
                 if isinstance(entry.body, Placeholder):
                     entry.body.ev.set()
             text = burst_text([_text_of(entry) for entry in taken])
             images = tuple(image for entry in taken for image in _images_of(entry))
             return _Head(_HeadKind.READY, taken[0], text, images, tuple(taken), _text_of(taken[0]))
+
+    def _group(self, thread_id: int | str, nid: str, burst: bool) -> str:
+        """The group of a message being queued (call under the lock): the group of the topic's latest queued message
+        for a burst follower, else a group of its own. It becomes the topic's latest group."""
+        group = self._groups.get(thread_id, nid) if burst else nid
+        self._groups[thread_id] = group
+        return group
+
+    def _refuse(self, thread_id: int | str) -> Delivery:
+        """A message the full queue refused (call under the lock): it ends the chain, so a follower of it starts anew."""
+        self._groups.pop(thread_id, None)
+        return Delivery(Admission.FULL)
 
     @staticmethod
     def _index_of(queue: list[_Entry], nid: str | None) -> int | None:
