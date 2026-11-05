@@ -381,6 +381,7 @@ class QueueTests(InboundCase):
 
 class MediaTests(InboundCase):
     PHOTO = [{"file_id": "f1"}]
+    DOCUMENT = {"file_id": "d1", "file_name": "report.pdf", "file_size": 11 * 1024 * 1024}
 
     def setUp(self) -> None:
         super().setUp()
@@ -391,6 +392,16 @@ class MediaTests(InboundCase):
         self.assertEqual(self.media.calls, [("", False)])  # Claude takes photos as a text note, not as images
         self.assertEqual([item.text for item in self.queued()], ["heard you"])
         self.assertEqual(self.starts.started, [(THREAD, TOPIC)])
+
+    def test_document_without_caption_is_media_not_dropped(self) -> None:
+        self.assertIs(self.handle(self.message("", document=self.DOCUMENT), update_id=502), Disposition.DEFERRED)
+        self.assertEqual(self.media.calls, [("", False)])
+        self.assertEqual([item.text for item in self.queued()], ["heard you"])
+        self.assertEqual(self.starts.started, [(THREAD, TOPIC)])
+
+    def test_document_with_caption_is_media_with_the_caption(self) -> None:
+        self.assertIs(self.handle(self.message("read this", document=self.DOCUMENT)), Disposition.DEFERRED)
+        self.assertEqual(self.media.calls, [("read this", False)])
 
     def test_photo_on_a_codex_topic_asks_for_native_images(self) -> None:
         self.sessions.ensure(THREAD, TOPIC, CLAUDE_CMD, self.project)

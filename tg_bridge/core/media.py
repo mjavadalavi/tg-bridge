@@ -1,12 +1,22 @@
 """MediaService (getFile/download) + Transcriber Protocol + SonioxTranscriber (C05, C17).
 
-Port of the live file's _fetch_media (C17) and soniox_transcribe (C05). A message with a photo, voice note or audio
-file is turned into what the session should receive:
+Port of the live file's _fetch_media (C17) and soniox_transcribe (C05). A message with a photo, voice note,
+audio file or document is turned into what the session should receive:
 
 - a photo is downloaded into the inbox (mode 0600). A backend with native image input gets the path as an image;
   any other backend gets the old text note '[photo saved for you at <path>]' appended to the message text;
 - a voice note or audio file is downloaded, transcribed by the injected Transcriber, echoed to the topic (600 chars)
-  and its text is put in front of the caption, as the live file did.
+  and its text is put in front of the caption, as the live file did;
+- a document (a file sent as a Telegram document, e.g. a PDF) is downloaded into the inbox under its original name and
+  always becomes the text note '[file <name> saved for you at <path>]', even for a backend with native images. A file
+  over the Bot API's 20 MB download limit is not downloaded: the topic is told its size instead.
+
+Naming: every download is created with tempfile.mkstemp in the inbox, so the name is unique and never truncates an
+existing file: '<unix seconds>-<random>-<safe name>'. The safe name keeps Unicode word characters (Persian stays
+readable), turns every other character into '_', never contains a path separator, and keeps the extension within
+NAME_LIMIT characters. A name that is only dots falls back to the Telegram basename. The note shows a cleaned copy of
+the sender's name instead: whitespace (newlines included) collapses to single spaces, '[' and ']' become '(' and ')',
+and the name is cut to NAME_LIMIT characters, so a file name can never close the note or add lines to the message.
 
 fetch() returns None when the user has already been told why nothing will run (an error text was sent through the
 Messenger). It returns a MediaOutcome otherwise; an outcome may have empty text when the only content is an image.
@@ -16,10 +26,13 @@ polls it (one second apart, at most POLL_LIMIT times) and joins the tokens. Its 
 uploaded file even when the transcription fails. Its errors never show the key: the key is masked in every message.
 """
 
+import contextlib
 import json
 import os
+import re
 import secrets
 import shutil
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -41,12 +54,19 @@ SONIOX_DELETE_TIMEOUT = 30  # seconds for each cleanup request
 POLL_LIMIT = 60  # status checks before the transcription counts as timed out; voice notes are short
 POLL_SECONDS = 1.0
 DOWNLOAD_TIMEOUT = 60  # seconds for one Telegram file download
+BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # the Bot API's getFile serves files up to 20 MB
+NAME_LIMIT = 100  # characters of a document's original name kept in the inbox file name
 REDACTED = "<redacted>"
 PHOTO_ERROR_LIMIT = 120
+FILE_ERROR_LIMIT = 120
 VOICE_ERROR_LIMIT = 150
 ECHO_LIMIT = 600  # characters of a transcript echoed back to the topic
 PHOTO_NOTE = "[photo saved for you at {path}]"
+FILE_NOTE = "[file {name} saved for you at {path}]"
 MSG_PHOTO_FAILED = "photo download failed: {error}"
+MSG_FILE_TOO_LARGE = ("📎 {name} is {size} MB: Telegram lets a bot download files up to 20 MB only. "
+                      "Send it smaller, or put it on disk and send its path.")
+MSG_FILE_FAILED = "📎 file download failed: {error}"
 MSG_TRANSCRIPTION_FAILED = "🎙 transcription failed: {error}"
 MSG_ECHO = "🎙 {heard}"
 MSG_EMPTY = "🎙 voice came through but transcribed to nothing — try again or type it."
@@ -89,6 +109,33 @@ def _short(exc: BaseException, limit: int) -> str:
 def _masked(text: str, secret: str) -> str:
     """The text with every occurrence of secret replaced, so a credential never reaches a message or an exception."""
     return text.replace(secret, REDACTED) if secret else text
+
+
+def _safe_name(name: str) -> str:
+    """The inbox file name for a sent file name: its base name with every character that is not a Unicode word
+    character, '.', '-' or a ZWNJ replaced by '_'. The extension is kept and the stem is trimmed so the result is at
+    most NAME_LIMIT characters. No path separator survives, so the saved file stays inside the inbox. A name with
+    nothing but dots (such as '..') gives '' and the caller falls back to the Telegram basename."""
+    base = re.sub(r"[^\w.\-\u200c]", "_", os.path.basename(name))
+    if not base.strip("."):
+        return ""
+    stem, ext = os.path.splitext(base)
+    if len(ext) >= NAME_LIMIT:
+        stem, ext = base, ""
+    return stem[: NAME_LIMIT - len(ext)] + ext
+
+
+def _note_name(name: str) -> str:
+    """The sender's file name as it may appear inside FILE_NOTE: one line, no brackets, at most NAME_LIMIT characters.
+    An empty result becomes 'file'."""
+    cleaned = re.sub(r"\s+", " ", name).replace("[", "(").replace("]", ")").strip()[:NAME_LIMIT].rstrip()
+    return cleaned or "file"
+
+
+def _discard(path: str) -> None:
+    """Remove a partial download; a file that is already gone is fine."""
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(path)
 
 
 class SonioxTranscriber:
@@ -220,6 +267,18 @@ class MediaService:
                 images = (saved,)
             else:
                 text = (text + "\n" + PHOTO_NOTE.format(path=saved)).strip()
+        document = message.get("document")
+        if document:
+            name = str(document.get("file_name") or "file")
+            size = document.get("file_size")
+            if size is not None and size > BOT_DOWNLOAD_LIMIT:
+                self._messenger.send_text(chat_id, thread, MSG_FILE_TOO_LARGE.format(
+                    name=name, size=f"{size / (1024 * 1024):.1f}"))
+                return None
+            saved = self._file(str(document["file_id"]), name, chat_id, thread)
+            if saved is None:
+                return None
+            text = (text + "\n" + FILE_NOTE.format(name=_note_name(name), path=saved)).strip()
         media = message.get("voice") or message.get("audio")
         if media:
             heard = self._voice(str(media["file_id"]), chat_id, thread)
@@ -233,6 +292,13 @@ class MediaService:
             return self._download(file_id)
         except Exception as exc:
             self._messenger.send_text(chat_id, thread, MSG_PHOTO_FAILED.format(error=_short(exc, PHOTO_ERROR_LIMIT)))
+            return None
+
+    def _file(self, file_id: str, name: str, chat_id: Any, thread: Any) -> str | None:
+        try:
+            return self._download(file_id, name)
+        except Exception as exc:
+            self._messenger.send_text(chat_id, thread, MSG_FILE_FAILED.format(error=_short(exc, FILE_ERROR_LIMIT)))
             return None
 
     def _voice(self, file_id: str, chat_id: Any, thread: Any) -> str | None:
@@ -250,8 +316,11 @@ class MediaService:
         self._messenger.send_text(chat_id, thread, MSG_ECHO.format(heard=heard[:ECHO_LIMIT]))
         return heard
 
-    def _download(self, file_id: str) -> str:
-        """Fetch a Telegram file into the inbox with mode 0600 and return its local path."""
+    def _download(self, file_id: str, name: str = "") -> str:
+        """Fetch a Telegram file into the inbox and return its local path. The file is created with mkstemp, so its
+        name is unique (two downloads in the same second never share a path) and its mode is 0600. A given name (a
+        document's original file name) is made safe and kept in the inbox file name; photos and voice notes keep their
+        Telegram basename as the suffix. A failed download removes its partial file."""
         info = self._client.call("getFile", file_id=file_id)
         if not isinstance(info, dict) or not info.get("file_path"):
             raise TelegramError("getFile", None, "no file_path in the answer")
@@ -259,16 +328,17 @@ class MediaService:
         token = self._read_token()
         url = f"{self._api_base}/file/bot{token}/{file_path}"
         os.makedirs(self._paths.inbox, mode=0o700, exist_ok=True)
-        dest = os.path.join(self._paths.inbox, f"{int(self._clock.now())}-{os.path.basename(file_path)}")
+        leaf = _safe_name(name) or os.path.basename(file_path)
+        fd, dest = tempfile.mkstemp(dir=self._paths.inbox, prefix=f"{int(self._clock.now())}-", suffix=f"-{leaf}")
         try:
-            with self._openers.get().open(url, timeout=DOWNLOAD_TIMEOUT) as response:
-                fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "wb") as out:
-                    shutil.copyfileobj(response, out)
+            with os.fdopen(fd, "wb") as out, self._openers.get().open(url, timeout=DOWNLOAD_TIMEOUT) as response:
+                shutil.copyfileobj(response, out)
         except urllib.error.HTTPError as exc:
             exc.close()  # an HTTP error keeps its socket open until it is closed
+            _discard(dest)
             raise DownloadFailed(_masked(_short(exc, PHOTO_ERROR_LIMIT), token)) from None
         except Exception as exc:
+            _discard(dest)
             raise DownloadFailed(_masked(_short(exc, PHOTO_ERROR_LIMIT), token)) from None
         os.chmod(dest, 0o600)
         return dest

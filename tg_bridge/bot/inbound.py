@@ -174,7 +174,8 @@ class MessageHandler:
             self._cwd.suggest_for_new_topic(self._config, chat_id, thread, created.get("name", ""))
             return Disposition.DONE
         text = (message.get("text") or message.get("caption") or "").strip()
-        has_media = bool(message.get("photo") or message.get("voice") or message.get("audio"))
+        has_media = bool(message.get("photo") or message.get("voice") or message.get("audio")
+                         or message.get("document"))
         if not text and not has_media:
             return Disposition.DONE
         guidance = guard_text(chat.get("type"), thread)
@@ -186,8 +187,9 @@ class MessageHandler:
         return self.continue_message(message, text, update_id)
 
     def _media_message(self, message: Mapping[str, Any], text: str, update_id: int | None) -> Disposition:
-        """A photo, voice or audio message: its queue place is reserved first in a plain session topic, then the media
-        worker downloads it and continues the message. Any other topic lets the worker resolve it the usual way."""
+        """A photo, voice, audio or document message: its queue place is reserved first in a plain session topic, then
+        the media worker downloads it and continues the message. Any other topic lets the worker resolve it the usual
+        way."""
         chat_id = (message.get("chat") or {}).get("id")
         thread = message.get("message_thread_id")
         topic = self._topics.queued_session_name(thread)
