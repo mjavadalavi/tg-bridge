@@ -55,6 +55,20 @@ class ArrivalsTests(unittest.TestCase):
         self.arrivals.settle(THREAD)
         self.assertEqual(self.clock.sleeps, [])
 
+    def test_mark_reports_a_follower_within_the_gap(self) -> None:
+        self.assertFalse(self.arrivals.mark(THREAD), "the first message of a topic is not a follower")
+        self.clock.advance(BURST_GAP_SECONDS - 0.5)
+        self.assertTrue(self.arrivals.mark(THREAD))
+
+    def test_mark_after_the_gap_is_not_a_follower(self) -> None:
+        self.arrivals.mark(THREAD)
+        self.clock.advance(BURST_GAP_SECONDS)  # exactly the gap is already a new arrival
+        self.assertFalse(self.arrivals.mark(THREAD))
+
+    def test_mark_of_another_topic_is_not_a_follower(self) -> None:
+        self.arrivals.mark(OTHER)
+        self.assertFalse(self.arrivals.mark(THREAD))
+
     def test_a_steady_stream_is_capped(self) -> None:
         """Every sleep is followed by a new message, so the topic never goes quiet: the settle ends at the cap."""
         self.arrivals.mark(THREAD)

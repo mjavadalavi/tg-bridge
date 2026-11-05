@@ -163,7 +163,7 @@ class InboundCase(unittest.TestCase):
         self.dispatcher = Dispatcher(
             turns=object(), slots=object(), inbox=self.inbox, messenger=self.messenger, answers=object(),
             titles=object(), client=self.telegram, live=self.live, config=self.config, logger=self.logger,
-            start_thread=self.starts, removals=self.removals)
+            start_thread=self.starts, removals=self.removals, clock=self.clock)
         self.backends = build_default_registry(self.config, self.logger, self.clock, title_launcher="")
         self.topics = TopicResolver(config=self.config, kv=self.kv, sessions=self.sessions, logger=self.logger)
         self.permissions = StubPermissions()

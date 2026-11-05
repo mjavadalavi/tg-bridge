@@ -10,6 +10,7 @@ Every test runs on a migrated database in a TempHome with FakeTelegram and FakeC
 
 from tg_bridge.bot.commands.info import register_info_commands
 from tg_bridge.bot.inbound import AUTO_OFF_NEXT_TEXT, AUTO_OFF_TEXT, AUTO_ON_TEXT, Disposition
+from tg_bridge.core.arrivals import BURST_GAP_SECONDS
 from tg_bridge.core.media import MediaOutcome
 from tg_bridge.core.permissions import BYPASS_MODE
 from tg_bridge.core.topic_queues import QUEUE_MAX
@@ -34,6 +35,7 @@ from tests.inbound_support import (
 
 QUEUE_FULL = "📥 queue full (100) — wait for the current turn to finish."
 QUEUED_SECOND = "📥 queued — position 2 after the current turn."
+QUEUED_THIRD = "📥 queued — position 3 after the current turn."
 QUEUED_TERMINAL_SECOND = ("📥 queued — position 2; the topic's terminal session (tg-bridge view) is busy "
                           "or has text typed in it.")
 SPAWNED = "✅ spawned budget-claude in tmux window 'mytask' ({pane}) — your message is its first prompt."
@@ -351,6 +353,7 @@ class QueueTests(InboundCase):
 
     def test_second_message_is_queued_with_now_next_drop_buttons(self) -> None:
         self.handle(self.message("one"))
+        self.clock.advance(BURST_GAP_SECONDS + 1)  # not a burst follower: it is announced
         self.assertIs(self.handle(self.message("two")), Disposition.DEFERRED)
         self.assertEqual(self.sent(), [QUEUED_SECOND])
         row = self.keyboards()[0][0]
@@ -363,9 +366,21 @@ class QueueTests(InboundCase):
     def test_a_message_queued_while_the_topic_waits_for_its_terminal_says_so(self) -> None:
         self.dispatcher.waiting_terminal = lambda thread: True  # the runner is in the terminal wait (see test_terminal_attach)
         self.handle(self.message("one"))
+        self.clock.advance(BURST_GAP_SECONDS + 1)
         self.assertIs(self.handle(self.message("two")), Disposition.DEFERRED)
         self.assertEqual(self.sent(), [QUEUED_TERMINAL_SECOND])
         self.assertEqual(len(self.keyboards()[0][0]), 3, "the queued notice lost its Now/Next/Drop buttons")
+
+    def test_burst_follower_gets_no_queued_notice_and_a_later_message_still_does(self) -> None:
+        self.handle(self.message("one"))
+        self.assertIs(self.handle(self.message("two")), Disposition.DEFERRED)  # within the gap of "one"
+        self.assertEqual(self.sent(), [], "a burst follower must not announce its queue place")
+        self.assertEqual([item.text for item in self.queued()], ["one", "two"])
+        self.clock.advance(BURST_GAP_SECONDS + 1)
+        self.handle(self.message("three"))
+        self.assertEqual(self.sent(), [QUEUED_THIRD])
+        self.assertEqual(len(self.keyboards()), 1)
+        self.assertEqual([item.text for item in self.queued()], ["one", "two", "three"])
 
     def test_messages_keep_their_order(self) -> None:
         for text in ("a", "b", "c"):
@@ -446,6 +461,12 @@ class MediaTests(InboundCase):
         self.handle(self.message("", photo=self.PHOTO))
         self.assertEqual(self.sent()[-1], QUEUE_FULL)
         self.assertEqual(self.media.calls, [])
+
+    def test_photo_that_follows_a_message_within_the_gap_gets_no_queued_notice(self) -> None:
+        self.handle(self.message("one"))  # starts the runner; the photo arrives within the gap, behind a running turn
+        self.assertIs(self.handle(self.message("", photo=self.PHOTO), update_id=502), Disposition.DEFERRED)
+        self.assertEqual(self.sent(), [], "a filled placeholder that was a burst follower must not be announced")
+        self.assertEqual([item.text for item in self.queued()], ["one", "heard you"])
 
     def test_media_in_a_pane_topic_is_typed_into_the_pane(self) -> None:
         self.name_topic(THREAD, PANE_TOPIC)

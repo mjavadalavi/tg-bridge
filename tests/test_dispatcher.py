@@ -550,6 +550,22 @@ class BurstScenarios(DispatcherCase):
         self.assertEqual(self.clock.sleeps, [BURST_GAP_SECONDS] * 2)  # one gap for "alone", one for "slow", none after
         self.assertEqual(self.turns.texts_run(THREAD), ["alone", "slow", "later"])
 
+    def test_deliver_reports_a_burst_follower(self) -> None:
+        """A message within the burst gap of the topic's previous one is a follower (burst); one after the gap is not.
+        The runner's settle is gated, so no time passes while the follower arrives."""
+        first = self.deliver(self.ingest(8401), "first")
+        self.assertIs(first.admission, Admission.STARTED)
+        self.assertFalse(first.burst)
+        self.assertTrue(self.clock.entered.wait(WAIT))
+        follower = self.deliver(self.ingest(8402), "second")
+        self.assertIs(follower.admission, Admission.QUEUED)
+        self.assertTrue(follower.burst)
+        self.clock.released.set()
+        self.assertTrue(self.idle())
+        self.clock.advance(BURST_GAP_SECONDS + 1)
+        self.assertFalse(self.deliver(self.ingest(8403), "later").burst)
+        self.assertTrue(self.idle())
+
     def test_refused_batch_replays_every_row_on_restart(self) -> None:
         """A shutdown refused the spawn of a batch: every update_id of the batch goes back to pending."""
         self.turns.replies[burst_text(["r1", "r2"])] = TurnReply(None, None, TurnOutcome.RESTART)

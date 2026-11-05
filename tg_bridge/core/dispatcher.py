@@ -143,12 +143,14 @@ class Dispatcher:
         return self._removals.active(thread_id)
 
     def reserve(self, thread_id: int, topic: str, chat_id: int | str, sender: str, update_id: int | None) -> Delivery:
-        """Reserve a media message's place in the topic's queue. Starts the runner when the topic is idle."""
-        self._arrivals.mark(thread_id)
+        """Reserve a media message's place in the topic's queue. Starts the runner when the topic is idle. The delivery
+        says whether the message is a burst follower (Delivery.burst), and the place keeps that flag."""
+        burst = self._arrivals.mark(thread_id)
         if self._removals.active(thread_id):
             self._drop_removing(thread_id, update_id)
             return Delivery(Admission.DROPPED)
-        delivery = self._queues.reserve(thread_id, chat_id, sender, update_id, quiet=self._quiet(thread_id))
+        delivery = self._queues.reserve(thread_id, chat_id, sender, update_id, quiet=self._quiet(thread_id),
+                                        burst=burst)
         if delivery.admission is Admission.STARTED:
             self._start(thread_id, topic)
         return delivery
@@ -157,14 +159,15 @@ class Dispatcher:
                 reserved: str | None = None, images: tuple[str, ...] = ()) -> Delivery:
         """Hand over a message's text and local image paths: a filled placeholder, a queued message, or the first
         message of an idle topic (which starts the runner). The images reach the turn's session as native image input
-        when its backend takes them. Notices and buttons are the caller's to send (see Delivery.notify). A message to an
-        idle kept session is HANDED: no notice, and the held runner is woken to take it."""
-        self._arrivals.mark(thread_id)
+        when its backend takes them. Notices and buttons are the caller's to send (see Delivery.notify and
+        Delivery.burst). A message to an idle kept session is HANDED: no notice, and the held runner is woken to take
+        it."""
+        burst = self._arrivals.mark(thread_id)
         if self._removals.active(thread_id):
             self._drop_removing(thread_id, update_id)
             return Delivery(Admission.DROPPED)
         delivery = self._queues.deliver(thread_id, chat_id, sender, update_id, text, reserved, images,
-                                        quiet=self._quiet(thread_id))
+                                        quiet=self._quiet(thread_id), burst=burst)
         if delivery.admission is Admission.STARTED:
             self._start(thread_id, topic)
         elif delivery.admission is Admission.HANDED and self._linger is not None:

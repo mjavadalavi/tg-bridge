@@ -32,13 +32,14 @@ class Placeholder:
     """A queue place reserved for a media message. Its worker fills text, images and sets ev; busy: a turn was running
     when the place was reserved (the topic is then told where the message stands once it is filled)."""
 
-    __slots__ = ("ev", "text", "images", "busy")
+    __slots__ = ("ev", "text", "images", "busy", "burst")
 
-    def __init__(self, busy: bool) -> None:
+    def __init__(self, busy: bool, burst: bool = False) -> None:
         self.ev = threading.Event()
         self.text: str | None = None
         self.images: tuple[str, ...] = ()
         self.busy = busy
+        self.burst = burst  # the media message followed another within the burst gap when it was reserved
 
 
 class Admission(enum.Enum):
@@ -61,6 +62,7 @@ class Delivery:
     nid: str | None = None
     position: int = 0
     busy: bool = False  # FILLED: whether a turn was running when the placeholder was reserved
+    burst: bool = False  # the message followed another within the burst gap: it is announced by nobody, it joins a turn
 
     @property
     def notify(self) -> bool:
@@ -150,29 +152,32 @@ class TopicQueues:
             return thread_id in self._busy
 
     def reserve(self, thread_id: int | str, chat_id: int | str, sender: str, update_id: int | None,
-                quiet: bool = False) -> Delivery:
+                quiet: bool = False, burst: bool = False) -> Delivery:
         """Put a placeholder at the back of the topic's queue, so a media message keeps its place while its download
         and transcription run. An idle topic is marked busy here, and the caller starts its runner (STARTED). A quiet
-        place behind a running turn is not announced when it is filled, so its placeholder is not busy."""
+        place behind a running turn is not announced when it is filled, so its placeholder is not busy. A burst follower
+        keeps the flag, so its notice is skipped when it is filled too."""
         nid = _new_id()
         with self._lock:
             queue = self._queues.setdefault(thread_id, [])
             if len(queue) >= self._max:
                 return Delivery(Admission.FULL)
             busy = thread_id in self._busy
-            queue.append(_Entry(nid, Placeholder(busy and not quiet), chat_id, sender, update_id))
+            queue.append(_Entry(nid, Placeholder(busy and not quiet, burst), chat_id, sender, update_id))
             if busy:
-                return Delivery(Admission.RESERVED, nid, len(queue))
+                return Delivery(Admission.RESERVED, nid, len(queue), burst=burst)
             self._busy.add(thread_id)
-            return Delivery(Admission.STARTED, nid, len(queue))
+            return Delivery(Admission.STARTED, nid, len(queue), burst=burst)
 
     def deliver(self, thread_id: int | str, chat_id: int | str, sender: str, update_id: int | None, text: str,
-                reserved: str | None = None, images: tuple[str, ...] = (), quiet: bool = False) -> Delivery:
-        """Hand over a message's text and images. With reserved, the placeholder of that id is filled in place.
-        Otherwise the message joins the back of the queue: behind a running turn (QUEUED, or FULL at QUEUE_MAX), or as
-        the first message of an idle topic (STARTED). A quiet message behind a running turn is HANDED instead of QUEUED:
-        the caller tells nobody and starts no runner, because the kept session will take it. A reserved id that is no
-        longer queued (its place was released) is queued as new."""
+                reserved: str | None = None, images: tuple[str, ...] = (), quiet: bool = False,
+                burst: bool = False) -> Delivery:
+        """Hand over a message's text and images. With reserved, the placeholder of that id is filled in place, and the
+        delivery keeps the burst flag the placeholder was reserved with. Otherwise the message joins the back of the
+        queue: behind a running turn (QUEUED, or FULL at QUEUE_MAX), or as the first message of an idle topic (STARTED).
+        A quiet message behind a running turn is HANDED instead of QUEUED: the caller tells nobody and starts no runner,
+        because the kept session will take it. A reserved id that is no longer queued (its place was released) is queued
+        as new."""
         nid = _new_id()
         with self._lock:
             queue = self._queues.setdefault(thread_id, [])
@@ -183,17 +188,17 @@ class TopicQueues:
                     entry.body.text = text
                     entry.body.images = images
                     entry.body.ev.set()
-                    return Delivery(Admission.FILLED, entry.nid, idx + 1, entry.body.busy)
+                    return Delivery(Admission.FILLED, entry.nid, idx + 1, entry.body.busy, entry.body.burst)
             if thread_id in self._busy:
                 if len(queue) >= self._max:
                     return Delivery(Admission.FULL)
                 queue.append(_Entry(nid, text, chat_id, sender, update_id, images))
                 if quiet:
-                    return Delivery(Admission.HANDED, nid, len(queue))
-                return Delivery(Admission.QUEUED, nid, len(queue))
+                    return Delivery(Admission.HANDED, nid, len(queue), burst=burst)
+                return Delivery(Admission.QUEUED, nid, len(queue), burst=burst)
             queue.append(_Entry(nid, text, chat_id, sender, update_id, images))
             self._busy.add(thread_id)
-            return Delivery(Admission.STARTED, nid, len(queue))
+            return Delivery(Admission.STARTED, nid, len(queue), burst=burst)
 
     def unreserve(self, thread_id: int | str, nid: str | None) -> bool:
         """Remove a placeholder that will never be filled (its download failed, or it timed out). Wakes a runner that

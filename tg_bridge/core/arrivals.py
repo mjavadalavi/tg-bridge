@@ -6,7 +6,8 @@ message handed to the topic, but for no more than BURST_CAP_SECONDS in all, so a
 Then TopicQueues.take_head hands over the whole burst as one turn.
 
 Arrivals keeps the monotonic time of the latest message of each topic and sleeps through the injected clock. The
-inbound handler calls mark, the topic runners call settle; the lock guards the dict only, and no sleep runs under it.
+Dispatcher calls mark for each message it is handed (mark also says whether the message is a burst follower), and the
+topic runners call settle; the lock guards the dict only, and no sleep runs under it.
 """
 
 import threading
@@ -25,11 +26,14 @@ class Arrivals:
         self._lock = threading.Lock()  # guards _last
         self._last: dict[int | str, float] = {}
 
-    def mark(self, thread_id: int | str) -> None:
-        """Records that a message was just handed to the topic."""
+    def mark(self, thread_id: int | str) -> bool:
+        """Records that a message was just handed to the topic. True when the topic's previous message was less than
+        BURST_GAP_SECONDS ago: this one is a burst follower, and it is announced by nobody."""
         now = self._clock.monotonic()
         with self._lock:
+            last = self._last.get(thread_id)
             self._last[thread_id] = now
+        return last is not None and now - last < BURST_GAP_SECONDS
 
     def settle(self, thread_id: int | str) -> None:
         """Sleeps while the topic's latest message is less than BURST_GAP_SECONDS old. The total sleep of one call is
