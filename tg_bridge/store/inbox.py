@@ -10,7 +10,7 @@ text; the InboxService decides what to do with it.
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -103,6 +103,19 @@ class InboxRepo:
     def mark_pending(self, update_id: int) -> None:
         """Puts a row back to pending, so the next start replays it (a deferred message)."""
         self._db.execute("UPDATE inbox_queue SET state=? WHERE update_id=?", (STATE_PENDING, update_id))
+
+    def done_many(self, update_ids: Iterable[int]) -> None:
+        """Marks several updates as finished in one transaction: every row of the batch changes, or none does."""
+        self._set_states(STATE_DONE, update_ids)
+
+    def mark_pending_many(self, update_ids: Iterable[int]) -> None:
+        """Puts several rows back to pending in one transaction (a batch replays as a whole)."""
+        self._set_states(STATE_PENDING, update_ids)
+
+    def _set_states(self, state: str, update_ids: Iterable[int]) -> None:
+        with self._db.tx() as conn:
+            conn.executemany("UPDATE inbox_queue SET state=? WHERE update_id=?",
+                             [(state, update_id) for update_id in update_ids])
 
     def pending(self) -> list[InboxRecord]:
         """Every pending update, in update_id order (the replay order)."""

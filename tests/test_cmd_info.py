@@ -26,6 +26,8 @@ from tg_bridge.bot.commands.base import Alias, Command, CommandDeps, CommandRegi
 from tg_bridge.bot.commands.info import (
     LINGER_QUIET_STATUS_TEXT,
     LINGER_STATUS_TEXT,
+    QUEUE_BUTTON_ITEMS,
+    QUEUE_LIST_CHARS,
     SELF_TURN_STATUS_TEXT,
     launcher_state,
     register_info_commands,
@@ -292,8 +294,13 @@ class QueueTests(InfoCase):
         self.run_cmd("/queue")
         self.assertEqual(self.last(), "the queue is empty.")
 
-    def test_one_button_row_per_item_and_a_media_placeholder_label(self) -> None:
-        """Labels: G: one button row per queued item; G: a media placeholder is labelled, not shown as empty.
+    def queue(self, texts: list[str]) -> None:
+        """Queues the texts behind a running turn: the first starts it, the rest wait in order."""
+        for index, text in enumerate(texts, 1):
+            self.queues.deliver(THREAD, CHAT, "tester", index, text)
+
+    def test_queue_is_one_message_with_a_media_placeholder_label(self) -> None:
+        """Labels: G: one line per queued item; G: a media placeholder is labelled, not shown as empty.
         """
         started = self.queues.deliver(THREAD, CHAT, "tester", 1, "first queued")  # idle topic: it starts
         self.assertEqual(started.admission, Admission.STARTED)
@@ -301,13 +308,51 @@ class QueueTests(InfoCase):
         self.assertEqual([item.text for item in self.queues.snapshot(THREAD)], ["first queued", None])
         self.run_cmd("/queue")
         nid = self.queues.snapshot(THREAD)[0].nid
+        self.assertEqual(len(self.replies()), 1)
+        self.assertEqual(self.replies()[0].splitlines(),
+                         ["📥 2 queued:", "1. first queued", "2. (voice or photo, still processing)"])
+        self.assertEqual(len(self.telegram.buttons(THREAD)), 1)
+        self.assertIn(f"qnow:{THREAD}:{nid}", self.button_callbacks())
+        self.assertIn(f"qjump:{THREAD}:{nid}", self.button_callbacks())
+        self.assertIn(f"qdrop:{THREAD}:{nid}", self.button_callbacks())
+        self.assertIn("⏭ 1", self.button_labels())
+        self.assertIn("⏩ 2", self.button_labels())
+
+    def test_thirty_items_are_one_message_with_ten_button_rows(self) -> None:
+        self.queue([f"item {n}" for n in range(30)])
+        self.run_cmd("/queue")
+        self.assertEqual(len(self.replies()), 1, "/queue sends one message, whatever the queue length")
+        lines = self.replies()[0].splitlines()
+        self.assertEqual(lines[0], "📥 30 queued:")
+        self.assertEqual(lines[1:], [f"{n}. item {n - 1}" for n in range(1, 31)])
         keyboards = self.telegram.buttons(THREAD)
-        self.assertEqual(len(keyboards), 2)
-        self.assertIn(f"now:{THREAD}:{nid}", self.button_callbacks())
-        self.assertIn(f"jump:{THREAD}:{nid}", self.button_callbacks())
-        self.assertIn(f"drop:{THREAD}:{nid}", self.button_callbacks())
-        self.assertIn("1. first queued", self.replies()[0])
-        self.assertIn("still processing", self.replies()[1])
+        self.assertEqual(len(keyboards), 1)
+        rows = keyboards[0]
+        self.assertEqual(len(rows), QUEUE_BUTTON_ITEMS)
+        self.assertEqual([button["text"] for button in rows[0]], ["⏭ 1", "⏩ 1", "❌ 1"])
+        self.assertEqual([button["text"] for button in rows[-1]], ["⏭ 10", "⏩ 10", "❌ 10"])
+        nid = self.queues.snapshot(THREAD)[9].nid
+        self.assertEqual([button["callback_data"] for button in rows[-1]],
+                         [f"qnow:{THREAD}:{nid}", f"qjump:{THREAD}:{nid}", f"qdrop:{THREAD}:{nid}"])
+
+    def test_a_list_over_the_limit_ends_with_the_more_line(self) -> None:
+        self.queue([f"long item {n} " + "x" * 200 for n in range(100)])
+        self.run_cmd("/queue")
+        text = self.replies()[0]
+        self.assertLessEqual(len(text), QUEUE_LIST_CHARS)
+        lines = text.splitlines()
+        listed = len(lines) - 2  # the header and the more line
+        self.assertGreater(listed, 0)
+        self.assertEqual(lines[0], "📥 100 queued:")
+        self.assertEqual(lines[-1], f"… and {100 - listed} more")
+        self.assertTrue(lines[listed].startswith(f"{listed}. long item"))
+        self.assertEqual(len(self.telegram.buttons(THREAD)[0]), QUEUE_BUTTON_ITEMS)
+
+    def test_a_list_that_fits_has_no_more_line(self) -> None:
+        self.queue(["a", "b"])
+        self.run_cmd("/queue")
+        self.assertNotIn("more", self.replies()[0])
+        self.assertEqual(self.replies()[0].splitlines()[-1], "2. b")
 
 
 class RulesTests(InfoCase):

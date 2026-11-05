@@ -4,6 +4,10 @@ Port of the live file's _dispatchers, _dispatch and the runner part of _continue
 3280-3330). A topic runs one turn at a time. Messages that arrive while a turn runs wait in the topic's queue. A media
 message's placeholder is waited for (at most MEDIA_WAIT_SECONDS) when it reaches the head of the queue.
 
+Batches: before it takes a turn, the runner settles (core/arrivals): it waits while messages keep arriving, so a
+forwarded batch is all queued. TopicQueues.take_head then hands over the head and the ready messages behind it as one
+turn, with the merged text and images, and every inbox row of the batch is marked, replayed or dropped together.
+
 Dispatcher starts one daemon runner thread per idle topic. The runner marks the inbox row done when its turn starts,
 sends the typing action, takes a slot, runs the TurnRunner, then sends the answer or the error and submits the title
 job. A turn that a restart stopped keeps its inbox row done (recover() reports it). A turn that a shutdown refused
@@ -35,19 +39,22 @@ is an fcntl file lock taken inside terminal_claim, and only file I/O runs under 
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from tg_bridge.agents.base import AttachSpec
 from tg_bridge.clock import Clock, SystemClock
 from tg_bridge.config import Config
 from tg_bridge.core import terminal_claim
+from tg_bridge.core.arrivals import Arrivals
 from tg_bridge.core.linger import LINGER_CAP_TEXT, LINGER_EXIT_TEXT, POLL_SECONDS, HoldEnd, HoldResult, LingerControl
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.removals import Removals
 from tg_bridge.core.slots import Slot, SlotPool
 from tg_bridge.core.terminal_wait import STALL_SECONDS, TerminalWait
 from tg_bridge.core.titles import TitleService
-from tg_bridge.core.topic_queues import Admission, Delivery, Placeholder, QueuedItem, TopicQueues, _Entry, _HeadKind
+from tg_bridge.core.topic_queues import (
+    Admission, Delivery, Placeholder, QueuedItem, TopicQueues, _Entry, _Head, _HeadKind,
+)
 from tg_bridge.core.turn_runner import TurnRunner
 from tg_bridge.core.turn_text import NO_OUTPUT, RESTART_TEXT
 from tg_bridge.logging_ import Logger
@@ -113,6 +120,7 @@ class Dispatcher:
         self._linger = linger  # None: no session is kept, the runner never holds a topic
         self._hold_pause = hold_failure_pause
         self._clock = clock if clock is not None else SystemClock()  # the media wait's deadline
+        self._arrivals = Arrivals(self._clock)  # the burst settle before each take
         self._poll = poll_seconds  # the slice of a media wait while the topic is held
         self._view_dir = view_dir
         self._queues = TopicQueues()
@@ -135,31 +143,36 @@ class Dispatcher:
         return self._removals.active(thread_id)
 
     def reserve(self, thread_id: int, topic: str, chat_id: int | str, sender: str, update_id: int | None) -> Delivery:
-        """Reserve a media message's place in the topic's queue. Starts the runner when the topic is idle."""
+        """Reserve a media message's place in the topic's queue. Starts the runner when the topic is idle. The delivery
+        says whether the message is a burst follower (Delivery.burst), and the place keeps that flag."""
         if self._removals.active(thread_id):
-            self._drop_removing(thread_id, update_id)
+            self._drop_removing(thread_id, [update_id])
             return Delivery(Admission.DROPPED)
-        delivery = self._queues.reserve(thread_id, chat_id, sender, update_id, quiet=self._quiet(thread_id))
+        burst = self._arrivals.mark(thread_id)  # after the removal check: a dropped message is not an arrival
+        delivery = self._queues.reserve(thread_id, chat_id, sender, update_id, quiet=self._quiet(thread_id),
+                                        burst=burst)
         if delivery.admission is Admission.STARTED:
             self._start(thread_id, topic)
-        return delivery
+        return self._arrivals.admitted(thread_id, delivery, burst)
 
     def deliver(self, thread_id: int, topic: str, chat_id: int | str, sender: str, update_id: int | None, text: str,
                 reserved: str | None = None, images: tuple[str, ...] = ()) -> Delivery:
         """Hand over a message's text and local image paths: a filled placeholder, a queued message, or the first
         message of an idle topic (which starts the runner). The images reach the turn's session as native image input
-        when its backend takes them. Notices and buttons are the caller's to send (see Delivery.notify). A message to an
-        idle kept session is HANDED: no notice, and the held runner is woken to take it."""
+        when its backend takes them. Notices and buttons are the caller's to send (see Delivery.notify and
+        Delivery.burst). A message to an idle kept session is HANDED: no notice, and the held runner is woken to take
+        it."""
         if self._removals.active(thread_id):
-            self._drop_removing(thread_id, update_id)
+            self._drop_removing(thread_id, [update_id])
             return Delivery(Admission.DROPPED)
+        burst = False if reserved is not None else self._arrivals.mark(thread_id)  # a fill: marked at its reservation
         delivery = self._queues.deliver(thread_id, chat_id, sender, update_id, text, reserved, images,
-                                        quiet=self._quiet(thread_id))
+                                        quiet=self._quiet(thread_id), burst=burst)
         if delivery.admission is Admission.STARTED:
             self._start(thread_id, topic)
         elif delivery.admission is Admission.HANDED and self._linger is not None:
             self._linger.wake(thread_id)
-        return delivery
+        return self._arrivals.admitted(thread_id, delivery, burst)
 
     def unreserve(self, thread_id: int, nid: str | None) -> bool:
         return self._queues.unreserve(thread_id, nid)
@@ -171,7 +184,7 @@ class Dispatcher:
         """Remove a queued message. Its inbox row is marked done, so it never replays."""
         item = self._queues.drop(thread_id, nid)
         if item is not None:
-            self._mark_done(item.update_id)
+            self._mark_done([item.update_id])
         return item
 
     def queue_snapshot(self, thread_id: int) -> tuple[QueuedItem, ...]:
@@ -181,12 +194,11 @@ class Dispatcher:
         """Drops every queued message of a topic, as a topic removal does. Their inbox rows are marked done here, so a
         refused removal does not replay them at the next start. Returns how many were dropped."""
         items = self._queues.drain(thread_id)
-        for item in items:
-            self._mark_done(item.update_id)
+        self._mark_done(item.update_id for item in items)
         return len(items)
 
-    def _drop_removing(self, thread_id: int, update_id: int | None) -> None:
-        self._mark_done(update_id)
+    def _drop_removing(self, thread_id: int, update_ids: Iterable[int | None]) -> None:
+        self._mark_done(update_ids)
         self._logger.log(f"message for a topic being removed: dropped (thread {thread_id})")
 
     # the runner
@@ -206,6 +218,8 @@ class Dispatcher:
         shutdown, or when the bridge is shutting down."""
         failures = 0  # consecutive failed hold ticks of this runner
         while not self._live.is_shutting_down():
+            failures = self._settle(thread_id, failures)  # a forwarded batch still arriving is taken as one turn
+            if self._live.is_shutting_down(): return  # the rows of the batch stay pending: the next start replays them
             holding = self._holding(thread_id)
             head = self._queues.take_head(thread_id, keep_busy=holding)
             if head.kind is _HeadKind.EMPTY:
@@ -218,8 +232,20 @@ class Dispatcher:
                 continue
             if head.entry is None or head.text is None:  # READY always carries both; guards the type only
                 return
-            if not self._run_entry(thread_id, topic, head.entry, head.text, head.images):
+            if not self._run_entry(thread_id, topic, head):
                 return
+
+    def _settle(self, thread_id: int, failures: int) -> int:
+        """Waits while messages keep arriving, in sleeps of at most poll_seconds; a held topic ticks instead."""
+        started = self._clock.monotonic()
+        left = self._arrivals.remaining(thread_id, started)
+        while left > 0 and not (self._live.is_shutting_down() or self._removals.active(thread_id)):
+            if self._holding(thread_id):
+                failures = self._hold_tick(thread_id, failures)
+            else:
+                self._clock.sleep(min(left, self._poll))
+            left = self._arrivals.remaining(thread_id, started)
+        return failures
 
     def _await_media(self, thread_id: int, entry: _Entry | None) -> None:
         """Wait for the head placeholder for at most the media wait. While the topic holds a kept session, the wait runs
@@ -318,14 +344,14 @@ class Dispatcher:
         except Exception as exc:
             self._logger.log(f"linger: thread {thread_id} notice not sent: {str(exc)[:SEND_ERROR_CHARS]}")
 
-    def _run_entry(self, thread_id: int, topic: str, entry: _Entry, text: str, images: tuple[str, ...]) -> bool:
-        """Run one queued message as a turn, once the terminal allows it (TerminalWait). False: the runner must stop
+    def _run_entry(self, thread_id: int, topic: str, head: _Head) -> bool:
+        """Run one queued batch as a turn, once the terminal allows it (TerminalWait). False: the runner must stop
         (restart stop, shutdown refusal, shutdown while the terminal held the topic). A terminal that was not ready when
-        the turn was to start (_run_turn returns None) sends the message back into the terminal wait, without a reply.
+        the turn was to start (_run_turn returns None) sends the batch back into the terminal wait, without a reply.
         Before a turn the bridge spawns itself (attach None), the before_turn hook runs; an attached turn skips it."""
         while True:
-            turn = self._terminal.wait(thread_id, entry.chat_id)
-            if turn is None:  # no turn started: the row is still pending for a restart
+            turn = self._terminal.wait(thread_id, head.entry.chat_id)
+            if turn is None:  # no turn started: the rows are still pending for a restart
                 return False
             if turn.attach is None and self._before_turn is not None:
                 try:
@@ -333,7 +359,7 @@ class Dispatcher:
                 except Exception as exc:  # the hook is best-effort: the turn runs regardless
                     self._logger.log(f"thread {thread_id}: before-turn hook failed: {str(exc)[:SEND_ERROR_CHARS]}")
             try:
-                done = self._run_turn(thread_id, topic, entry, text, images, turn.attach)
+                done = self._run_turn(thread_id, topic, head, turn.attach)
             finally:
                 if turn.attach is None:  # an attached turn marks nothing: the terminal's process is not the bridge's
                     self._end_terminal(thread_id)
@@ -351,59 +377,58 @@ class Dispatcher:
         except OSError as exc:
             self._logger.log(f"terminal: thread {thread_id} turn end not recorded: {str(exc)[:SEND_ERROR_CHARS]}")
 
-    def _run_turn(self, thread_id: int, topic: str, entry: _Entry, text: str, images: tuple[str, ...],
-                  attach: AttachSpec | None) -> bool | None:
-        """The turn of one queued message. False: the runner must stop (restart stop, shutdown refusal). None: the
-        terminal session was not ready (busy, text typed in it, or gone): nothing ran, the row is pending again and the
-        message goes back into the terminal wait. A topic removed before the turn spawns gets no turn: the message is
+    def _run_turn(self, thread_id: int, topic: str, head: _Head, attach: AttachSpec | None) -> bool | None:
+        """The turn of one queued batch. False: the runner must stop (restart stop, shutdown refusal). None: the
+        terminal session was not ready (busy, text typed in it, or gone): nothing ran, the rows are pending again and
+        the batch goes back into the terminal wait. A topic removed before the turn spawns gets no turn: the batch is
         dropped here (checked before any write and after the slot). attach names the terminal session the turn runs in
-        (None: the bridge spawns its own process)."""
-        chat_id = entry.chat_id
+        (None: the bridge spawns its own process). Every update_id of the batch is marked, replayed or dropped as one."""
+        chat_id = head.entry.chat_id
         if self._removals.active(thread_id):
-            self._drop_removing(thread_id, entry.update_id)
+            self._drop_removing(thread_id, self._ids_of(head))
             return True
         try:
             # the turn starts now: a restart from here is reported by recover(), not re-run
-            self._mark_done(entry.update_id)
+            self._mark_done(self._ids_of(head))
             self._typing(chat_id, thread_id)
             slot = self._slots.new_slot(chat_id, thread_id)
-            if not self._take_slot(thread_id, slot):  # a shutdown came while the message waited: it replays on restart
-                self._replay_later(entry.update_id)
+            if not self._take_slot(thread_id, slot):  # a shutdown came while the batch waited: it replays on restart
+                self._replay_later(self._ids_of(head))
                 return False
             if self._removals.active(thread_id):  # the topic was removed while the slot was awaited: nothing spawns
                 slot.give_back()
-                self._drop_removing(thread_id, entry.update_id)
+                self._drop_removing(thread_id, self._ids_of(head))
                 return True
             try:
-                reply = self._turns.run(thread_id=thread_id, chat_id=chat_id, topic=topic, text=text,
-                                        sender=entry.sender, slot=slot, images=images, attach=attach)
+                reply = self._turns.run(thread_id=thread_id, chat_id=chat_id, topic=topic, text=head.text,
+                                        sender=head.entry.sender, slot=slot, images=head.images, attach=attach)
             finally:
                 slot.give_back()
-            if reply.terminal_busy:  # nothing was pasted: the message waits for the terminal again, no reply is sent
-                self._replay_later(entry.update_id)
+            if reply.terminal_busy:  # nothing was pasted: the batch waits for the terminal again, no reply is sent
+                self._replay_later(self._ids_of(head))
                 self._logger.log(f"turn {topic}: terminal not ready, the message waits for it again")
                 return None
-            if reply.err == RESTART_TEXT:  # a restart stopped this turn: recover() tells the topic, the row stays done
+            if reply.err == RESTART_TEXT:  # a restart stopped this turn: recover() tells the topic, the rows stay done
                 return False
-            # a shutdown refused the spawn: the message replays on restart
+            # a shutdown refused the spawn: the batch replays on restart
             if reply.answer is None and reply.err is None:
-                self._replay_later(entry.update_id)
+                self._replay_later(self._ids_of(head))
                 return False
-            self._reply(chat_id, thread_id, topic, text, reply.answer, reply.err)
+            self._reply(chat_id, thread_id, topic, head.first_text or "", reply.answer, reply.err)
             return True
         except Exception as exc:
             self._logger.log(f"turn {topic}: {exc}")
             self._messenger.send_text(chat_id, thread_id, f"bridge error: {str(exc)[:ERROR_TEXT_CHARS]}")
             return True
 
-    def _reply(self, chat_id: int | str, thread_id: int, topic: str, text: str, answer: str | None,
+    def _reply(self, chat_id: int | str, thread_id: int, topic: str, first_text: str, answer: str | None,
                err: str | None) -> None:
         if err:
             self._messenger.send_text(chat_id, thread_id, err)
         else:
             self._answers.send_answer(chat_id, thread_id, answer or NO_OUTPUT, self._config.answer_doc_threshold())
         if answer:  # the title call can take up to two minutes: it is queued after the answer, on its own worker
-            self._titles.submit(chat_id, thread_id, topic, text, answer)
+            self._titles.submit(chat_id, thread_id, topic, first_text, answer)
 
     def _typing(self, chat_id: int | str, thread_id: int) -> None:
         try:
@@ -411,10 +436,15 @@ class Dispatcher:
         except Exception as exc:  # cosmetic only: the turn must run regardless
             self._logger.log(f"sendChatAction: {str(exc)[:SEND_ERROR_CHARS]}")
 
-    def _mark_done(self, update_id: int | None) -> None:
-        if update_id is not None:
-            self._inbox.done(update_id)
+    def _mark_done(self, update_ids: Iterable[int | None]) -> None:
+        ids = [update_id for update_id in update_ids if update_id is not None]
+        if ids:
+            self._inbox.done_many(ids)
 
-    def _replay_later(self, update_id: int | None) -> None:
-        if update_id is not None:
-            self._inbox.mark_pending(update_id)
+    def _replay_later(self, update_ids: list[int]) -> None:
+        if update_ids:
+            self._inbox.mark_pending_many(update_ids)
+
+    @staticmethod
+    def _ids_of(head: _Head) -> list[int]:
+        return [entry.update_id for entry in head.entries if entry.update_id is not None]

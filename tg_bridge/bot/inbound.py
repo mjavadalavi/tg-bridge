@@ -198,7 +198,8 @@ class MessageHandler:
             return Disposition.DEFERRED
         delivery = self._dispatcher.reserve(thread, topic, chat_id, sender_name(message.get("from") or {}), update_id)
         if delivery.admission is Admission.FULL:
-            self._say(chat_id, thread, QUEUE_FULL_TEXT.format(limit=QUEUE_MAX))
+            if not delivery.burst:  # the first refusal of a burst of overflow is the one notice
+                self._say(chat_id, thread, QUEUE_FULL_TEXT.format(limit=QUEUE_MAX))
             return Disposition.DONE
         self._media_pool.submit(self._media_job, message, text, update_id, delivery.nid)
         return Disposition.DEFERRED
@@ -342,12 +343,15 @@ class MessageHandler:
 
     def _enqueue(self, chat_id: Any, thread: int, name: str, sender: str, update_id: int | None, text: str,
                  reserved: str | None, images: tuple[str, ...]) -> Disposition:
-        """Queues the text behind a running turn, or starts the topic's runner. Notices carry the Now/Next/Drop buttons."""
+        """Queues the text behind a running turn, or starts the topic's runner. Notices carry the Now/Next/Drop buttons.
+        A burst follower gets no notice: it joins the turn that the message before it started or queued. A refused
+        message that follows a refused one gets no queue-full notice either (one per burst of overflow)."""
         delivery = self._dispatcher.deliver(thread, name, chat_id, sender, update_id, text, reserved, images)
         if delivery.admission is Admission.FULL:
-            self._say(chat_id, thread, QUEUE_FULL_TEXT.format(limit=QUEUE_MAX))
+            if not delivery.burst:  # the first refusal of a burst of overflow is the one notice
+                self._say(chat_id, thread, QUEUE_FULL_TEXT.format(limit=QUEUE_MAX))
             return Disposition.DONE
-        if delivery.notify and delivery.nid is not None:
+        if delivery.notify and not delivery.burst and delivery.nid is not None:
             text = QUEUED_TERMINAL_TEXT if self._dispatcher.waiting_terminal(thread) else QUEUED_TEXT
             self._out.submit(self._messenger.send_buttons, chat_id, thread,
                              text.format(position=delivery.position), queue_rows(thread, delivery.nid))

@@ -11,10 +11,11 @@ import math
 from tg_bridge.agents.registry import BackendRegistry, UnknownBackend
 from tg_bridge.bot.commands.base import Command, CommandContext, CommandRegistry
 from tg_bridge.config import Config
-from tg_bridge.bot.pickers import rules_picker, status_rows
+from tg_bridge.bot.pickers import ButtonRows, rules_picker, status_rows
 from tg_bridge.core import terminal_claim
 from tg_bridge.core.linger import LingerStatus
 from tg_bridge.core.live import RunningTurn
+from tg_bridge.core.topic_queues import QueuedItem
 from tg_bridge.core.topic_backend import topic_backend
 from tg_bridge.core.turn_listeners import slash_key
 from tg_bridge.feed.format import fmt_k, short
@@ -23,7 +24,15 @@ from tg_bridge.store.turns import CostTotals
 from tg_bridge.telegram.keyboards import CallbackData
 
 DEFAULT_BACKEND = "claude"
-QUEUE_TEXT_CHARS = 80
+QUEUE_TEXT_CHARS = 80  # a queued message as one /queue line is cut to this many characters
+QUEUE_HEADER = "📥 {count} queued:"
+QUEUE_LIST_CHARS = 3500  # the /queue text stops growing here; Telegram allows 4096 characters per message
+QUEUE_MORE_TEXT = "… and {more} more"  # the last line of /queue when the list is cut
+QUEUE_BUTTON_ITEMS = 10  # the first queued messages that get a ⏭ / ⏩ / ❌ button row each
+QUEUE_NOW_KIND = "qnow"  # the buttons of the /queue list: their own kinds, so a tap re-renders the list and does
+QUEUE_JUMP_KIND = "qjump"  # not wipe it (the per-message notice buttons use now / jump / drop and edit to a note)
+QUEUE_DROP_KIND = "qdrop"
+EMPTY_QUEUE_TEXT = "the queue is empty."
 MEDIA_PLACEHOLDER = "(voice or photo, still processing)"  # a queued voice/photo whose text is not in yet
 SQLITE_MAX_INT = 2**63 - 1  # a /forget number above this cannot be a rule id (and would overflow the query)
 SECONDS_PER_MINUTE = 60
@@ -136,17 +145,47 @@ def _cost_line(totals: CostTotals) -> str:
 
 
 def _queue(ctx: CommandContext, args: str) -> None:
-    items = ctx.deps.queues.snapshot(ctx.thread_id)
+    text, rows = queue_view(ctx.thread_id, ctx.deps.queues.snapshot(ctx.thread_id))
+    if rows:
+        ctx.say_buttons(text, rows)
+    else:
+        ctx.say(text)
+
+
+def queue_view(thread_id: int, items: tuple[QueuedItem, ...]) -> tuple[str, ButtonRows]:
+    """The /queue message and its keyboard, also what a tap on that list re-renders. One message: a header with the
+    count, a numbered line per queued message, and a button row for each of the first QUEUE_BUTTON_ITEMS messages
+    (⏭ Now, ⏩ Next, ❌ Drop, labelled with the number). An empty queue is the text alone and no rows."""
     if not items:
-        ctx.say("the queue is empty.")
-        return
+        return EMPTY_QUEUE_TEXT, []
+    rows: ButtonRows = []
+    for index, item in enumerate(items[:QUEUE_BUTTON_ITEMS], 1):
+        rows.append([
+            (f"⏭ {index}", CallbackData(QUEUE_NOW_KIND, (thread_id, item.nid))),
+            (f"⏩ {index}", CallbackData(QUEUE_JUMP_KIND, (thread_id, item.nid))),
+            (f"❌ {index}", CallbackData(QUEUE_DROP_KIND, (thread_id, item.nid))),
+        ])
+    return _queue_text(items), rows
+
+
+def _queue_text(items: tuple[QueuedItem, ...]) -> str:
+    """The /queue message. When the whole list would pass QUEUE_LIST_CHARS, the lines stop early (room is kept for the
+    last line, which tells how many are not listed)."""
+    lines = [QUEUE_HEADER.format(count=len(items))]
     for index, item in enumerate(items, 1):
         body = MEDIA_PLACEHOLDER if item.text is None else item.text
-        ctx.say_buttons(f"{index}. {short(body, QUEUE_TEXT_CHARS)}", [[
-            ("⏭ Now", CallbackData("now", (ctx.thread_id, item.nid))),
-            ("⏩ Next", CallbackData("jump", (ctx.thread_id, item.nid))),
-            ("❌ Drop", CallbackData("drop", (ctx.thread_id, item.nid))),
-        ]])
+        lines.append(f"{index}. {short(body, QUEUE_TEXT_CHARS)}")
+    text = "\n".join(lines)
+    if len(text) <= QUEUE_LIST_CHARS:
+        return text
+    room = len("\n" + QUEUE_MORE_TEXT.format(more=len(items)))  # the longest last line this list can need
+    kept = [lines[0]]
+    for line in lines[1:]:
+        if len("\n".join(kept + [line])) + room > QUEUE_LIST_CHARS:
+            break
+        kept.append(line)
+    more = len(items) - (len(kept) - 1)
+    return "\n".join(kept + [QUEUE_MORE_TEXT.format(more=more)])
 
 
 def _rules(ctx: CommandContext, args: str) -> None:

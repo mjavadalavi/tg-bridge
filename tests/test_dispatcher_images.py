@@ -56,7 +56,7 @@ class PhotoQueueCase(unittest.TestCase):
             turns=self.runner, slots=self.h.slots, inbox=None, messenger=self.h.messenger,
             answers=AnswerSender(self.h.tg, FakeUploader(), self.h.messenger, self.h.logger, self.h.clock),
             titles=_Titles(), client=self.h.tg, live=self.h.live, config=self.h.config, logger=self.h.logger,
-            start_thread=self._start_thread)
+            start_thread=self._start_thread, clock=self.h.clock)
 
     def _start_thread(self, **kwargs: object) -> threading.Thread:
         thread = threading.Thread(**kwargs)  # type: ignore[arg-type]
