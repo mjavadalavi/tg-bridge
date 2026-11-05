@@ -463,6 +463,19 @@ class DispatcherMediaScenarios(DispatcherCase):
         self.assertTrue(self.idle())
         self.assertEqual(self.turns.texts_run(THREAD), ["x1", "b", burst_text(["a", "voice text"])])
 
+    def test_a_wait_on_a_burst_member_behind_the_head_times_out(self) -> None:
+        """The sliced wait counts the real time waited too, so it ends although the FakeClock never moves."""
+        self.dispatcher = self._make_dispatcher(media_wait=0.05)
+        self.turns.gates["y1"] = threading.Event()
+        self.deliver(self.ingest(4400), "y1")
+        self.assertTrue(self.turns.started("y1").wait(WAIT))
+        self.deliver(self.ingest(4401), "a")
+        self.assertTrue(self.dispatcher.reserve(THREAD, TOPIC, CHAT, SENDER, self.ingest(4402)).burst)
+        self.turns.gates["y1"].set()
+        self.assertTrue(self.idle())
+        self.assertTrue(any("still being processed" in text for text in self.tg.texts(THREAD)))
+        self.assertEqual(self.turns.texts_run(THREAD), ["y1", "a"])
+
     def test_media_timeout_releases_the_place_and_tells_the_topic(self) -> None:
         """2: dispatcher moved on after the placeholder timed out
         2: topic told the media is still processing

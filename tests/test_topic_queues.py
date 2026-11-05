@@ -341,6 +341,33 @@ class GroupTests(unittest.TestCase):
 
         self.assertEqual((head.entry.nid, head.lead), (voice.nid, voice.nid))
 
+    def test_a_follower_after_a_refusal_is_announced_as_a_new_message(self) -> None:
+        queues = TopicQueues(max_items=2)
+        queues.deliver(THREAD, CHAT, SENDER, 1, "running")
+        queues.take_head(THREAD)
+        queues.deliver(THREAD, CHAT, SENDER, 81, "a")
+        b = queues.deliver(THREAD, CHAT, SENDER, 82, "b", burst=True)
+        self.assertTrue(b.burst)
+        queues.deliver(THREAD, CHAT, SENDER, 83, "refused", burst=True)
+        queues.drop(THREAD, b.nid)
+
+        after = queues.deliver(THREAD, CHAT, SENDER, 84, "c", burst=True)
+
+        self.assertFalse(after.burst, "a new group: its queued notice and buttons are sent")
+
+    def test_a_follower_of_a_burst_whose_turn_was_taken_starts_its_own_group(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 91, "a")
+        self.queues.deliver(THREAD, CHAT, SENDER, 92, "b", burst=True)
+        self.queues.take_head(THREAD)
+
+        late = self.queues.deliver(THREAD, CHAT, SENDER, 93, "late part", burst=True)
+        voice = self.queues.reserve(THREAD, CHAT, SENDER, 94, burst=True)
+
+        self.assertFalse(late.burst, "nothing of its burst is queued: it is announced")
+        self.assertTrue(voice.burst, "it joins the late part")
+        self.queues.deliver(THREAD, CHAT, SENDER, 94, "voice", voice.nid)
+        self.assertEqual(self.queues.take_head(THREAD).text, burst_text(["late part", "voice"]))
+
     def test_head_nid_of_an_empty_queue_is_none(self) -> None:
         self.assertIsNone(self.queues.head_nid(THREAD))
 

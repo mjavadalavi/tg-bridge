@@ -252,20 +252,20 @@ class Dispatcher:
         while the topic holds a kept session (a hold tick runs between them) or while the placeholder is a burst member
         behind the head lead (it ends early once the head changes: a Now or a Drop made another batch next). Otherwise
         the rest is one plain wait. On timeout the place is released and the topic is told; the late result is queued at
-        the back. The slices are real waits; only the deadline reads the injected clock (a FakeClock moves it)."""
+        the back. The deadline reads the injected clock, and the real time waited counts too, so every wait ends."""
         if entry is None or not isinstance(entry.body, Placeholder):
             return
         ev, behind = entry.body.ev, lead is not None and lead != entry.nid
-        deadline = self._clock.monotonic() + self._media_wait
-        failures = 0
-        while (left := deadline - self._clock.monotonic()) > 0:
+        deadline, waited, failures = self._clock.monotonic() + self._media_wait, 0.0, 0
+        while (left := min(deadline - self._clock.monotonic(), self._media_wait - waited)) > 0:  # real waits count too
             holding = self._holding(thread_id)
             if not (holding or behind):  # the rest of the wait is plain
                 if ev.wait(left):
                     return
                 break
-            if ev.wait(min(self._poll, left)) or (behind and self._queues.head_nid(thread_id) != lead):
+            if ev.wait(step := min(self._poll, left)) or (behind and self._queues.head_nid(thread_id) != lead):
                 return
+            waited += step
             if holding:
                 failures = self._hold_tick(thread_id, failures)
         self._media_timed_out(thread_id, entry)

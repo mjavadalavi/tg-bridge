@@ -6,8 +6,8 @@ A topic runs one turn at a time. Messages that arrive while a turn runs wait in 
 QUEUE_MAX of them. A media message reserves its place at once as a Placeholder; its download and transcription fill it
 later. The runner, in dispatcher.py, waits for an unfilled placeholder when it reaches the head of the queue.
 Groups: every queued message carries a group id. A burst follower (it arrived within the burst gap of the topic's
-previous message, see arrivals.py) takes the group of that message; any other message starts a group of its own. A
-refused message (queue full) ends the chain, so the next follower starts a new group. A turn takes a batch: the head and
+previous message, see arrivals.py) joins the group of that message while a member of it is still queued; any other
+message starts a group of its own. A refused message (queue full) ends the chain, so the next follower starts anew. A turn takes a batch: the head and
 the later messages of its group, at most MERGE_MAX, merged into one text, so a forwarded batch runs as one turn. The
 group is an identity, not a position: ⏭ Now / ⏩ Next move a whole group, and a Drop or a released placeholder never
 lets two groups merge. A message that is a command (its first non-space character is "/" or "!") always runs alone.
@@ -65,7 +65,7 @@ class Delivery:
     nid: str | None = None
     position: int = 0
     busy: bool = False  # FILLED: whether a turn was running when the placeholder was reserved
-    burst: bool = False  # the message followed another within the burst gap: it is announced by nobody, it joins a turn
+    burst: bool = False  # the message joined a queued group (a burst): it is announced by nobody, it joins that turn
 
     @property
     def notify(self) -> bool:
@@ -182,12 +182,13 @@ class TopicQueues:
             if len(queue) >= self._max:
                 return self._refuse(thread_id)
             busy = thread_id in self._busy
-            queue.append(_Entry(nid, Placeholder(busy and not quiet), chat_id, sender, update_id,
-                                group=self._group(thread_id, nid, burst)))
+            entry = _Entry(nid, Placeholder(busy and not quiet), chat_id, sender, update_id,
+                           group=self._group(thread_id, queue, nid, burst))
+            queue.append(entry)
             if busy:
-                return Delivery(Admission.RESERVED, nid, len(queue), burst=burst)
+                return Delivery(Admission.RESERVED, nid, len(queue), burst=entry.follower)
             self._busy.add(thread_id)
-            return Delivery(Admission.STARTED, nid, len(queue), burst=burst)
+            return Delivery(Admission.STARTED, nid, len(queue), burst=entry.follower)
 
     def deliver(self, thread_id: int | str, chat_id: int | str, sender: str, update_id: int | None, text: str,
                 reserved: str | None = None, images: tuple[str, ...] = (), quiet: bool = False,
@@ -209,16 +210,16 @@ class TopicQueues:
                     entry.body.images = images
                     entry.body.ev.set()
                     return Delivery(Admission.FILLED, entry.nid, idx + 1, entry.body.busy, entry.follower)
-            if thread_id in self._busy:
-                if len(queue) >= self._max:
-                    return self._refuse(thread_id)
-                queue.append(_Entry(nid, text, chat_id, sender, update_id, images, self._group(thread_id, nid, burst)))
-                if quiet:
-                    return Delivery(Admission.HANDED, nid, len(queue), burst=burst)
-                return Delivery(Admission.QUEUED, nid, len(queue), burst=burst)
-            queue.append(_Entry(nid, text, chat_id, sender, update_id, images, self._group(thread_id, nid, burst)))
-            self._busy.add(thread_id)
-            return Delivery(Admission.STARTED, nid, len(queue), burst=burst)
+            busy = thread_id in self._busy
+            if busy and len(queue) >= self._max:
+                return self._refuse(thread_id)
+            entry = _Entry(nid, text, chat_id, sender, update_id, images, self._group(thread_id, queue, nid, burst))
+            queue.append(entry)
+            if not busy:
+                self._busy.add(thread_id)
+                return Delivery(Admission.STARTED, nid, len(queue), burst=entry.follower)
+            admission = Admission.HANDED if quiet else Admission.QUEUED
+            return Delivery(admission, nid, len(queue), burst=entry.follower)
 
     def unreserve(self, thread_id: int | str, nid: str | None) -> bool:
         """Remove a placeholder that will never be filled (its download failed, or it timed out). Wakes a runner that
@@ -326,10 +327,13 @@ class TopicQueues:
             images = tuple(image for entry in taken for image in _images_of(entry))
             return _Head(_HeadKind.READY, taken[0], text, images, tuple(taken), _text_of(taken[0]))
 
-    def _group(self, thread_id: int | str, nid: str, burst: bool) -> str:
-        """The group of a message being queued (call under the lock): the group of the topic's latest queued message
-        for a burst follower, else a group of its own. It becomes the topic's latest group."""
-        group = self._groups.get(thread_id, nid) if burst else nid
+    def _group(self, thread_id: int | str, queue: list[_Entry], nid: str, burst: bool) -> str:
+        """The group of a message being queued (call under the lock): for a burst follower, the group of the topic's
+        latest queued message while a member of it is still in the queue (a burst whose turn was taken is over); else
+        a group of its own. It becomes the topic's latest group."""
+        group = self._groups.get(thread_id) if burst else None
+        if group is None or not any(entry.group == group for entry in queue):
+            group = nid
         self._groups[thread_id] = group
         return group
 
