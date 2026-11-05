@@ -9,7 +9,7 @@ The queue holds data only, so these tests run without threads.
 import unittest
 
 from tg_bridge.core.topic_queues import (
-    BURST_HEADER, MERGE_MAX, Admission, Placeholder, TopicQueues, burst_text,
+    BURST_FOOTER, MERGE_MAX, Admission, Placeholder, TopicQueues, _HeadKind, burst_text,
 )
 
 THREAD = 7001
@@ -103,18 +103,18 @@ class BatchTakeTests(unittest.TestCase):
         self.assertIs(self.queues.deliver(THREAD, CHAT, SENDER, 1, "running").admission, Admission.STARTED)
         self.assertEqual(self.queues.take_head(THREAD).text, "running")
 
-    def test_three_ready_entries_are_one_head_with_header_parts_and_images(self) -> None:
+    def test_three_burst_entries_are_one_head_with_parts_footer_and_images(self) -> None:
         self.queues.deliver(THREAD, CHAT, SENDER, 11, "bug A", images=("/tmp/a.png",))
-        self.queues.deliver(THREAD, CHAT, SENDER, 12, "bug B")
-        self.queues.deliver(THREAD, CHAT, SENDER, 13, "bug C", images=("/tmp/c1.png", "/tmp/c2.png"))
+        self.queues.deliver(THREAD, CHAT, SENDER, 12, "bug B", burst=True)
+        self.queues.deliver(THREAD, CHAT, SENDER, 13, "bug C", images=("/tmp/c1.png", "/tmp/c2.png"), burst=True)
 
         head = self.queues.take_head(THREAD)
 
         self.assertEqual(head.kind.value, "ready")
-        expected = (f"{BURST_HEADER.format(count=3)}\n\n"
-                    "--- message 1/3 ---\nbug A\n\n"
-                    "--- message 2/3 ---\nbug B\n\n"
-                    "--- message 3/3 ---\nbug C")
+        expected = ("bug A\n\n"
+                    "--- message 2/3, sent together with the one above ---\nbug B\n\n"
+                    "--- message 3/3, sent together with the one above ---\nbug C\n\n"
+                    f"{BURST_FOOTER.format(count=3)}")
         self.assertEqual(head.text, expected)
         self.assertEqual(head.images, ("/tmp/a.png", "/tmp/c1.png", "/tmp/c2.png"))
         self.assertEqual([e.update_id for e in head.entries], [11, 12, 13])
@@ -122,42 +122,131 @@ class BatchTakeTests(unittest.TestCase):
         self.assertEqual(self.queues.snapshot(THREAD), ())
         self.assertEqual(self.queues.take_head(THREAD, keep_busy=True).kind.value, "empty")
 
+    def test_the_merged_text_starts_with_the_first_text_and_ends_with_the_footer(self) -> None:
+        self.assertEqual(burst_text(["one", "two", "three"]).split("\n\n")[0], "one")
+        self.assertTrue(burst_text(["one", "two", "three"]).endswith(BURST_FOOTER.format(count=3)))
+        self.assertEqual(burst_text(["solo"]), "solo")
+
+    def test_first_text_is_the_first_entrys_own_text(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 41, "topic title source", burst=False)
+        self.queues.deliver(THREAD, CHAT, SENDER, 42, "second", burst=True)
+
+        head = self.queues.take_head(THREAD)
+
+        self.assertEqual(head.first_text, "topic title source")
+        self.assertNotEqual(head.first_text, head.text)
+
     def test_single_entry_text_and_images_are_unchanged(self) -> None:
         self.queues.deliver(THREAD, CHAT, SENDER, 21, "just one", images=("/tmp/one.png",))
 
         head = self.queues.take_head(THREAD)
 
         self.assertEqual(head.text, "just one")
+        self.assertEqual(head.first_text, "just one")
         self.assertEqual(head.images, ("/tmp/one.png",))
         self.assertEqual(len(head.entries), 1)
         self.assertIs(head.entry, head.entries[0])
 
-    def test_batch_stops_at_an_unfilled_placeholder_which_stays_the_head(self) -> None:
-        self.queues.deliver(THREAD, CHAT, SENDER, 31, "a")
-        self.queues.deliver(THREAD, CHAT, SENDER, 32, "b")
-        voice = self.queues.reserve(THREAD, CHAT, SENDER, 33)
-        self.queues.deliver(THREAD, CHAT, SENDER, 34, "c")
+    def test_only_burst_followers_merge_into_the_head(self) -> None:
+        """A message sent minutes later (burst=False) is not merged, even though it is ready and queued behind."""
+        self.queues.deliver(THREAD, CHAT, SENDER, 51, "first")
+        self.queues.deliver(THREAD, CHAT, SENDER, 52, "minutes later")
+        self.queues.deliver(THREAD, CHAT, SENDER, 53, "part of that burst", burst=True)
 
         first = self.queues.take_head(THREAD)
-        self.assertEqual(first.text, burst_text(["a", "b"]))
-        self.assertEqual([e.update_id for e in first.entries], [31, 32])
-        self.assertEqual([item.text for item in self.queues.snapshot(THREAD)], [None, "c"])  # the place is kept
+        self.assertEqual(first.text, "first")
+        self.assertEqual(len(first.entries), 1)
+
+        second = self.queues.take_head(THREAD)
+        self.assertEqual(second.text, burst_text(["minutes later", "part of that burst"]))
+
+    def test_a_slash_command_head_runs_alone(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 61, "/compact", burst=True)
+        self.queues.deliver(THREAD, CHAT, SENDER, 62, "later", burst=True)
+
+        command = self.queues.take_head(THREAD)
+        self.assertEqual(command.text, "/compact")
+        self.assertEqual(len(command.entries), 1)
+
+        self.assertEqual(self.queues.take_head(THREAD).text, "later")
+
+    def test_a_slash_command_follower_ends_the_batch(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 71, "one")
+        self.queues.deliver(THREAD, CHAT, SENDER, 72, "  /x", burst=True)
+        self.queues.deliver(THREAD, CHAT, SENDER, 73, "two", burst=True)
+
+        self.assertEqual(self.queues.take_head(THREAD).text, "one")
+        self.assertEqual(self.queues.take_head(THREAD).text, "  /x")
+        self.assertEqual(self.queues.take_head(THREAD).text, "two")
+
+    def test_a_bash_mode_bang_runs_alone_as_head_and_as_follower(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 81, "!ls")
+        self.queues.deliver(THREAD, CHAT, SENDER, 82, "after the ls", burst=True)
+        self.assertEqual(self.queues.take_head(THREAD).text, "!ls")
+        self.assertEqual(self.queues.take_head(THREAD).text, "after the ls")
+
+        self.queues.deliver(THREAD, CHAT, SENDER, 83, "before the ls")
+        self.queues.deliver(THREAD, CHAT, SENDER, 84, "!ls", burst=True)
+        self.assertEqual(self.queues.take_head(THREAD).text, "before the ls")
+        self.assertEqual(self.queues.take_head(THREAD).text, "!ls")
+
+    def test_an_unfilled_burst_placeholder_behind_the_head_is_waited_for_and_nothing_is_popped(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 91, "a")
+        voice = self.queues.reserve(THREAD, CHAT, SENDER, 92, burst=True)
+
+        head = self.queues.take_head(THREAD)
+
+        self.assertIs(head.kind, _HeadKind.WAIT)
+        self.assertEqual(head.entry.nid, voice.nid)
+        self.assertIsInstance(head.entry.body, Placeholder)
+        self.assertEqual([item.text for item in self.queues.snapshot(THREAD)], ["a", None])
+
+        self.queues.deliver(THREAD, CHAT, SENDER, 92, "voice text", voice.nid)
+        merged = self.queues.take_head(THREAD)
+        self.assertEqual(merged.text, burst_text(["a", "voice text"]))
+        self.assertEqual([e.update_id for e in merged.entries], [91, 92])
+
+    def test_a_non_burst_placeholder_behind_the_head_does_not_block(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 101, "a")
+        self.queues.reserve(THREAD, CHAT, SENDER, 102)  # sent minutes later: not a follower
+
+        head = self.queues.take_head(THREAD)
+
+        self.assertIs(head.kind, _HeadKind.READY)
+        self.assertEqual(head.text, "a")
+        self.assertEqual([item.text for item in self.queues.snapshot(THREAD)], [None])
+
+    def test_batch_stops_at_an_unfilled_placeholder_which_stays_the_head(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 31, "a")
+        self.queues.deliver(THREAD, CHAT, SENDER, 32, "b", burst=True)
+        voice = self.queues.reserve(THREAD, CHAT, SENDER, 33, burst=True)
+        self.queues.deliver(THREAD, CHAT, SENDER, 34, "c", burst=True)
 
         waiting = self.queues.take_head(THREAD)
         self.assertEqual(waiting.kind.value, "wait")
-        self.assertIsInstance(waiting.entry.body, Placeholder)
+        self.assertEqual(waiting.entry.nid, voice.nid)
         self.assertEqual(waiting.entries, ())
+        self.assertEqual([item.text for item in self.queues.snapshot(THREAD)], ["a", "b", None, "c"])
 
         self.queues.deliver(THREAD, CHAT, SENDER, 33, "voice text", voice.nid)
         filled = self.queues.take_head(THREAD)
-        self.assertEqual(filled.text, burst_text(["voice text", "c"]))
-        self.assertEqual([e.update_id for e in filled.entries], [33, 34])
-        self.assertTrue(filled.entries[0].body.ev.is_set())
+        self.assertEqual(filled.text, burst_text(["a", "b", "voice text", "c"]))
+        self.assertEqual([e.update_id for e in filled.entries], [31, 32, 33, 34])
+        self.assertIsInstance(filled.entries[2].body, Placeholder)
+        self.assertTrue(filled.entries[2].body.ev.is_set())
+
+    def test_a_filled_placeholder_keeps_its_burst_flag(self) -> None:
+        self.queues.deliver(THREAD, CHAT, SENDER, 111, "a")
+        voice = self.queues.reserve(THREAD, CHAT, SENDER, 112, burst=True)
+        filled = self.queues.deliver(THREAD, CHAT, SENDER, 112, "voice", voice.nid)
+        self.assertIs(filled.admission, Admission.FILLED)
+        self.assertTrue(filled.burst)
 
     def test_merge_is_bounded_by_merge_max(self) -> None:
         total = MERGE_MAX + 5
         for i in range(total):
-            self.assertIs(self.queues.deliver(THREAD, CHAT, SENDER, 100 + i, f"m{i}").admission, Admission.QUEUED)
+            self.assertIs(self.queues.deliver(THREAD, CHAT, SENDER, 100 + i, f"m{i}", burst=True).admission,
+                          Admission.QUEUED)
 
         first = self.queues.take_head(THREAD)
         second = self.queues.take_head(THREAD)

@@ -394,6 +394,14 @@ class QueueTests(InboundCase):
         self.assertEqual(self.sent()[-1], QUEUE_FULL)
         self.assertEqual(len(self.queued()), QUEUE_MAX)
 
+    def test_a_burst_of_overflow_gets_one_queue_full_notice(self) -> None:
+        for index in range(QUEUE_MAX):
+            self.handle(self.message(f"m{index}"))
+        for index in range(20):  # a forwarded batch: all within the gap, so each refusal follows the one before
+            self.assertIs(self.handle(self.message(f"over{index}")), Disposition.DONE)
+        self.assertEqual(self.sent(), [QUEUE_FULL], "one notice for the burst, not one per refused message")
+        self.assertEqual(len(self.queued()), QUEUE_MAX)
+
 
 class MediaTests(InboundCase):
     PHOTO = [{"file_id": "f1"}]

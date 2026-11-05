@@ -16,6 +16,7 @@ import time
 from tests.test_dispatcher import CHAT, SENDER, THREAD, TOPIC, DispatcherCase, wait_until
 from tests.test_dispatcher_linger import StubLinger
 from tg_bridge.core import terminal_claim
+from tg_bridge.core.arrivals import BURST_GAP_SECONDS
 from tg_bridge.core.dispatcher import Dispatcher
 from tg_bridge.core.linger import HoldEnd
 from tg_bridge.core.view_recorder import META_SUFFIX, STATE_IDLE, STATE_RUNNING
@@ -151,6 +152,8 @@ class KeptTopicKeepsItsMark(TerminalDispatcherCase):
         self.linger.holds = True  # the turn that runs now is kept
         self.ingest(1)
         self.deliver(1, "first")
+        self.assertTrue(wait_until(lambda: self.linger.calls >= 1), "the settle did not tick the hold")
+        self.clock.advance(BURST_GAP_SECONDS + 1)  # the held settle waits for the gap: the fake clock moves past it
         self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the turn did not run")
         self.assertTrue(wait_until(lambda: self.linger.calls >= 2), "the runner did not tick the hold")
         self.assertTrue(terminal_claim.turn_marked(self.view, THREAD), "the kept session lost its mark")
@@ -194,6 +197,8 @@ class KeptTopicKeepsItsMark(TerminalDispatcherCase):
         self.linger.holds = True
         self.ingest(1)
         self.deliver(1, "first")
+        self.assertTrue(wait_until(lambda: self.linger.calls >= 1), "the settle did not tick the hold")
+        self.clock.advance(BURST_GAP_SECONDS + 1)  # the held settle waits for the gap: the fake clock moves past it
         self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the turn did not run")
         self.assertTrue(wait_until(lambda: self.linger.calls >= 1), "the runner did not tick the hold")
         self.assertTrue(terminal_claim.turn_marked(self.view, THREAD), "the kept session lost its mark")

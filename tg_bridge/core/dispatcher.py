@@ -39,7 +39,7 @@ is an fcntl file lock taken inside terminal_claim, and only file I/O runs under 
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from tg_bridge.agents.base import AttachSpec
 from tg_bridge.clock import Clock, SystemClock
@@ -145,15 +145,15 @@ class Dispatcher:
     def reserve(self, thread_id: int, topic: str, chat_id: int | str, sender: str, update_id: int | None) -> Delivery:
         """Reserve a media message's place in the topic's queue. Starts the runner when the topic is idle. The delivery
         says whether the message is a burst follower (Delivery.burst), and the place keeps that flag."""
-        burst = self._arrivals.mark(thread_id)
         if self._removals.active(thread_id):
-            self._drop_removing(thread_id, update_id)
+            self._drop_removing(thread_id, [update_id])
             return Delivery(Admission.DROPPED)
+        burst = self._arrivals.mark(thread_id)  # after the removal check: a dropped message is not an arrival
         delivery = self._queues.reserve(thread_id, chat_id, sender, update_id, quiet=self._quiet(thread_id),
                                         burst=burst)
         if delivery.admission is Admission.STARTED:
             self._start(thread_id, topic)
-        return delivery
+        return self._arrivals.admitted(thread_id, delivery, burst)
 
     def deliver(self, thread_id: int, topic: str, chat_id: int | str, sender: str, update_id: int | None, text: str,
                 reserved: str | None = None, images: tuple[str, ...] = ()) -> Delivery:
@@ -162,17 +162,17 @@ class Dispatcher:
         when its backend takes them. Notices and buttons are the caller's to send (see Delivery.notify and
         Delivery.burst). A message to an idle kept session is HANDED: no notice, and the held runner is woken to take
         it."""
-        burst = self._arrivals.mark(thread_id)
         if self._removals.active(thread_id):
-            self._drop_removing(thread_id, update_id)
+            self._drop_removing(thread_id, [update_id])
             return Delivery(Admission.DROPPED)
+        burst = False if reserved is not None else self._arrivals.mark(thread_id)  # a fill: marked at its reservation
         delivery = self._queues.deliver(thread_id, chat_id, sender, update_id, text, reserved, images,
                                         quiet=self._quiet(thread_id), burst=burst)
         if delivery.admission is Admission.STARTED:
             self._start(thread_id, topic)
         elif delivery.admission is Admission.HANDED and self._linger is not None:
             self._linger.wake(thread_id)
-        return delivery
+        return self._arrivals.admitted(thread_id, delivery, burst)
 
     def unreserve(self, thread_id: int, nid: str | None) -> bool:
         return self._queues.unreserve(thread_id, nid)
@@ -184,7 +184,7 @@ class Dispatcher:
         """Remove a queued message. Its inbox row is marked done, so it never replays."""
         item = self._queues.drop(thread_id, nid)
         if item is not None:
-            self._mark_done(item.update_id)
+            self._mark_done([item.update_id])
         return item
 
     def queue_snapshot(self, thread_id: int) -> tuple[QueuedItem, ...]:
@@ -194,12 +194,11 @@ class Dispatcher:
         """Drops every queued message of a topic, as a topic removal does. Their inbox rows are marked done here, so a
         refused removal does not replay them at the next start. Returns how many were dropped."""
         items = self._queues.drain(thread_id)
-        for item in items:
-            self._mark_done(item.update_id)
+        self._mark_done(item.update_id for item in items)
         return len(items)
 
-    def _drop_removing(self, thread_id: int, update_id: int | None) -> None:
-        self._mark_done(update_id)
+    def _drop_removing(self, thread_id: int, update_ids: Iterable[int | None]) -> None:
+        self._mark_done(update_ids)
         self._logger.log(f"message for a topic being removed: dropped (thread {thread_id})")
 
     # the runner
@@ -219,7 +218,8 @@ class Dispatcher:
         shutdown, or when the bridge is shutting down."""
         failures = 0  # consecutive failed hold ticks of this runner
         while not self._live.is_shutting_down():
-            self._arrivals.settle(thread_id)  # a forwarded batch still arriving is taken as one turn
+            failures = self._settle(thread_id, failures)  # a forwarded batch still arriving is taken as one turn
+            if self._live.is_shutting_down(): return  # the rows of the batch stay pending: the next start replays them
             holding = self._holding(thread_id)
             head = self._queues.take_head(thread_id, keep_busy=holding)
             if head.kind is _HeadKind.EMPTY:
@@ -234,6 +234,18 @@ class Dispatcher:
                 return
             if not self._run_entry(thread_id, topic, head):
                 return
+
+    def _settle(self, thread_id: int, failures: int) -> int:
+        """Waits while messages keep arriving, in sleeps of at most poll_seconds; a held topic ticks instead."""
+        started = self._clock.monotonic()
+        left = self._arrivals.remaining(thread_id, started)
+        while left > 0 and not (self._live.is_shutting_down() or self._removals.active(thread_id)):
+            if self._holding(thread_id):
+                failures = self._hold_tick(thread_id, failures)
+            else:
+                self._clock.sleep(min(left, self._poll))
+            left = self._arrivals.remaining(thread_id, started)
+        return failures
 
     def _await_media(self, thread_id: int, entry: _Entry | None) -> None:
         """Wait for the head placeholder for at most the media wait. While the topic holds a kept session, the wait runs
@@ -373,19 +385,19 @@ class Dispatcher:
         (None: the bridge spawns its own process). Every update_id of the batch is marked, replayed or dropped as one."""
         chat_id = head.entry.chat_id
         if self._removals.active(thread_id):
-            self._batch(head, lambda uid: self._drop_removing(thread_id, uid))
+            self._drop_removing(thread_id, self._ids_of(head))
             return True
         try:
             # the turn starts now: a restart from here is reported by recover(), not re-run
-            self._batch(head, self._mark_done)
+            self._mark_done(self._ids_of(head))
             self._typing(chat_id, thread_id)
             slot = self._slots.new_slot(chat_id, thread_id)
             if not self._take_slot(thread_id, slot):  # a shutdown came while the batch waited: it replays on restart
-                self._batch(head, self._replay_later)
+                self._replay_later(self._ids_of(head))
                 return False
             if self._removals.active(thread_id):  # the topic was removed while the slot was awaited: nothing spawns
                 slot.give_back()
-                self._batch(head, lambda uid: self._drop_removing(thread_id, uid))
+                self._drop_removing(thread_id, self._ids_of(head))
                 return True
             try:
                 reply = self._turns.run(thread_id=thread_id, chat_id=chat_id, topic=topic, text=head.text,
@@ -393,30 +405,30 @@ class Dispatcher:
             finally:
                 slot.give_back()
             if reply.terminal_busy:  # nothing was pasted: the batch waits for the terminal again, no reply is sent
-                self._batch(head, self._replay_later)
+                self._replay_later(self._ids_of(head))
                 self._logger.log(f"turn {topic}: terminal not ready, the message waits for it again")
                 return None
             if reply.err == RESTART_TEXT:  # a restart stopped this turn: recover() tells the topic, the rows stay done
                 return False
             # a shutdown refused the spawn: the batch replays on restart
             if reply.answer is None and reply.err is None:
-                self._batch(head, self._replay_later)
+                self._replay_later(self._ids_of(head))
                 return False
-            self._reply(chat_id, thread_id, topic, head.text, reply.answer, reply.err)
+            self._reply(chat_id, thread_id, topic, head.first_text or "", reply.answer, reply.err)
             return True
         except Exception as exc:
             self._logger.log(f"turn {topic}: {exc}")
             self._messenger.send_text(chat_id, thread_id, f"bridge error: {str(exc)[:ERROR_TEXT_CHARS]}")
             return True
 
-    def _reply(self, chat_id: int | str, thread_id: int, topic: str, text: str, answer: str | None,
+    def _reply(self, chat_id: int | str, thread_id: int, topic: str, first_text: str, answer: str | None,
                err: str | None) -> None:
         if err:
             self._messenger.send_text(chat_id, thread_id, err)
         else:
             self._answers.send_answer(chat_id, thread_id, answer or NO_OUTPUT, self._config.answer_doc_threshold())
         if answer:  # the title call can take up to two minutes: it is queued after the answer, on its own worker
-            self._titles.submit(chat_id, thread_id, topic, text, answer)
+            self._titles.submit(chat_id, thread_id, topic, first_text, answer)
 
     def _typing(self, chat_id: int | str, thread_id: int) -> None:
         try:
@@ -424,16 +436,15 @@ class Dispatcher:
         except Exception as exc:  # cosmetic only: the turn must run regardless
             self._logger.log(f"sendChatAction: {str(exc)[:SEND_ERROR_CHARS]}")
 
-    def _mark_done(self, update_id: int | None) -> None:
-        if update_id is not None:
-            self._inbox.done(update_id)
+    def _mark_done(self, update_ids: Iterable[int | None]) -> None:
+        ids = [update_id for update_id in update_ids if update_id is not None]
+        if ids:
+            self._inbox.done_many(ids)
 
-    def _replay_later(self, update_id: int | None) -> None:
-        if update_id is not None:
-            self._inbox.mark_pending(update_id)
+    def _replay_later(self, update_ids: list[int]) -> None:
+        if update_ids:
+            self._inbox.mark_pending_many(update_ids)
 
     @staticmethod
-    def _batch(head: _Head, action: Callable[[int | None], None]) -> None:
-        """Applies an inbox action to the update_id of every message of the head's batch."""
-        for entry in head.entries:
-            action(entry.update_id)
+    def _ids_of(head: _Head) -> list[int]:
+        return [entry.update_id for entry in head.entries if entry.update_id is not None]

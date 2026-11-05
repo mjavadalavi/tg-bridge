@@ -3,6 +3,8 @@
 - now / jump / drop: the buttons under a queued message (callback now:<thread>:<nid> and so on). Now moves the item to
   the front and interrupts the running turn on a thread of its own; during a background update it interrupts that
   update only and the item runs on the same session (section 5 D2). Next only moves it; Drop removes it.
+- qnow / qjump / qdrop: the buttons of the /queue list. The same actions, but the tapped list is edited into the list
+  as it is now (queue_view), so the other rows keep working. A gone item is answered and the list is re-rendered.
 - st: the ⏹ Stop button on a progress message. It calls SessionCommands.stop_turn, the same method /stop calls. While a
   background update runs, the topic gets the choice card instead (sq: this update only, or close the session).
 - cm:<thread>:<kind>:<arg> status kinds: st (Stop, the same method again), nw (stop and start fresh), sn (New) and sc
@@ -16,7 +18,13 @@ import threading
 
 from tg_bridge.bot.callbacks.router import CallbackRouter, Tap
 from tg_bridge.bot.commands.base import CommandDeps, CommandRegistry
-from tg_bridge.bot.commands.info import launcher_state
+from tg_bridge.bot.commands.info import (
+    QUEUE_DROP_KIND,
+    QUEUE_JUMP_KIND,
+    QUEUE_NOW_KIND,
+    launcher_state,
+    queue_view,
+)
 from tg_bridge.bot.commands.session import (
     STOP_BUTTON_KIND,
     UPDATE_CLOSED_TEXT,
@@ -75,7 +83,8 @@ def _thread_arg(tap: Tap, count: int) -> int | None:
 
 
 class QueueTaps:
-    """The now / jump / drop buttons of a queued message. The queue itself is the Dispatcher's."""
+    """The now / jump / drop buttons of a queued message, and the qnow / qjump / qdrop buttons of the /queue list. The
+    queue itself is the Dispatcher's."""
 
     def __init__(self, *, dispatcher: Dispatcher, live: LiveRegistry, linger: LingerService | None = None) -> None:
         self._dispatcher = dispatcher
@@ -86,24 +95,33 @@ class QueueTaps:
         router.on("now", self._now)
         router.on("jump", self._jump)
         router.on("drop", self._drop)
+        router.on(QUEUE_NOW_KIND, self._list_now)
+        router.on(QUEUE_JUMP_KIND, self._list_jump)
+        router.on(QUEUE_DROP_KIND, self._list_drop)
 
     def _item(self, tap: Tap) -> tuple[int, str] | None:
         thread = _thread_arg(tap, 2)
         return None if thread is None or not tap.args[1] else (thread, tap.args[1])
 
-    def _now(self, tap: Tap) -> None:
-        item = self._item(tap)
-        if item is None:
-            return
+    def _move_now(self, item: tuple[int, str]) -> bool:
+        """Moves the item to the front and interrupts the turn. False when the item is no longer queued."""
         thread, nid = item
         if not self._dispatcher.to_front(thread, nid):
-            tap.toast(NOT_QUEUED_TEXT)
-            return
+            return False
         # a background update is interrupted alone (section 5 D2): the item then runs on the same kept session
         interrupted = self._linger is not None and self._linger.request_interrupt(thread)
         running = None if interrupted else self._live.request_abort(thread, stop_tap=False)
         if running is not None:  # stop() can take ~20 s: the tap answers at once, the stop runs on its own thread
             threading.Thread(target=running.session.halt_turn, daemon=True).start()
+        return True
+
+    def _now(self, tap: Tap) -> None:
+        item = self._item(tap)
+        if item is None:
+            return
+        if not self._move_now(item):
+            tap.toast(NOT_QUEUED_TEXT)
+            return
         tap.toast(NOW_TOAST)
         tap.edit(NOW_NOTE)
 
@@ -126,6 +144,32 @@ class QueueTaps:
             return
         tap.toast(DROP_TOAST)
         tap.edit(DROP_NOTE)
+
+    def _list_now(self, tap: Tap) -> None:
+        item = self._item(tap)
+        if item is None:
+            return
+        tap.toast(NOW_TOAST if self._move_now(item) else NOT_QUEUED_TEXT)
+        self._render_list(tap, item[0])
+
+    def _list_jump(self, tap: Tap) -> None:
+        item = self._item(tap)
+        if item is None:
+            return
+        tap.toast(JUMP_TOAST if self._dispatcher.to_front(*item) else NOT_QUEUED_TEXT)
+        self._render_list(tap, item[0])
+
+    def _list_drop(self, tap: Tap) -> None:
+        item = self._item(tap)
+        if item is None:
+            return
+        tap.toast(DROP_TOAST if self._dispatcher.drop(*item) is not None else NOT_QUEUED_TEXT)
+        self._render_list(tap, item[0])
+
+    def _render_list(self, tap: Tap, thread: int) -> None:
+        """Edits the tapped /queue message into the queue as it is now (an empty queue is the empty text, no buttons)."""
+        text, rows = queue_view(thread, self._dispatcher.queue_snapshot(thread))
+        tap.edit(text, rows)
 
 
 def _choice_arg(arg: str) -> tuple[str, int, int] | None:

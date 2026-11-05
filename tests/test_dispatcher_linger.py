@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 from tests.test_dispatcher import CHAT, SENDER, THREAD, TOPIC, DispatcherCase, wait_until
+from tg_bridge.core.arrivals import BURST_GAP_SECONDS
 from tg_bridge.core.dispatcher import Dispatcher
 from tg_bridge.core.linger import LINGER_CAP_TEXT, LINGER_EXIT_TEXT, HoldEnd, HoldResult
 from tg_bridge.core.topic_queues import Admission
@@ -94,17 +95,32 @@ class LingerDispatcherCase(DispatcherCase):
         return any(thread.is_alive() for thread in self.thread_log.threads)
 
     def start_held_topic(self) -> None:
-        """A first turn runs and ends; the runner then holds the topic and ticks."""
+        """A first turn runs and ends; the runner then holds the topic and ticks. The settle before the turn ticks the
+        hold while the gap has not passed, so the fake clock moves past the gap once the first tick has run."""
         self.linger.holds = True
         self.ingest(1)
         self.deliver(1, "first")
         self.assertTrue(wait_until(lambda: self.linger.calls >= 1), "the runner never ticked")
+        self.clock.advance(BURST_GAP_SECONDS + 1)
+        self.assertTrue(wait_until(lambda: self.turns.texts_run(THREAD) == ["first"]), "the first turn never ran")
 
     def notices(self, thread_id: int = THREAD) -> list[str]:
         return [text for text in self.tg.texts(thread_id) if text.startswith(NOTICE_PREFIXES)]
 
 
 class HoldLoop(LingerDispatcherCase):
+    def test_settle_ticks_the_hold_before_the_first_turn(self) -> None:
+        """A held topic's settle ticks the hold instead of sleeping. The fake clock only moves on a sleep, so the gap
+        does not pass while the hold runs: the message waits until the test ends the hold."""
+        self.linger.holds = True
+        self.ingest(1)
+        self.deliver(1, "first")
+        self.assertTrue(wait_until(lambda: self.linger.calls >= 3), "the settle did not tick the hold")
+        self.assertEqual(self.turns.texts_run(THREAD), [])
+        self.linger.next_end = HoldEnd.DONE
+        self.assertTrue(wait_until(lambda: not self.alive()), "the runner did not end after the release")
+        self.assertEqual(self.turns.texts_run(THREAD), ["first"])
+
     def test_runner_stays_while_held_and_ticks(self) -> None:
         self.start_held_topic()
         self.assertTrue(wait_until(lambda: self.linger.calls >= 3), "the hold did not tick again")

@@ -10,6 +10,7 @@ Every wait is an Event or a bounded poll, so a broken dispatcher fails in second
 import threading
 import time
 import unittest
+from unittest import mock
 
 from tests.fakes.clock import FakeClock
 from tests.fakes.telegram import FakeTelegram
@@ -19,8 +20,11 @@ from tg_bridge.config import Config
 from tg_bridge.core.arrivals import BURST_GAP_SECONDS
 from tg_bridge.core.dispatcher import MEDIA_WAIT_SECONDS, Dispatcher
 from tg_bridge.core.live import LiveRegistry
+from tg_bridge.core.removals import Removals
 from tg_bridge.core.slots import SlotPool
-from tg_bridge.core.topic_queues import QUEUE_MAX, Admission, Delivery, Placeholder, TopicQueues, burst_text
+from tg_bridge.core.topic_queues import (
+    BURST_FOOTER, QUEUE_MAX, Admission, Delivery, Placeholder, TopicQueues, burst_text,
+)
 from tg_bridge.core.turn_kit import TurnReply
 from tg_bridge.core.turn_state import TurnOutcome
 from tg_bridge.core.turn_text import RESTART_TEXT
@@ -145,6 +149,7 @@ class DispatcherCase(unittest.TestCase):
         self.db = Database(Paths.from_home(self.home))
         self.inbox = InboxRepo(self.db, self.clock)
         self.live = LiveRegistry()
+        self.removals = Removals(self.clock)  # shared by the dispatcher, so a test can mark a topic as being removed
         self.slots = SlotPool(2, self.messenger, self.live.is_shutting_down, poll_seconds=0.01)
         self.turns = StubTurns()
         self.titles = RecordingTitles()
@@ -159,7 +164,7 @@ class DispatcherCase(unittest.TestCase):
             turns=self.turns, slots=self.slots, inbox=self.inbox, messenger=self.messenger, answers=self.answers,
             titles=self.titles, client=self.tg, live=self.live, config=self.config, logger=self.logger,
             media_wait_seconds=self.media_wait if media_wait is None else media_wait,
-            start_thread=self.thread_log, clock=self.clock)
+            start_thread=self.thread_log, clock=self.clock, removals=self.removals)
 
     def tearDown(self) -> None:
         self.turns.release_all()
@@ -358,8 +363,9 @@ class DispatcherQueueScenarios(DispatcherCase):
         self.assertEqual([item.text for item in self.dispatcher.queue_snapshot(THREAD)], ["x3", "x2"])
         self.turns.gates["x1"].set()
         self.assertTrue(self.idle())
-        # x3 and x2 were both queued behind x1, so they run as one turn, x3 first
-        self.assertEqual(self.turns.texts_run(THREAD), ["x1", burst_text(["x3", "x2"])])
+        # x2 arrived after the settle of x1 (the clock had moved past the burst gap), so it is no follower: x3 and x2
+        # run in their own turns, x3 first
+        self.assertEqual(self.turns.texts_run(THREAD), ["x1", "x3", "x2"])
         self.assertEqual(self.dispatcher.queue_snapshot(THREAD), ())
 
     def test_queue_full_refuses_the_sixth_message_and_the_rest_run_in_order(self) -> None:
@@ -422,17 +428,17 @@ class DispatcherMediaScenarios(DispatcherCase):
         self.assertEqual(self.state(uid), STATE_DONE)
 
     def test_text_behind_a_placeholder_waits_for_it(self) -> None:
-        """A text sent after a voice note waits behind the voice note's place, so the order of messages is kept:
-        once the voice is filled, both are ready and run as one turn, the voice first.
-
-        Ported labels:
-            4a: voice and text both ran
-            4b: voice transcript ran before the text (got ['hello there', 'after voice'])
-        """
+        """The text arrives inside the voice's burst gap (the settle is held), so it is a burst follower of the voice
+        and both run as one turn, the voice first, once the voice is filled."""
+        self.clock = GatedClock()
+        self.dispatcher = self._make_dispatcher()
         voice = self.dispatcher.reserve(THREAD, TOPIC, CHAT, SENDER, self.ingest(4001))
+        self.assertTrue(self.clock.entered.wait(WAIT))
         behind = self.deliver(self.ingest(4002), "typed second")
         self.assertIs(behind.admission, Admission.QUEUED)
         self.assertEqual(behind.position, 2)
+        self.assertTrue(behind.burst)
+        self.clock.released.set()
         self.deliver(self.ingest(4003), "voice first", reserved=voice.nid)
         self.assertTrue(self.idle())
         self.assertEqual(self.turns.texts_run(THREAD), [burst_text(["voice first", "typed second"])])
@@ -525,7 +531,8 @@ class BurstScenarios(DispatcherCase):
         self.deliver_together((8001, "bug one"), (8002, "bug two"), (8003, "bug three"))
         self.assertTrue(self.idle())
         self.assertEqual(self.turns.texts_run(THREAD), [burst_text(["bug one", "bug two", "bug three"])])
-        self.assertTrue(self.turns.texts_run(THREAD)[0].startswith("[3 messages sent together"))
+        self.assertTrue(self.turns.texts_run(THREAD)[0].startswith("bug one\n\n--- message 2/3"))
+        self.assertTrue(self.turns.texts_run(THREAD)[0].endswith(BURST_FOOTER.format(count=3)))
         self.assertEqual([self.state(uid) for uid in (8001, 8002, 8003)], [STATE_DONE] * 3)
         self.assertEqual(self.dispatcher.queue_snapshot(THREAD), ())
 
@@ -536,7 +543,7 @@ class BurstScenarios(DispatcherCase):
         self.assertEqual(self.turns.texts_run(THREAD), [])  # still settling: the gap has not passed
         self.clock.released.set()
         self.assertTrue(self.idle())
-        self.assertEqual(self.clock.sleeps, [BURST_GAP_SECONDS])
+        self.assertEqual(sum(self.clock.sleeps), BURST_GAP_SECONDS)
         self.assertEqual(self.turns.texts_run(THREAD), ["alone"])
 
         # a message that has waited in the queue for longer than the gap is not delayed once its turn ends
@@ -547,7 +554,8 @@ class BurstScenarios(DispatcherCase):
         self.clock.advance(BURST_GAP_SECONDS + 1)
         self.turns.gates["slow"].set()
         self.assertTrue(self.idle())
-        self.assertEqual(self.clock.sleeps, [BURST_GAP_SECONDS] * 2)  # one gap for "alone", one for "slow", none after
+        # one gap for "alone", one for "slow", none after: the sleeps are slices, so their sum is the waits
+        self.assertEqual(sum(self.clock.sleeps), BURST_GAP_SECONDS * 2)
         self.assertEqual(self.turns.texts_run(THREAD), ["alone", "slow", "later"])
 
     def test_deliver_reports_a_burst_follower(self) -> None:
@@ -573,6 +581,96 @@ class BurstScenarios(DispatcherCase):
         self.assertTrue(self.idle())
         self.assertEqual([self.state(uid) for uid in (8201, 8202)], [STATE_PENDING] * 2)
         self.assertEqual(self.tg.texts(THREAD), [])
+
+
+    def test_a_batch_marks_its_rows_done_in_one_call(self) -> None:
+        with mock.patch.object(self.inbox, "done_many", wraps=self.inbox.done_many) as done_many, \
+                mock.patch.object(self.inbox, "done", wraps=self.inbox.done) as done:
+            self.deliver_together((8001, "one"), (8002, "two"), (8003, "three"))
+            self.assertTrue(self.idle())
+        done_many.assert_called_once_with([8001, 8002, 8003])
+        done.assert_not_called()
+
+    def test_a_refused_batch_is_put_back_in_one_call(self) -> None:
+        self.turns.replies[burst_text(["r1", "r2"])] = TurnReply(None, None, TurnOutcome.RESTART)
+        with mock.patch.object(self.inbox, "mark_pending_many", wraps=self.inbox.mark_pending_many) as pending:
+            self.deliver_together((8211, "r1"), (8212, "r2"))
+            self.assertTrue(self.idle())
+        pending.assert_called_once_with([8211, 8212])
+        self.assertEqual([self.state(uid) for uid in (8211, 8212)], [STATE_PENDING] * 2)
+
+    def test_the_title_comes_from_the_first_message_of_the_batch(self) -> None:
+        self.deliver_together((8301, "bug one"), (8302, "bug two"))
+        self.assertTrue(self.idle())
+        self.assertEqual(self.turns.texts_run(THREAD), [burst_text(["bug one", "bug two"])])
+        self.assertEqual(self.titles.submits[-1][3], "bug one")
+
+    def test_shutdown_during_the_settle_ends_the_runner_without_a_turn(self) -> None:
+        uid = self.ingest(8311)
+        self.assertIs(self.deliver(uid, "late").admission, Admission.STARTED)
+        self.assertTrue(self.clock.entered.wait(WAIT))  # the settle is sleeping
+        self.live.begin_shutdown()
+        self.clock.released.set()
+        self.assertTrue(self.idle())
+        self.assertEqual(self.turns.texts_run(THREAD), [])
+        self.assertEqual(self.state(uid), STATE_PENDING)
+
+    def test_removal_during_the_settle_drops_the_batch_without_a_turn(self) -> None:
+        uid = self.ingest(8321)
+        self.assertIs(self.deliver(uid, "doomed").admission, Admission.STARTED)
+        self.assertTrue(self.clock.entered.wait(WAIT))  # the settle is sleeping
+        self.assertTrue(self.removals.begin(THREAD))
+        self.clock.released.set()
+        self.assertTrue(self.idle())
+        self.assertEqual(self.turns.texts_run(THREAD), [])
+        self.assertEqual(self.state(uid), STATE_DONE)
+
+    def test_a_filled_placeholder_is_not_an_arrival(self) -> None:
+        """The reservation marks the arrival. Filling the placeholder later does not, so a message after the gap
+        (counted from the reservation) is not a burst follower."""
+        self.clock.released.set()  # the settles of this case do not block
+        self.turns.gates["hold"] = threading.Event()
+        self.deliver(self.ingest(8401), "hold")
+        self.assertTrue(self.turns.started("hold").wait(WAIT))
+        reserved = self.dispatcher.reserve(THREAD, TOPIC, CHAT, SENDER, self.ingest(8402))
+        self.assertIs(reserved.admission, Admission.RESERVED)
+        self.clock.advance(1.5)
+        self.assertIs(self.deliver(self.ingest(8403), "voice", reserved=reserved.nid).admission, Admission.FILLED)
+        self.clock.advance(1.0)  # 2.5 s after the reservation, 1.0 s after the fill
+        later = self.deliver(self.ingest(8404), "later")
+        self.assertIs(later.admission, Admission.QUEUED)
+        self.assertFalse(later.burst, "the fill re-marked the arrival: the later message counted as a follower")
+        self.turns.gates["hold"].set()
+        self.assertTrue(self.idle())
+        self.assertEqual(self.turns.texts_run(THREAD), ["hold", "voice", "later"])
+
+    def test_a_dropped_message_is_not_an_arrival(self) -> None:
+        self.clock.released.set()  # the settle of the message that is not dropped does not block
+        self.removals.begin(THREAD)
+        self.assertIs(self.deliver(self.ingest(8501), "gone").admission, Admission.DROPPED)
+        self.removals.cancel(THREAD)  # a refused removal: the topic takes messages again at once
+        self.clock.advance(1.0)  # 1.0 s after the dropped message: a mark there would make the next one a follower
+        self.assertFalse(self.deliver(self.ingest(8502), "next").burst)
+        self.assertTrue(self.idle())
+        self.assertEqual(self.turns.texts_run(THREAD), ["next"])
+
+    def test_a_burst_of_overflow_is_refused_with_one_notice(self) -> None:
+        """Overflow of one burst: the first refusal is not a follower (no refused message came before it), the next one
+        is (it follows a refused message within the gap), and a refusal after the gap starts a new notice."""
+        self.clock.released.set()
+        self.turns.gates["f1"] = threading.Event()
+        self.deliver(self.ingest(8601), "f1")
+        self.assertTrue(self.turns.started("f1").wait(WAIT))
+        for i in range(QUEUE_MAX):
+            self.assertIs(self.deliver(self.ingest(8602 + i), f"f{i + 2}").admission, Admission.QUEUED)
+        first = self.deliver(self.ingest(8602 + QUEUE_MAX), "over-1")
+        second = self.deliver(self.ingest(8603 + QUEUE_MAX), "over-2")
+        self.clock.advance(BURST_GAP_SECONDS + 1)
+        later = self.deliver(self.ingest(8604 + QUEUE_MAX), "over-3")
+        self.assertEqual([(d.admission, d.burst) for d in (first, second, later)],
+                         [(Admission.FULL, False), (Admission.FULL, True), (Admission.FULL, False)])
+        self.turns.gates["f1"].set()
+        self.assertTrue(self.idle())
 
 
 class DispatcherRunScenarios(DispatcherCase):

@@ -312,9 +312,9 @@ class QueueTests(InfoCase):
         self.assertEqual(self.replies()[0].splitlines(),
                          ["📥 2 queued:", "1. first queued", "2. (voice or photo, still processing)"])
         self.assertEqual(len(self.telegram.buttons(THREAD)), 1)
-        self.assertIn(f"now:{THREAD}:{nid}", self.button_callbacks())
-        self.assertIn(f"jump:{THREAD}:{nid}", self.button_callbacks())
-        self.assertIn(f"drop:{THREAD}:{nid}", self.button_callbacks())
+        self.assertIn(f"qnow:{THREAD}:{nid}", self.button_callbacks())
+        self.assertIn(f"qjump:{THREAD}:{nid}", self.button_callbacks())
+        self.assertIn(f"qdrop:{THREAD}:{nid}", self.button_callbacks())
         self.assertIn("⏭ 1", self.button_labels())
         self.assertIn("⏩ 2", self.button_labels())
 
@@ -333,7 +333,7 @@ class QueueTests(InfoCase):
         self.assertEqual([button["text"] for button in rows[-1]], ["⏭ 10", "⏩ 10", "❌ 10"])
         nid = self.queues.snapshot(THREAD)[9].nid
         self.assertEqual([button["callback_data"] for button in rows[-1]],
-                         [f"now:{THREAD}:{nid}", f"jump:{THREAD}:{nid}", f"drop:{THREAD}:{nid}"])
+                         [f"qnow:{THREAD}:{nid}", f"qjump:{THREAD}:{nid}", f"qdrop:{THREAD}:{nid}"])
 
     def test_a_list_over_the_limit_ends_with_the_more_line(self) -> None:
         self.queue([f"long item {n} " + "x" * 200 for n in range(100)])

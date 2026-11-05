@@ -6,6 +6,7 @@ directly and with four threads racing on one row.
 """
 
 import json
+import sqlite3
 import threading
 import unittest
 
@@ -15,7 +16,7 @@ from tg_bridge.clock import utc_stamp
 from tg_bridge.paths import Paths
 from tg_bridge.store.asks import AskRecord, AskRepo
 from tg_bridge.store.db import Database
-from tg_bridge.store.inbox import InboxRecord, InboxRepo
+from tg_bridge.store.inbox import STATE_DONE, STATE_PENDING, InboxRecord, InboxRepo
 from tg_bridge.store.rules import RuleRecord, RuleRepo
 from tg_bridge.store.sessions import SessionRepo
 from tg_bridge.store.turns import CostTotals, TurnRepo
@@ -288,6 +289,29 @@ class RuleRepoTests(MiscCase):
 
 
 class InboxRepoTests(MiscCase):
+    def states(self, update_ids: list[int]) -> list[str]:
+        return [self.inbox.get(uid).state for uid in update_ids]
+
+    def test_done_many_and_mark_pending_many_update_every_row(self) -> None:
+        for uid in (30, 31, 32):
+            self.inbox.ingest(uid, {"update_id": uid}, thread_id=7)
+        self.inbox.done_many([30, 31, 32])
+        self.assertEqual(self.states([30, 31, 32]), [STATE_DONE] * 3)
+        self.inbox.mark_pending_many([31, 32])
+        self.assertEqual(self.states([30, 31, 32]), [STATE_DONE, STATE_PENDING, STATE_PENDING])
+
+    def test_a_failing_batch_rolls_back_every_row(self) -> None:
+        """The unbindable id fails the second row of the batch: the first row, already written, goes back too."""
+        for uid in (40, 41):
+            self.inbox.ingest(uid, {"update_id": uid}, thread_id=7)
+        with self.assertRaises(sqlite3.Error):
+            self.inbox.done_many([40, object()])  # type: ignore[list-item]
+        self.assertEqual(self.states([40, 41]), [STATE_PENDING] * 2)
+        self.inbox.done_many([40, 41])
+        with self.assertRaises(sqlite3.Error):
+            self.inbox.mark_pending_many([40, object()])  # type: ignore[list-item]
+        self.assertEqual(self.states([40, 41]), [STATE_DONE] * 2)
+
     def test_ingest_stores_pending_row_with_payload_as_json(self) -> None:
         update = {"update_id": 10, "message": {"text": "hi سلام"}}
         self.assertTrue(self.inbox.ingest(10, update, thread_id=7, chat_id=-100, sender="42"))

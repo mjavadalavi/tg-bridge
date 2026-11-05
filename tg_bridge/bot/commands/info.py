@@ -11,7 +11,7 @@ import math
 from tg_bridge.agents.registry import BackendRegistry, UnknownBackend
 from tg_bridge.bot.commands.base import Command, CommandContext, CommandRegistry
 from tg_bridge.config import Config
-from tg_bridge.bot.pickers import rules_picker, status_rows
+from tg_bridge.bot.pickers import ButtonRows, rules_picker, status_rows
 from tg_bridge.core import terminal_claim
 from tg_bridge.core.linger import LingerStatus
 from tg_bridge.core.live import RunningTurn
@@ -29,6 +29,10 @@ QUEUE_HEADER = "📥 {count} queued:"
 QUEUE_LIST_CHARS = 3500  # the /queue text stops growing here; Telegram allows 4096 characters per message
 QUEUE_MORE_TEXT = "… and {more} more"  # the last line of /queue when the list is cut
 QUEUE_BUTTON_ITEMS = 10  # the first queued messages that get a ⏭ / ⏩ / ❌ button row each
+QUEUE_NOW_KIND = "qnow"  # the buttons of the /queue list: their own kinds, so a tap re-renders the list and does
+QUEUE_JUMP_KIND = "qjump"  # not wipe it (the per-message notice buttons use now / jump / drop and edit to a note)
+QUEUE_DROP_KIND = "qdrop"
+EMPTY_QUEUE_TEXT = "the queue is empty."
 MEDIA_PLACEHOLDER = "(voice or photo, still processing)"  # a queued voice/photo whose text is not in yet
 SQLITE_MAX_INT = 2**63 - 1  # a /forget number above this cannot be a rule id (and would overflow the query)
 SECONDS_PER_MINUTE = 60
@@ -141,20 +145,27 @@ def _cost_line(totals: CostTotals) -> str:
 
 
 def _queue(ctx: CommandContext, args: str) -> None:
-    """One message: a header with the count, a numbered line per queued message, and a button row for each of the
-    first QUEUE_BUTTON_ITEMS messages (⏭ Now, ⏩ Next, ❌ Drop, labelled with the number)."""
-    items = ctx.deps.queues.snapshot(ctx.thread_id)
+    text, rows = queue_view(ctx.thread_id, ctx.deps.queues.snapshot(ctx.thread_id))
+    if rows:
+        ctx.say_buttons(text, rows)
+    else:
+        ctx.say(text)
+
+
+def queue_view(thread_id: int, items: tuple[QueuedItem, ...]) -> tuple[str, ButtonRows]:
+    """The /queue message and its keyboard, also what a tap on that list re-renders. One message: a header with the
+    count, a numbered line per queued message, and a button row for each of the first QUEUE_BUTTON_ITEMS messages
+    (⏭ Now, ⏩ Next, ❌ Drop, labelled with the number). An empty queue is the text alone and no rows."""
     if not items:
-        ctx.say("the queue is empty.")
-        return
-    rows = []
+        return EMPTY_QUEUE_TEXT, []
+    rows: ButtonRows = []
     for index, item in enumerate(items[:QUEUE_BUTTON_ITEMS], 1):
         rows.append([
-            (f"⏭ {index}", CallbackData("now", (ctx.thread_id, item.nid))),
-            (f"⏩ {index}", CallbackData("jump", (ctx.thread_id, item.nid))),
-            (f"❌ {index}", CallbackData("drop", (ctx.thread_id, item.nid))),
+            (f"⏭ {index}", CallbackData(QUEUE_NOW_KIND, (thread_id, item.nid))),
+            (f"⏩ {index}", CallbackData(QUEUE_JUMP_KIND, (thread_id, item.nid))),
+            (f"❌ {index}", CallbackData(QUEUE_DROP_KIND, (thread_id, item.nid))),
         ])
-    ctx.say_buttons(_queue_text(items), rows)
+    return _queue_text(items), rows
 
 
 def _queue_text(items: tuple[QueuedItem, ...]) -> str:

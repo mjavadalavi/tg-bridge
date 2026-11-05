@@ -252,6 +252,71 @@ class QueueTapTests(CallbackCase):
         self.tap(f"now:{THREAD}")
         self.assertEqual(self.answers(), [])
 
+    def queue_five(self) -> list[str]:
+        """Five queued messages 'item 0' .. 'item 4' of the topic; the first one starts (idle topic), the rest wait."""
+        results = [self.dispatcher.deliver(THREAD, TOPIC, CHAT, "sender", None, f"item {n}") for n in range(5)]
+        self.assertEqual([r.admission for r in results][1:], [Admission.QUEUED] * 4)
+        return [r.nid or "" for r in results]
+
+    def list_lines(self) -> list[str]:
+        return self.edits()[-1]["text"].splitlines()
+
+    def list_rows(self) -> list[list[dict]]:
+        return json.loads(self.edits()[-1]["reply_markup"])["inline_keyboard"]
+
+    def test_qdrop_on_item_three_edits_the_list_to_four_rows(self) -> None:
+        """The /queue list keeps working after one tap: its message becomes the 4-item list, 4 button rows, and the
+        other rows keep their own q-kinds (not the per-message now / jump / drop)."""
+        nids = self.queue_five()
+        self.tap(f"qdrop:{THREAD}:{nids[2]}")
+        self.assertEqual([i.text for i in self.dispatcher.queue_snapshot(THREAD)], ["item 0", "item 1", "item 3", "item 4"])
+        self.assertEqual(self.answers(), ["Dropped 🗑"])
+        self.assertEqual(self.list_lines(), ["📥 4 queued:", "1. item 0", "2. item 1", "3. item 3", "4. item 4"])
+        rows = self.list_rows()
+        self.assertEqual(len(rows), 4)
+        callbacks = [b["callback_data"] for row in rows for b in row]
+        self.assertIn(f"qdrop:{THREAD}:{nids[3]}", callbacks)
+        self.assertNotIn(f"qdrop:{THREAD}:{nids[2]}", callbacks)
+        self.assertTrue(all(c.startswith(("qnow:", "qjump:", "qdrop:")) for c in callbacks), callbacks)
+
+    def test_qjump_and_qnow_rerender_the_list_in_the_new_order(self) -> None:
+        nids = self.queue_five()
+        session = self.start_turn()
+        self.tap(f"qjump:{THREAD}:{nids[3]}")
+        self.assertEqual(session.stops, 0)
+        self.assertEqual(self.answers()[-1], "Moved to front ✅")
+        self.assertEqual(self.list_lines()[1:], ["1. item 3", "2. item 0", "3. item 1", "4. item 2", "5. item 4"])
+        self.assertEqual(len(self.list_rows()), 5)
+
+        self.tap(f"qnow:{THREAD}:{nids[4]}")
+        self.assertTrue(session.stopped.wait(5), "the running turn was not stopped")
+        self.assertEqual(self.answers()[-1], "Interrupting — your item runs now ⏭")
+        self.assertEqual(self.list_lines()[1:], ["1. item 4", "2. item 3", "3. item 0", "4. item 1", "5. item 2"])
+        self.assertEqual(self.list_lines()[0], "📥 5 queued:")
+
+    def test_the_last_qdrop_edits_the_list_to_the_empty_text(self) -> None:
+        nid = self.dispatcher.deliver(THREAD, TOPIC, CHAT, "sender", None, "only").nid or ""
+        self.tap(f"qdrop:{THREAD}:{nid}")
+        self.assertEqual(self.edits()[-1]["text"], "the queue is empty.")
+        self.assertEqual(self.edits()[-1]["reply_markup"], json.dumps({"inline_keyboard": []}))
+
+    def test_a_list_tap_on_an_item_already_gone_rerenders_without_it(self) -> None:
+        """An item taken out of the queue by someone else (a running turn took it): the tap says so, and the list is
+        re-rendered as it is now, without that item and without changing anything else."""
+        nids = self.queue_five()
+        self.dispatcher.drop(THREAD, nids[1])
+        session = self.start_turn()
+        self.tap(f"qnow:{THREAD}:{nids[1]}")
+        self.assertEqual(self.answers()[-1], NOT_QUEUED_TEXT)
+        self.assertEqual(session.stops, 0)
+        self.assertEqual(self.list_lines(), ["📥 4 queued:", "1. item 0", "2. item 2", "3. item 3", "4. item 4"])
+        self.assertEqual(len(self.list_rows()), 4)
+
+        self.tap(f"qdrop:{THREAD}:{nids[1]}")
+        self.assertEqual(self.answers()[-1], NOT_QUEUED_TEXT)
+        self.assertEqual(self.list_lines()[0], "📥 4 queued:")
+        self.assertEqual(len(self.list_rows()), 4)
+
 
 class StopTapTests(CallbackCase):
     """The feed's ⏹ Stop (st:<thread>) and the /status Stop button share SessionCommands.stop_turn with /stop."""
