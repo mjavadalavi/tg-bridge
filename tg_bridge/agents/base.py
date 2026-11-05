@@ -101,6 +101,7 @@ class SessionSpec:
     view_dir: str = ""              # tui sessions mirror their raw output to <view_dir>/<thread>.pty; '' = none
     tui_size: tuple[int, int] = DEFAULT_TUI_SIZE  # (rows, cols) of the TUI's pseudo-terminal
     attach: AttachSpec | None = None  # set: the turn runs in that terminal session (no process is spawned)
+    memory_dir: str = ""            # the topic's own auto-memory folder; '' = Claude Code's default (per cwd)
 
 
 class RuleMatcher(Protocol):

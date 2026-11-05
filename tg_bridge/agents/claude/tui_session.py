@@ -27,6 +27,7 @@ import threading
 from tg_bridge.agents.base import AgentSession, EventSink, SessionSpec
 from tg_bridge.agents.claude.hookbridge import (TURN_ENDED, HookServer, hook_command, hook_settings, permission_allow,
                                                 permission_deny)
+from tg_bridge.agents.claude.memory_settings import with_memory
 from tg_bridge.agents.claude.protocol import DENY_MESSAGE
 from tg_bridge.agents.claude.session import BYPASS_MODE, INTERRUPT_TIMEOUT, KILL_SWITCH_TOOL
 # INTERRUPT_FALLBACK_SECONDS and TRANSCRIPT_WAIT_SECONDS now live in transcript_turns; they stay importable from here.
@@ -58,7 +59,8 @@ def _turn_state(name: str) -> property:
 
 
 def build_tui_args(spec: SessionSpec, settings: str) -> list[str]:
-    """The argv of the interactive TUI for spec. settings is the --settings JSON that installs the permission hook."""
+    """The argv of the interactive TUI for spec. settings is the --settings JSON that installs the permission hook; with
+    spec.memory_dir it also carries the topic's autoMemoryDirectory. There is one --settings flag either way."""
     deny = ",".join(dict.fromkeys((KILL_SWITCH_TOOL, "AskUserQuestion", *spec.deny_tools)))
     args = [*spec.launcher.argv, *permission_args(spec.mode), "--disallowedTools", deny,
             "--append-system-prompt", spec.system_rules, "--name", f"tg:{spec.topic}"]
@@ -71,7 +73,7 @@ def build_tui_args(spec: SessionSpec, settings: str) -> list[str]:
         args += ["--session-id", spec.new_id]
     if spec.model:
         args += ["--model", spec.model]
-    return [*args, "--settings", settings]
+    return [*args, "--settings", with_memory(settings, spec.memory_dir)]
 
 
 class ClaudeTuiSession(PtyProcess, AgentSession):

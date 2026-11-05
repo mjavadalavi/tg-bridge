@@ -27,6 +27,7 @@ from dataclasses import replace
 from tg_bridge.agents.base import AgentSession, EventSink, SessionSpec
 from tg_bridge.agents.claude import protocol
 from tg_bridge.agents.claude.background import BackgroundLedger
+from tg_bridge.agents.claude.memory_settings import with_memory
 from tg_bridge.agents.claude.protocol import ControlChannel
 from tg_bridge.agents.claude.rules import ClaudeRuleMapper
 from tg_bridge.agents.claude.translate import ClaudeTranslator
@@ -68,7 +69,8 @@ def _as_interrupted(event: AgentEvent) -> AgentEvent:
 
 
 def build_args(spec: SessionSpec) -> list[str]:
-    """The claude argv for spec. Same flags, order and values as the live TopicSession.build_args."""
+    """The claude argv for spec: the live TopicSession.build_args flags, plus --settings with the topic's own memory
+    folder when spec.memory_dir is set."""
     deny = ",".join(dict.fromkeys((KILL_SWITCH_TOOL, *spec.deny_tools)))
     args = [*spec.launcher.argv, "-p", "--input-format", "stream-json", "--output-format", "stream-json",
             "--verbose", "--permission-prompt-tool", "stdio", "--permission-mode", spec.mode,
@@ -84,6 +86,8 @@ def build_args(spec: SessionSpec) -> list[str]:
         args += ["--session-id", spec.new_id]
     if spec.model:
         args += ["--model", spec.model]
+    if spec.memory_dir:
+        args += ["--settings", with_memory("", spec.memory_dir)]
     return args
 
 

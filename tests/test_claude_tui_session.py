@@ -181,6 +181,15 @@ class BuildTuiArgsTests(unittest.TestCase):
         self.assertEqual(flag_value(build_tui_args(pure_spec(model="opus"), SETTINGS), "--model"), "opus")
         self.assertNotIn("--model", build_tui_args(pure_spec(), SETTINGS))
 
+    def test_the_memory_dir_joins_the_hook_in_the_one_settings_flag(self) -> None:
+        args = build_tui_args(pure_spec(memory_dir="/state/memory/7"), SETTINGS)
+        self.assertEqual(args.count("--settings"), 1)
+        self.assertEqual(json.loads(flag_value(args, "--settings")),
+                         {"hooks": {"PermissionRequest": []}, "autoMemoryDirectory": "/state/memory/7"})
+
+    def test_without_a_memory_dir_the_settings_are_the_hook_alone(self) -> None:
+        self.assertEqual(flag_value(build_tui_args(pure_spec(), SETTINGS), "--settings"), SETTINGS)
+
 
 class OpenSessionTests(unittest.TestCase):
     def setUp(self) -> None:

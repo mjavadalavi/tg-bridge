@@ -5,13 +5,13 @@ Enter line. Enter claims the topic (core/terminal_claim, under its flock) and ru
 on the pane's own tty: argv = the launcher's argv + --resume <uuid> when the topic has one, else --session-id <new
 uuid>, --model when it has one and the permission flags of its mode (permission_args, the tui transport's mapping), and
 --settings with one SessionStart hook (`tg-bridge hook session-start <thread> <pid>`) that moves the claim to the
-session the tab is on after a /clear or /resume. cwd is the topic's folder. The claim names the pane, the session uuid,
-the launcher's config folder and the cwd (core/terminal_claim). The claim is taken unhooked: the SessionStart hook
-marks it hooked when it runs, so a hook that never runs (disabled, moved checkout, import error) leaves the claim
-unhooked and the bridge keeps searching for the session. When the CLI exits the pane records the session the tab ended
-on, the one it started with and the ones it moved off (seen) as the topic's ended record, then removes the claim; the
-pane is ready again. Once the CLI runs, the claim also names its child pid (set_child), so the bridge can end the tab's
-Claude Code.
+session the tab is on after a /clear or /resume, and autoMemoryDirectory (the topic's memory folder, the one the
+bridge's turns use). cwd is the topic's folder. The claim names the pane, the session uuid, the launcher's config folder
+and the cwd (core/terminal_claim). The claim is taken unhooked: the SessionStart hook marks it hooked when it runs, so a
+hook that never runs (disabled, moved checkout, import error) leaves the claim unhooked and the bridge keeps searching
+for the session. When the CLI exits the pane records the session the tab ended on, the one it started with and the ones
+it moved off (seen) as the topic's ended record, then removes the claim; the pane is ready again. Once the CLI runs, the
+claim also names its child pid (set_child), so the bridge can end the tab's Claude Code.
 
 Number keys 1..9 on ready change the topic's launcher (daemon/view_launcher): the same change as Telegram's /launcher,
 under the topic's flock and refused while the topic is busy. The reply of the last change shows until the next key.
@@ -58,7 +58,7 @@ from tg_bridge.core.view_recorder import FEED_SUFFIX
 from tg_bridge.daemon.code_watch import RESTART_STATUS
 from tg_bridge.daemon.view_launcher import CHOICE_HINT_LINE, choice_line, claude_choices, switch_launcher
 from tg_bridge.daemon.viewer import FOLLOW_SECONDS, Follower, rounds
-from tg_bridge.paths import Paths
+from tg_bridge.paths import Paths, topic_memory
 from tg_bridge.store.sessions import SessionRecord
 
 FEED_TAIL_LINES = 30            # the ready screen shows the last lines of the feed
@@ -318,7 +318,8 @@ class ViewPane:
             problem = NO_BACKEND_LINE.format(backend=launcher.backend)
             return Topic(name, launcher.name, cwd, session, None, problem, choices)
         session_uuid = row.uuid or self._new_uuid()
-        settings = session_start_settings(session_start_command(self._thread, os.getpid()))  # the pid take_claim gets too
+        hook = session_start_command(self._thread, os.getpid())  # the pid take_claim gets too
+        settings = session_start_settings(hook, memory_dir=topic_memory(self._paths.memory, self._thread))
         argv = child_argv(config, row, launcher, session_uuid, settings)
         return Topic(name, launcher.name, cwd, session, argv, "", choices, session_uuid, launcher.config_dir)
 

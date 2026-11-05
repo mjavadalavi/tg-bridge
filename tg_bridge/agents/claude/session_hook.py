@@ -13,6 +13,7 @@ import sys
 from collections.abc import Sequence
 
 from tg_bridge.agents.claude.hookbridge import MATCH_ALL, entry_script
+from tg_bridge.agents.claude.memory_settings import with_memory
 
 SESSION_START_EVENT = "SessionStart"
 SESSION_HOOK_WORDS = ("hook", "session-start")
@@ -25,9 +26,11 @@ def session_start_command(thread_id: int, pid: int, python: str = sys.executable
     return [python, "-I", entry_script(), *SESSION_HOOK_WORDS, str(thread_id), str(pid)]
 
 
-def session_start_settings(command: Sequence[str], timeout_seconds: int = SESSION_HOOK_TIMEOUT_SECONDS) -> str:
+def session_start_settings(command: Sequence[str], timeout_seconds: int = SESSION_HOOK_TIMEOUT_SECONDS,
+                           memory_dir: str = "") -> str:
     """The compact --settings JSON that installs command as the SessionStart hook for every source (startup, clear,
-    resume and compact). The TUI runs the command through a shell, so the argv is quoted with shlex."""
+    resume and compact). The TUI runs the command through a shell, so the argv is quoted with shlex. A memory_dir
+    adds the topic's autoMemoryDirectory to the same JSON (with_memory); '' adds nothing."""
     entry = {"type": "command", "command": shlex.join(command), "timeout": timeout_seconds}
     settings = {"hooks": {SESSION_START_EVENT: [{"matcher": MATCH_ALL, "hooks": [entry]}]}}
-    return json.dumps(settings, separators=(",", ":"))
+    return with_memory(json.dumps(settings, separators=(",", ":")), memory_dir)

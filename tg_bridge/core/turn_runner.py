@@ -9,6 +9,9 @@ relaunch as a fresh session when the stored session is gone -> the turns row (it
 sessions.last_active) -> the feed summary -> the reply (answer, err). The per-launch objects and the end of the turn are
 in core/turn_kit.py. The session's sink is a SessionRouter (core/session_router.py) that holds the attempt's end gate.
 
+Memory: a Claude topic's SessionSpec names its own auto-memory folder, <memory root>/<thread id>, created 0700 before
+the launch (_topic_memory). Claude Code keeps one memory per cwd and topics share a cwd, so each topic gets its own.
+
 Attached: a turn with an attach target (a claim of a terminal tab) runs in that terminal session: the resume id is the
 claim's uuid, nothing is kept or offered for linger, no mark is taken here, and no relaunch is tried (_run_attached).
 
@@ -66,6 +69,7 @@ from tg_bridge.core.turn_text import (
 )
 from tg_bridge.core.view_recorder import ViewFactory
 from tg_bridge.logging_ import Logger
+from tg_bridge.paths import topic_memory
 from tg_bridge.store.kv import KvRepo
 from tg_bridge.store.rules import RuleRepo
 from tg_bridge.store.sessions import HistoryRepo, SessionRepo
@@ -94,6 +98,7 @@ class TurnRunner:
         kv: KvRepo, handoff: HandoffService, feeds: FeedFactory, clock: Clock, logger: Logger,
         base_env: Mapping[str, str], errfile_dir: str, poll_seconds: float = POLL_SECONDS,
         views: ViewFactory | None = None, view_dir: str = "", linger: LingerService | None = None,
+        memory_dir: str = "",
     ) -> None:
         self._config = config
         self._registry = registry
@@ -115,6 +120,7 @@ class TurnRunner:
         self._views = views
         self._view_dir = view_dir
         self._linger = linger  # None: no session is kept after a turn (linger off), as before
+        self._memory_dir = memory_dir  # the root of the topics' auto-memory folders; '' = Claude Code's default
         self._closer = TurnCloser(turns=turns, clock=clock)
 
     def run(self, *, thread_id: int, chat_id: int, topic: str, text: str, sender: str,
@@ -409,5 +415,12 @@ class TurnRunner:
             cwd=plan.cwd, mode=plan.mode, model=plan.model, resume_id=resume_id, new_id=new_id,
             allow_rules=plan.allow_rules, deny_tools=plan.deny_tools, system_rules=system_rules,
             env=dict(self._base_env, TZ=TIMEZONE), errfile_dir=self._errfile_dir, view_dir=self._view_dir,
-            tui_size=self._config.tui_size(), attach=plan.attach,
+            tui_size=self._config.tui_size(), attach=plan.attach, memory_dir=self._topic_memory(plan),
         )
+
+    def _topic_memory(self, plan: TurnPlan) -> str:
+        """The topic's own auto-memory folder, <memory root>/<thread id>, created 0700 before the launch. '' for a
+        backend other than Claude (it has no auto-memory setting) and when no memory root was given."""
+        if plan.launcher.backend != BACKEND_CLAUDE:
+            return ""
+        return topic_memory(self._memory_dir, plan.thread_id)

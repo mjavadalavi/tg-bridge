@@ -159,17 +159,28 @@ class ReadyTests(PaneCase):
                                                           "--allow-dangerously-skip-permissions"])
                     self.assertEqual(child["argv"][-2], "--settings")
 
-    def test_the_cli_gets_the_session_start_hook_and_no_other_settings(self) -> None:
+    def test_the_cli_gets_the_session_start_hook_and_the_memory_folder_and_no_other_settings(self) -> None:
         self.make_topic()
         self.pane([ENTER], rounds=1)
         [child] = self.children()
         settings = session_start_hook(child["argv"])
-        self.assertEqual(list(settings), ["hooks"])
+        self.assertEqual(sorted(settings), ["autoMemoryDirectory", "hooks"])
         self.assertEqual(list(settings["hooks"]), ["SessionStart"])
         [entry] = settings["hooks"]["SessionStart"]
         [hook] = entry["hooks"]
         self.assertEqual(hook["type"], "command")
         self.assertEqual(shlex.split(hook["command"])[-4:], ["hook", "session-start", str(THREAD), str(os.getpid())])
+
+    def test_the_single_settings_argument_holds_the_hook_and_the_topics_memory_folder(self) -> None:
+        self.make_topic()
+        self.pane([ENTER], rounds=1)
+        [child] = self.children()
+        self.assertEqual(child["argv"].count("--settings"), 1)
+        settings = session_start_hook(child["argv"])
+        folder = os.path.join(self.paths.memory, str(THREAD))
+        self.assertEqual(settings["autoMemoryDirectory"], folder)
+        self.assertIn("SessionStart", settings["hooks"])
+        self.assertTrue(os.path.isdir(folder))
 
     def run_claims(self, *, uuid: str = UUID, env: dict[str, str] | None = None) -> list[tuple[list[str], object]]:
         """Runs the pane once on Enter and returns (argv, the claim read while the CLI runs) for each run."""

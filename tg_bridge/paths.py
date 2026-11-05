@@ -1,6 +1,7 @@
 """Paths dataclass derived from HOME at construction (not at import).
 
 Every file the bridge reads or writes lives under one state directory, `<home>/.local/state/tg-bridge`. The
+per-topic Claude Code memory folders are `<state>/memory/<thread_id>`, so each topic keeps its own auto-memory. The
 live file computed these names at import time from HOME; here they are computed when a Paths object is built,
 so a test builds one under its own TempHome and nothing is shared between tests.
 """
@@ -27,6 +28,7 @@ class Paths:
     lock: str
     turns: str
     view: str
+    memory: str
 
     @classmethod
     def from_home(cls, home: str) -> "Paths":
@@ -45,9 +47,21 @@ class Paths:
             lock=os.path.join(state, "lock"),
             turns=os.path.join(state, "turns"),
             view=os.path.join(state, "view"),
+            memory=os.path.join(state, "memory"),
         )
 
     @classmethod
     def from_environment(cls) -> "Paths":
         """The paths for the current user's home directory (HOME, as expanduser reads it)."""
         return cls.from_home(os.path.expanduser("~"))
+
+
+def topic_memory(root: str, thread_id: int) -> str:
+    """The auto-memory folder of one topic, <root>/<thread_id>, created 0700 when it is missing (Paths.memory is the
+    root). A root of '' means no memory folder: returns '' and creates nothing. This is the one place the folder rule
+    lives; the bridge's turns (TurnRunner) and the topic's view tab both take the folder from here."""
+    if not root:
+        return ""
+    folder = os.path.join(root, str(thread_id))
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    return folder

@@ -1,10 +1,11 @@
 """Paths: every location is derived from the home directory passed in, under a TempHome."""
 
 import os
+import stat
 import unittest
 
 from tests.support import TempHome
-from tg_bridge.paths import Paths
+from tg_bridge.paths import Paths, topic_memory
 
 
 class PathsTests(unittest.TestCase):
@@ -23,6 +24,7 @@ class PathsTests(unittest.TestCase):
             self.assertEqual(paths.lock, os.path.join(home.state, "lock"))
             self.assertEqual(paths.turns, os.path.join(home.state, "turns"))
             self.assertEqual(paths.view, os.path.join(home.state, "view"))
+            self.assertEqual(paths.memory, os.path.join(home.state, "memory"))
 
     def test_from_environment_follows_home_at_call_time(self) -> None:
         with TempHome() as home:
@@ -38,6 +40,20 @@ class PathsTests(unittest.TestCase):
             paths = Paths.from_home(home.home)
             with self.assertRaises(AttributeError):
                 paths.config = "/elsewhere"  # type: ignore[misc]
+
+    def test_topic_memory_creates_the_folder_0700_and_returns_its_path(self) -> None:
+        with TempHome() as home:
+            root = os.path.join(home.state, "memory")
+            folder = topic_memory(root, 42)
+            self.assertEqual(folder, os.path.join(root, "42"))
+            self.assertEqual(stat.S_IMODE(os.stat(folder).st_mode), 0o700)
+            self.assertEqual(topic_memory(root, 42), folder)  # a second call finds the folder and keeps it
+
+    def test_topic_memory_with_no_root_returns_empty_and_creates_nothing(self) -> None:
+        with TempHome() as home:
+            before = sorted(os.listdir(home.home))
+            self.assertEqual(topic_memory("", 42), "")
+            self.assertEqual(sorted(os.listdir(home.home)), before)
 
 
 if __name__ == "__main__":

@@ -250,7 +250,8 @@ class App:
             config=config, registry=registry, live=live, permissions=permissions, waits=waits, sessions=sessions,
             history=history, rules=rules, turns=turns, kv=kv, handoff=handoff, feeds=feeds, clock=clock,
             logger=logger, base_env=dict(environ), errfile_dir=paths.turns,
-            views=views if views_on else None, view_dir=paths.view if views_on else "", linger=linger)
+            views=views if views_on else None, view_dir=paths.view if views_on else "", linger=linger,
+            memory_dir=paths.memory)
         titles = TitleService(backend=registry.get(BACKEND_CLAUDE), sessions=sessions, messenger=messenger,
                               pool=title_pool, logger=logger)
         removals = Removals(clock)  # the marks of the topics being removed: the dispatcher and the remover share them

@@ -145,6 +145,14 @@ class BuildArgsParityTests(ClaudeSessionTestCase):
         argv = build_args(self.spec(topic="budget"))
         self.assertEqual(argv[argv.index("--name") + 1], "tg:budget")
 
+    def test_memory_dir_adds_one_settings_flag_with_the_memory_folder(self) -> None:
+        argv = build_args(self.spec(memory_dir="/state/memory/7"))
+        self.assertEqual(argv.count("--settings"), 1)
+        self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), {"autoMemoryDirectory": "/state/memory/7"})
+
+    def test_without_a_memory_dir_there_is_no_settings_flag(self) -> None:
+        self.assertNotIn("--settings", build_args(self.spec()))
+
 
 class StartAndTurnTests(ClaudeSessionTestCase):
     def test_start_is_initialized_and_session_id_is_learned_from_the_stream(self) -> None:
