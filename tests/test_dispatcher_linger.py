@@ -88,7 +88,7 @@ class LingerDispatcherCase(DispatcherCase):
             turns=self.turns, slots=self.slots, inbox=self.inbox, messenger=self.messenger, answers=self.answers,
             titles=self.titles, client=self.tg, live=self.live, config=self.config, logger=self.logger,
             media_wait_seconds=self.media_wait if media_wait is None else media_wait,
-            start_thread=self.thread_log, linger=self.linger, hold_failure_pause=0.0)
+            start_thread=self.thread_log, linger=self.linger, hold_failure_pause=0.0, clock=self.clock)
 
     def alive(self) -> bool:
         return any(thread.is_alive() for thread in self.thread_log.threads)

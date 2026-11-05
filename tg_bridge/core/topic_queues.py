@@ -5,6 +5,8 @@ flag. Port of the live file's _queues, _queue_lk, QUEUE_MAX and _reserve_slot's 
 A topic runs one turn at a time. Messages that arrive while a turn runs wait in the topic's queue, in order, at most
 QUEUE_MAX of them. A media message reserves its place at once as a Placeholder; its download and transcription fill it
 later. The runner, in dispatcher.py, waits for an unfilled placeholder when it reaches the head of the queue.
+A turn takes a batch: the head and the ready messages directly behind it (at most MERGE_MAX), merged into one text, so a
+forwarded batch of messages runs as one turn.
 
 TopicQueues holds the queue data only. It starts no thread and sends nothing. Its lock guards the queues and the set of
 busy topics, and no caller of it ever holds that lock while calling another service.
@@ -20,6 +22,9 @@ import threading
 from dataclasses import dataclass
 
 QUEUE_MAX = 100  # messages a topic may hold behind its running turn; a safety bound only, high enough for a batch of forwarded messages
+MERGE_MAX = 50  # most queued messages one turn takes in; a larger batch runs as several turns, in order
+BURST_HEADER = "[{count} messages sent together — read them all, then answer them as one task]"
+BURST_PART = "--- message {index}/{count} ---\n{text}"
 ID_BYTES = 5
 
 
@@ -93,13 +98,37 @@ class _HeadKind(enum.Enum):
 @dataclass(frozen=True)
 class _Head:
     kind: _HeadKind
-    entry: _Entry | None = None
-    text: str | None = None
-    images: tuple[str, ...] = ()
+    entry: _Entry | None = None  # the first popped entry: chat id and sender of the turn
+    text: str | None = None  # the merged text of the batch
+    images: tuple[str, ...] = ()  # the images of every popped entry, in order
+    entries: tuple[_Entry, ...] = ()  # every popped entry, in order (a READY head has at least one)
 
 
 def _new_id() -> str:
     return os.urandom(ID_BYTES).hex()
+
+
+def _ready(entry: _Entry) -> bool:
+    """A text entry, or a placeholder whose media has been filled in."""
+    return not isinstance(entry.body, Placeholder) or entry.body.text is not None
+
+
+def _text_of(entry: _Entry) -> str:
+    return entry.body if isinstance(entry.body, str) else entry.body.text or ""
+
+
+def _images_of(entry: _Entry) -> tuple[str, ...]:
+    return entry.images if isinstance(entry.body, str) else entry.body.images
+
+
+def burst_text(texts: list[str]) -> str:
+    """The text of a turn: one message as it is; several as a header that counts them, then each part numbered."""
+    if len(texts) == 1:
+        return texts[0]
+    count = len(texts)
+    parts = [BURST_HEADER.format(count=count)]
+    parts += [BURST_PART.format(index=i, count=count, text=text) for i, text in enumerate(texts, 1)]
+    return "\n\n".join(parts)
 
 
 def _snapshot(entry: _Entry) -> QueuedItem:
@@ -223,22 +252,28 @@ class TopicQueues:
             return tuple(_snapshot(entry) for entry in self._queues.get(thread_id) or [])
 
     def take_head(self, thread_id: int | str, keep_busy: bool = False) -> _Head:
-        """The next message for the runner. An unfilled placeholder at the head is left in place (WAIT). Otherwise the
-        head is removed and returned (READY). An empty queue ends the topic's busy state (EMPTY), unless keep_busy is
-        set: the runner then hands the topic to a kept idle session, which stays busy until its next turn ends."""
+        """The next turn for the runner. An unfilled placeholder at the head is left in place (WAIT). Otherwise the head
+        and every directly following ready message, up to MERGE_MAX in all, are removed as one batch (READY); the batch
+        stops at the first unfilled placeholder, which stays queued. An empty queue ends the topic's busy state (EMPTY),
+        unless keep_busy is set: the runner then hands the topic to a kept idle session, which stays busy until its next
+        turn ends."""
         with self._lock:
             queue = self._queues.get(thread_id) or []
             if not queue:
                 if not keep_busy:
                     self._busy.discard(thread_id)
                 return _Head(_HeadKind.EMPTY)
-            entry = queue[0]
-            if isinstance(entry.body, Placeholder) and entry.body.text is None:
-                return _Head(_HeadKind.WAIT, entry)
-            queue.pop(0)
-            if isinstance(entry.body, str):
-                return _Head(_HeadKind.READY, entry, entry.body, entry.images)
-            return _Head(_HeadKind.READY, entry, entry.body.text, entry.body.images)
+            if not _ready(queue[0]):
+                return _Head(_HeadKind.WAIT, queue[0])
+            taken = [queue.pop(0)]
+            while len(taken) < MERGE_MAX and queue and _ready(queue[0]):
+                taken.append(queue.pop(0))
+            for entry in taken:
+                if isinstance(entry.body, Placeholder):
+                    entry.body.ev.set()
+            text = burst_text([_text_of(entry) for entry in taken])
+            images = tuple(image for entry in taken for image in _images_of(entry))
+            return _Head(_HeadKind.READY, taken[0], text, images, tuple(taken))
 
     @staticmethod
     def _index_of(queue: list[_Entry], nid: str | None) -> int | None:

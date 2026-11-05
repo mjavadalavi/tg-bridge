@@ -16,10 +16,11 @@ from tests.fakes.telegram import FakeTelegram
 from tests.fakes.uploads import FakeUploader
 from tests.support import TempHome
 from tg_bridge.config import Config
+from tg_bridge.core.arrivals import BURST_GAP_SECONDS
 from tg_bridge.core.dispatcher import MEDIA_WAIT_SECONDS, Dispatcher
 from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.slots import SlotPool
-from tg_bridge.core.topic_queues import QUEUE_MAX, Admission, Delivery, Placeholder, TopicQueues
+from tg_bridge.core.topic_queues import QUEUE_MAX, Admission, Delivery, Placeholder, TopicQueues, burst_text
 from tg_bridge.core.turn_kit import TurnReply
 from tg_bridge.core.turn_state import TurnOutcome
 from tg_bridge.core.turn_text import RESTART_TEXT
@@ -158,7 +159,7 @@ class DispatcherCase(unittest.TestCase):
             turns=self.turns, slots=self.slots, inbox=self.inbox, messenger=self.messenger, answers=self.answers,
             titles=self.titles, client=self.tg, live=self.live, config=self.config, logger=self.logger,
             media_wait_seconds=self.media_wait if media_wait is None else media_wait,
-            start_thread=self.thread_log)
+            start_thread=self.thread_log, clock=self.clock)
 
     def tearDown(self) -> None:
         self.turns.release_all()
@@ -357,7 +358,8 @@ class DispatcherQueueScenarios(DispatcherCase):
         self.assertEqual([item.text for item in self.dispatcher.queue_snapshot(THREAD)], ["x3", "x2"])
         self.turns.gates["x1"].set()
         self.assertTrue(self.idle())
-        self.assertEqual(self.turns.texts_run(THREAD), ["x1", "x3", "x2"])
+        # x3 and x2 were both queued behind x1, so they run as one turn, x3 first
+        self.assertEqual(self.turns.texts_run(THREAD), ["x1", burst_text(["x3", "x2"])])
         self.assertEqual(self.dispatcher.queue_snapshot(THREAD), ())
 
     def test_queue_full_refuses_the_sixth_message_and_the_rest_run_in_order(self) -> None:
@@ -371,7 +373,9 @@ class DispatcherQueueScenarios(DispatcherCase):
         self.assertEqual(self.state(refused_uid), STATE_PENDING)
         self.turns.gates["f1"].set()
         self.assertTrue(self.idle())
-        self.assertEqual(self.turns.texts_run(THREAD), ["f1"] + [f"f{i + 2}" for i in range(QUEUE_MAX)])
+        # the 100 queued messages run in two batches of MERGE_MAX (50), in order
+        self.assertEqual(self.turns.texts_run(THREAD), [
+            "f1", burst_text([f"f{i}" for i in range(2, 52)]), burst_text([f"f{i}" for i in range(52, 102)])])
 
     def test_replayed_pending_row_runs_exactly_once(self) -> None:
         """test_durability (d): a pending row with an idle topic starts a runner; its row is done after it runs."""
@@ -418,7 +422,8 @@ class DispatcherMediaScenarios(DispatcherCase):
         self.assertEqual(self.state(uid), STATE_DONE)
 
     def test_text_behind_a_placeholder_waits_for_it(self) -> None:
-        """A text sent after a voice note waits behind the voice note's place, so the order of messages is kept.
+        """A text sent after a voice note waits behind the voice note's place, so the order of messages is kept:
+        once the voice is filled, both are ready and run as one turn, the voice first.
 
         Ported labels:
             4a: voice and text both ran
@@ -430,7 +435,7 @@ class DispatcherMediaScenarios(DispatcherCase):
         self.assertEqual(behind.position, 2)
         self.deliver(self.ingest(4003), "voice first", reserved=voice.nid)
         self.assertTrue(self.idle())
-        self.assertEqual(self.turns.texts_run(THREAD), ["voice first", "typed second"])
+        self.assertEqual(self.turns.texts_run(THREAD), [burst_text(["voice first", "typed second"])])
 
     def test_media_timeout_releases_the_place_and_tells_the_topic(self) -> None:
         """2: dispatcher moved on after the placeholder timed out
@@ -480,6 +485,78 @@ class DispatcherMediaScenarios(DispatcherCase):
     def test_unreserve_of_unknown_placeholder_is_false(self) -> None:
         self.assertFalse(self.dispatcher.unreserve(THREAD, None))
         self.assertFalse(self.dispatcher.unreserve(THREAD, "nope"))
+
+
+class GatedClock(FakeClock):
+    """A FakeClock whose sleep waits for the test: the runner settles there while the test delivers the rest of a
+    batch, so every message of the batch lands before the settle ends. Only the first sleep blocks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.released = threading.Event()
+
+    def sleep(self, seconds: float) -> None:
+        self.entered.set()
+        self.released.wait(WAIT)
+        super().sleep(seconds)
+
+
+class BurstScenarios(DispatcherCase):
+    """Batching: messages that arrive together run as one turn, and their inbox rows follow the batch."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.clock = GatedClock()
+        self.dispatcher = self._make_dispatcher()
+
+    def deliver_together(self, *messages: tuple[int, str]) -> None:
+        """Hands over messages the way a forwarded batch arrives: the first starts the runner, which settles; the rest
+        arrive during the settle, then the settle ends."""
+        for update_id, _ in messages:
+            self.ingest(update_id)
+        self.deliver(messages[0][0], messages[0][1])
+        self.assertTrue(self.clock.entered.wait(WAIT))
+        for update_id, text in messages[1:]:
+            self.deliver(update_id, text)
+        self.clock.released.set()
+
+    def test_forwarded_batch_runs_as_one_turn_and_every_row_is_done(self) -> None:
+        self.deliver_together((8001, "bug one"), (8002, "bug two"), (8003, "bug three"))
+        self.assertTrue(self.idle())
+        self.assertEqual(self.turns.texts_run(THREAD), [burst_text(["bug one", "bug two", "bug three"])])
+        self.assertTrue(self.turns.texts_run(THREAD)[0].startswith("[3 messages sent together"))
+        self.assertEqual([self.state(uid) for uid in (8001, 8002, 8003)], [STATE_DONE] * 3)
+        self.assertEqual(self.dispatcher.queue_snapshot(THREAD), ())
+
+    def test_message_alone_starts_its_turn_after_the_gap_only(self) -> None:
+        uid = self.ingest(8101)
+        self.assertIs(self.deliver(uid, "alone").admission, Admission.STARTED)
+        self.assertTrue(self.clock.entered.wait(WAIT))
+        self.assertEqual(self.turns.texts_run(THREAD), [])  # still settling: the gap has not passed
+        self.clock.released.set()
+        self.assertTrue(self.idle())
+        self.assertEqual(self.clock.sleeps, [BURST_GAP_SECONDS])
+        self.assertEqual(self.turns.texts_run(THREAD), ["alone"])
+
+        # a message that has waited in the queue for longer than the gap is not delayed once its turn ends
+        self.turns.gates["slow"] = threading.Event()
+        self.assertIs(self.deliver(self.ingest(8102), "slow").admission, Admission.STARTED)
+        self.assertTrue(self.turns.started("slow").wait(WAIT))
+        self.assertIs(self.deliver(self.ingest(8103), "later").admission, Admission.QUEUED)
+        self.clock.advance(BURST_GAP_SECONDS + 1)
+        self.turns.gates["slow"].set()
+        self.assertTrue(self.idle())
+        self.assertEqual(self.clock.sleeps, [BURST_GAP_SECONDS] * 2)  # one gap for "alone", one for "slow", none after
+        self.assertEqual(self.turns.texts_run(THREAD), ["alone", "slow", "later"])
+
+    def test_refused_batch_replays_every_row_on_restart(self) -> None:
+        """A shutdown refused the spawn of a batch: every update_id of the batch goes back to pending."""
+        self.turns.replies[burst_text(["r1", "r2"])] = TurnReply(None, None, TurnOutcome.RESTART)
+        self.deliver_together((8201, "r1"), (8202, "r2"))
+        self.assertTrue(self.idle())
+        self.assertEqual([self.state(uid) for uid in (8201, 8202)], [STATE_PENDING] * 2)
+        self.assertEqual(self.tg.texts(THREAD), [])
 
 
 class DispatcherRunScenarios(DispatcherCase):
