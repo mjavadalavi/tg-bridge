@@ -19,7 +19,7 @@ import os
 import threading
 from dataclasses import dataclass
 
-QUEUE_MAX = 5  # messages a topic may hold behind its running turn
+QUEUE_MAX = 100  # messages a topic may hold behind its running turn; a safety bound only, high enough for a batch of forwarded messages
 ID_BYTES = 5
 
 

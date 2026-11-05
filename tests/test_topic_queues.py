@@ -34,6 +34,13 @@ class QuietDeliveryTests(unittest.TestCase):
         self.assertIs(plain.admission, Admission.QUEUED)
         self.assertTrue(plain.notify)
 
+    def test_busy_topic_queues_twenty_messages_in_order(self) -> None:
+        self.assertIs(self.queues.deliver(THREAD, CHAT, SENDER, 1, "running").admission, Admission.STARTED)
+        results = [self.queues.deliver(THREAD, CHAT, SENDER, 10 + i, f"bug {i}") for i in range(20)]
+        self.assertEqual([r.admission for r in results], [Admission.QUEUED] * 20)
+        self.assertEqual([r.position for r in results], list(range(2, 22)))  # position 1 is the running turn
+        self.assertEqual([item.text for item in self.queues.snapshot(THREAD)[1:]], [f"bug {i}" for i in range(20)])
+
     def test_quiet_is_ignored_for_an_idle_topic(self) -> None:
         idle = self.queues.deliver(THREAD, CHAT, SENDER, 1, "hello", quiet=True)
         self.assertIs(idle.admission, Admission.STARTED)

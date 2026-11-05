@@ -190,9 +190,9 @@ class TopicQueuesUnit(unittest.TestCase):
     def test_queue_constants(self) -> None:
         """2: media wait covers a worst-case download + transcription (300s)
 
-        MEDIA_WAIT_SECONDS covers a worst-case download and transcription, QUEUE_MAX is 5.
+        MEDIA_WAIT_SECONDS covers a worst-case download and transcription, QUEUE_MAX is 100.
         """
-        self.assertEqual(QUEUE_MAX, 5)
+        self.assertEqual(QUEUE_MAX, 100)
         self.assertGreaterEqual(MEDIA_WAIT_SECONDS, 300)
 
     def test_queue_full_refuses_at_the_limit(self) -> None:
@@ -366,12 +366,12 @@ class DispatcherQueueScenarios(DispatcherCase):
         self.assertTrue(self.turns.started("f1").wait(WAIT))
         for i in range(QUEUE_MAX):
             self.assertIs(self.deliver(self.ingest(2001 + i), f"f{i + 2}").admission, Admission.QUEUED)
-        refused_uid = self.ingest(2100)
+        refused_uid = self.ingest(2001 + QUEUE_MAX)
         self.assertIs(self.deliver(refused_uid, "f-extra").admission, Admission.FULL)
         self.assertEqual(self.state(refused_uid), STATE_PENDING)
         self.turns.gates["f1"].set()
         self.assertTrue(self.idle())
-        self.assertEqual(self.turns.texts_run(THREAD), ["f1", "f2", "f3", "f4", "f5", "f6"])
+        self.assertEqual(self.turns.texts_run(THREAD), ["f1"] + [f"f{i + 2}" for i in range(QUEUE_MAX)])
 
     def test_replayed_pending_row_runs_exactly_once(self) -> None:
         """test_durability (d): a pending row with an idle topic starts a runner; its row is done after it runs."""
