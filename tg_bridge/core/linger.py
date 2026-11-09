@@ -171,11 +171,11 @@ class LingerService:
         if held is None or self._run_waiting(held) is not None:
             return False
         with self._lock:  # the same release check as claim: a request that landed since the self turns is not lost
-            requested = held.release
-            if not requested:
+            requested, planned = held.release, held.binding.plan_approved  # a plan approved in those self turns
+            if not (requested or planned):
                 held.state = HoldState.TURN
-        if requested:
-            self._release(held, HoldEnd.STOPPED)
+        if requested or planned:
+            self._release(held, HoldEnd.STOPPED if requested else HoldEnd.CHANGED)
             return False
         return True
 

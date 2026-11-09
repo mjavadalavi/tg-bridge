@@ -526,6 +526,21 @@ class SelfTurnTests(LingerCase):
         self.assertTrue(self.router.attach(user_seen.append))
         self.assertEqual(user_seen, [], "no event of a self turn reaches the user turn's gate")
 
+    def test_claim_and_resume_release_a_hold_whose_plan_was_approved(self) -> None:
+        with self.subTest("claim"):
+            self.start(before=BG)
+            self.assertTrue(self.offer())
+            self.binding.plan_approved = True
+            self.assertIsNone(self.service.claim(THREAD, self.key()))
+            self.assertFalse(self.service.holding(THREAD))
+        with self.subTest("resume, after a self turn that approved a plan"):
+            self.start(before=BG)
+            self.assertTrue(self.offer())
+            self.assertIsNotNone(self.service.claim(THREAD, self.key()))
+            self.binding.plan_approved = True
+            self.assertFalse(self.service.resume(THREAD))
+            self.assertFalse(self.service.holding(THREAD))
+
     def test_claim_whose_self_turn_ends_badly_releases_and_returns_none(self) -> None:
         self.stub.outcome = TurnOutcome.ERROR
         self.start(before=BG)
