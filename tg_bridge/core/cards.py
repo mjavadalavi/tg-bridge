@@ -255,10 +255,12 @@ class ApprovalCards:
                 raise ValueError(f"card {nonce} is already posted")
             self._cards[nonce] = card
         try:
-            if card.text == PLAN_ABOVE_TEXT:  # a long plan: its whole text goes first, in plain messages
-                for chunk in plan_chunks(f"{PLAN_HEAD}\n\n{_plan_text(request)}"):
-                    self._messenger.send_text(chat_id, thread_id, chunk)
-            sent = self._messenger.send_buttons(chat_id, thread_id, card.text[:EDIT_TEXT_LIMIT], rows)
+            sent = None
+            # a long plan: its whole text goes first, in plain messages; a part that is not sent means no card, since
+            # nobody may approve a plan they could not read whole
+            if card.text != PLAN_ABOVE_TEXT or all(self._messenger.send_text(chat_id, thread_id, chunk)
+                                                   for chunk in plan_chunks(f"{PLAN_HEAD}\n\n{_plan_text(request)}")):
+                sent = self._messenger.send_buttons(chat_id, thread_id, card.text[:EDIT_TEXT_LIMIT], rows)
         except Exception:
             self._forget(card)
             raise

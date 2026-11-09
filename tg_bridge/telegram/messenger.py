@@ -48,14 +48,16 @@ class Messenger:
         self._renamed_at: float | None = None  # clock.monotonic() of the last rename attempt; None before the first
         self._renamed_name = ""
 
-    def send_text(self, chat_id: int | str, thread_id: int | str, text: str) -> None:
-        """Plain text to a topic, in chunks. A failed chunk is logged and the remaining chunks are not sent."""
+    def send_text(self, chat_id: int | str, thread_id: int | str, text: str) -> bool:
+        """Plain text to a topic, in chunks. A failed chunk is logged and the remaining chunks are not sent. True when
+        every chunk was sent."""
         for chunk in chunk_text(text):
             try:
                 self._client.call("sendMessage", chat_id=chat_id, message_thread_id=thread_id, text=chunk)
             except Exception as exc:
                 self._logger.log(f"sendMessage failed: {str(exc)[:ERROR_TEXT_LIMIT]}")
-                return
+                return False
+        return True
 
     def send_buttons(
         self,

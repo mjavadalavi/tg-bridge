@@ -368,6 +368,20 @@ class HoldTests(LingerCase):
             self.h.sessions.new_session(THREAD)
             self.assertEqual(self.service.wait_once(THREAD).end, HoldEnd.CHANGED)
 
+    def test_an_approved_plan_is_never_kept_nor_held_on(self) -> None:
+        """Its CLI is still in native plan mode: the offer is refused, and a hold whose plan was approved in a self
+        turn ends as CHANGED even though the topic's key did not change."""
+        with self.subTest("the offer"):
+            self.start(before=BG)
+            self.binding.plan_approved = True
+            self.assertFalse(self.offer())
+        with self.subTest("an existing hold"):
+            self.start(before=BG)
+            self.assertTrue(self.offer())
+            self.binding.plan_approved = True
+            self.assertEqual(self.service.wait_once(THREAD).end, HoldEnd.CHANGED)
+            self.assertFalse(self.service.holding(THREAD))
+
     def test_request_release_needs_an_idle_session(self) -> None:
         self.assertFalse(self.service.request_release(THREAD))
         self.start(before=BG)

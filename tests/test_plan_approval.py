@@ -16,6 +16,7 @@ from tg_bridge.core.permissions import BYPASS_MODE, PermissionService
 from tg_bridge.core.plan_approval import (ASK_MODE, PLAN_APPROVED_MESSAGE, PLAN_CHANGE_MESSAGE, PLAN_GO_TEXT,
                                           PLAN_NOT_QUEUED_TEXT, PLAN_SENDER, PlanFollowUp)
 from tg_bridge.core.topic_queues import Admission, Delivery
+from tg_bridge.telegram.messenger import Messenger
 
 PLAN = "# Plan\n\n1. add the fee column\n2. write the tests"
 
@@ -83,6 +84,25 @@ class PlanCardTests(PlanCase):
         self.assertFalse(self.service.answer_ask("00000001", True))
         self.assertFalse(self.service.answer_bypass("00000001"))
         self.assertEqual(self.answers(), [])
+
+
+class FailingSecondText(Messenger):
+    """A Messenger whose second plain-text send fails, as a send that failed after its retries."""
+
+    texts_sent = 0
+
+    def send_text(self, chat_id, thread_id, text) -> bool:
+        self.texts_sent += 1
+        return self.texts_sent != 2 and super().send_text(chat_id, thread_id, text)
+
+
+class PlanPartLostTests(PlanCase):
+    messenger_cls = FailingSecondText
+
+    def test_no_card_when_a_part_of_the_plan_was_not_sent(self) -> None:
+        self.emit(plan_request("step\n" * (3 * PLAN_CHUNK_CHARS // 5)))
+        self.assertEqual(self.tg.buttons(THREAD), [])
+        self.assertEqual(self.answers(), [("answer", "p1", Decision.DENY, None, None)])
 
 
 class PlanAnswerTests(PlanCase):

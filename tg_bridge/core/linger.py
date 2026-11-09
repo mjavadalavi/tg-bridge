@@ -306,7 +306,7 @@ class LingerService:
             return "the turn did not end OK"
         if not o.session.alive() or o.router.exited:
             return "the process is gone"
-        if o.binding.plan_approved:
+        if o.binding.plan_approved:  # also an end of an existing hold (_end_reason), for a plan approved in a self turn
             return "a plan was approved: its CLI is still in plan mode, the next turn starts a fresh one"
         if o.router.pending <= 0 and not o.router.activity and not o.router.self_pending:
             return "no background work is pending"
@@ -416,7 +416,7 @@ class LingerService:
             current = key if key is not None else topic_key(self._config, row, held.topic)
         except LauncherError:
             return HoldEnd.CHANGED
-        if current != held.key:
+        if current != held.key or held.binding.plan_approved:  # an approved plan's CLI is still in plan mode
             return HoldEnd.CHANGED
         now = self._clock.monotonic()
         if now >= deadline:
