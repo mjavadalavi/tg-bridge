@@ -2,6 +2,8 @@
 
 - pa / pd: allow once / deny a permission ask. pA: allow and save the backend's proposed rule. pt: bypass for this
   turn. q:<nonce>:<question>:<option>: a picked option. o:<nonce>:<question>: 'Other', which waits for a typed answer.
+- pP:<nonce>:<b|e>: approve a plan, to run in bypass (b) or asking before edits (e). pc:<nonce>: 'Change' on a plan,
+  which waits for the owner's typed feedback (core/plan_approval). A plan's Reject is pd.
 
 Each tap is a call on PermissionService, which decides whether the ask is still open. A tap that finds nothing open
 (a double tap, an old card, a turn that already ended) gets the 'expired' toast and the card's text is kept with its
@@ -10,6 +12,7 @@ buttons removed. The service claims an ask before it answers it, so a repeated t
 
 from tg_bridge.bot.callbacks.router import CallbackRouter, Tap
 from tg_bridge.core.permissions import PermissionService
+from tg_bridge.core.plan_approval import PLAN_MODES
 
 EXPIRED_TEXT = "expired — that turn already ended"
 ALLOWED_TEXT = "Allowed ✅"
@@ -18,6 +21,8 @@ ALWAYS_TEXT = "Always allowed ♾"
 BYPASS_TEXT = "Bypass on for this turn 🤖"
 RECORDED_TEXT = "Recorded ✅"
 OTHER_TEXT = "Type your answer in this topic ✏️"
+PLAN_APPROVED_TEXT = "Plan approved ✅ — the next turn implements it"
+PLAN_CHANGE_TEXT = "Type what to change in this topic ✏️"
 
 
 class ApprovalTaps:
@@ -33,6 +38,8 @@ class ApprovalTaps:
         router.on("pt", self._bypass)
         router.on("q", self._option)
         router.on("o", self._other)
+        router.on("pP", self._plan)
+        router.on("pc", self._plan_change)
 
     @staticmethod
     def _nonce(tap: Tap, fields: int) -> str | None:
@@ -83,3 +90,14 @@ class ApprovalTaps:
             return
         ok = self._permissions.answer_other(nonce, int(tap.args[1]))
         self._settle(tap, ok, OTHER_TEXT)
+
+    def _plan(self, tap: Tap) -> None:
+        nonce = self._nonce(tap, 2)
+        mode = PLAN_MODES.get(tap.args[1]) if nonce is not None else None
+        if nonce is not None and mode is not None:
+            self._settle(tap, self._permissions.answer_plan(nonce, mode), PLAN_APPROVED_TEXT)
+
+    def _plan_change(self, tap: Tap) -> None:
+        nonce = self._nonce(tap, 1)
+        if nonce is not None:
+            self._settle(tap, self._permissions.answer_plan_change(nonce), PLAN_CHANGE_TEXT)

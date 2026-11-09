@@ -22,12 +22,13 @@ Mapping:
 from typing import Any
 
 from tg_bridge.agents.claude.tools import FILE_TOOLS, tool_label
-from tg_bridge.agents.events import (ApprovalRequest, ApprovalWithdrawn, AgentEvent, Decision, Question,
-                                     SessionStarted, StatusEvent, TextEvent, ToolEnd, ToolStart, TurnResult,
-                                     TurnStatus, UsageEvent)
+from tg_bridge.agents.events import (PLAN_CHOICES, PLAN_KIND, ApprovalRequest, ApprovalWithdrawn, AgentEvent,
+                                     Decision, Question, SessionStarted, StatusEvent, TextEvent, ToolEnd, ToolStart,
+                                     TurnResult, TurnStatus, UsageEvent)
 
 NO_CONVERSATION = "No conversation found"  # the CLI's answer to --resume of an id it never persisted
 ASK_USER_QUESTION = "AskUserQuestion"
+EXIT_PLAN_MODE = "ExitPlanMode"  # a finished plan: a plan card (PLAN_KIND) with no Always and no Bypass button
 RESULT_DETAIL_CHARS = 1500  # error text kept on a failed TurnResult (the live file's cut)
 TOOL_ERROR_CHARS = 200      # first line of a failed tool result kept as ToolEnd.detail
 ALL_DECISIONS = frozenset({Decision.ALLOW_ONCE, Decision.ALLOW_ALWAYS, Decision.ALLOW_TURN, Decision.DENY})
@@ -140,8 +141,9 @@ class ClaudeTranslator:
             return [ApprovalRequest(approval_id=rid, kind="question", tool=tool, input=inp, summary=summary,
                                     choices=frozenset({Decision.DENY}), questions=_questions(inp.get("questions")),
                                     raw=event)]
+        choices = PLAN_CHOICES if tool == EXIT_PLAN_MODE else ALL_DECISIONS
         return [ApprovalRequest(approval_id=rid, kind=_approval_kind(tool), tool=tool, input=inp, summary=summary,
-                                choices=ALL_DECISIONS, raw=event)]
+                                choices=choices, raw=event)]
 
     def _cancel(self, event: dict) -> list[AgentEvent]:
         rid = event.get("request_id")
@@ -207,6 +209,8 @@ def _questions(raw: Any) -> tuple[Question, ...]:
 
 
 def _approval_kind(tool: str) -> str:
+    if tool == EXIT_PLAN_MODE:
+        return PLAN_KIND
     if tool == "Bash":
         return "command"
     if tool in FILE_TOOLS:

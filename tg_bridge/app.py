@@ -43,6 +43,7 @@ from tg_bridge.core.live import LiveRegistry
 from tg_bridge.core.media import MediaService, SonioxTranscriber
 from tg_bridge.core.removals import Removals
 from tg_bridge.core.permissions import PermissionService
+from tg_bridge.core.plan_approval import PlanFollowUp
 from tg_bridge.core.self_turn import SelfTurns
 from tg_bridge.core.slots import SLOT_COUNT, SlotPool
 from tg_bridge.core.terminal_claim import clear_turn_marks
@@ -227,8 +228,11 @@ class App:
         # turns: permissions, the turn runner, the dispatcher
         handoff = HandoffService(kv, registry, logger)
         cards = ApprovalCards(messenger, logger, clock)
+        def plan_approved(thread_id: int, chat_id: int, mode: str) -> None:  # the dispatcher is built below
+            PlanFollowUp(sessions, dispatcher)(thread_id, chat_id, mode)
+
         permissions = PermissionService(asks=asks, rules=rules, cards=cards, messenger=messenger, workers=out,
-                                        waiting=waits, logger=logger)
+                                        waiting=waits, logger=logger, plan_approved=plan_approved)
         slots = SlotPool(SLOT_COUNT, messenger, live.is_shutting_down)
 
         def feeds(chat_id: int | str, thread_id: int, parked: Callable[[], bool]) -> TurnFeed:

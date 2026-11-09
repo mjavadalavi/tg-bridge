@@ -729,6 +729,17 @@ class PermissionTests(TuiTestCase):
         self.assertEqual([e.ok for e in sink.events if isinstance(e, ToolEnd)], [True])
         self.assertEqual(only_result(sink).answer, "DONE")
 
+    def test_bypass_still_sends_a_plan_to_the_owner(self) -> None:
+        """A plan (ExitPlanMode) is never allowed by bypass: it becomes a plan ask, so the owner sees its card."""
+        sink, session = self.open("permission")
+        self.assertTrue(session.set_mode(BYPASS_MODE))
+        with mock.patch.object(session._server, "answer") as answered:
+            session._on_hook_request("h1", {"tool_name": "ExitPlanMode", "tool_input": {"plan": "p"}})
+            session._on_hook_request("h2", {"tool_name": "Bash", "tool_input": {"command": "ls"}})
+        self.assertEqual([c.args[0] for c in answered.call_args_list], ["h2"])  # only the Bash call is allowed
+        plans = [e for e in sink.events if isinstance(e, ApprovalRequest)]
+        self.assertEqual([(e.approval_id, e.kind) for e in plans], [("h1", "plan")])
+
 
 class StopLifecycleTests(TuiTestCase):
     def test_a_pending_permission_is_denied_before_the_first_key_on_stop(self) -> None:

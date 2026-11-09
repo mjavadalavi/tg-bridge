@@ -9,6 +9,8 @@ gets a warning line.
 
 Callback data: pa/pA/pd/pt (permission buttons) and q/o (question options and 'Other') carry the nonce, checked by
 CallbackData against the 64-byte limit. The Always button needs a rule text (always_rule); without one it is hidden.
+A plan card (PLAN_KIND) shows the plan and pP:<nonce>:b / pP:<nonce>:e (run it), pc (change) and pd (reject); its
+change waits for typed feedback like 'Other' does, under the question index PLAN_CHANGE_QI (core/plan_approval).
 
 Lock map: self._lock guards _cards (nonce -> _Card) and _await_text (thread id -> (nonce, question index)). Telegram
 calls and timer starts never run under it: each method copies what it needs, releases the lock, then acts.
@@ -23,8 +25,9 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Protocol
 
-from tg_bridge.agents.events import ApprovalRequest, Decision, Question
+from tg_bridge.agents.events import PLAN_KIND, ApprovalRequest, Decision, Question
 from tg_bridge.clock import Clock
+from tg_bridge.core.plan_approval import PLAN_CHANGE_QI
 from tg_bridge.feed.format import short
 from tg_bridge.logging_ import Logger
 from tg_bridge.telegram.keyboards import EMPTY_KEYBOARD, CallbackData, keyboard_json
@@ -33,12 +36,18 @@ from tg_bridge.telegram.messenger import EDIT_TEXT_LIMIT, Messenger
 ASK_NUDGE_SECONDS = 600.0
 NUDGE_TEXT = "\n\n⏰ still waiting for your tap"
 OTHER_WAIT_TEXT = "\n\n✏️ type your answer in this topic"
+PLAN_HEAD = "📋 Plan — read it, then run it, ask for changes or reject it"
+PLAN_ABOVE_TEXT = "📋 The plan is in the messages above — run it, ask for changes or reject it"
+PLAN_CARD_CHARS = 3500  # a longer plan is sent as plain messages before its card, which then only holds the buttons
+PLAN_CHANGE_WAIT_TEXT = "\n\n✏️ type what to change in this topic — your next message goes to Claude"
 DENY_WARNING = "\n⚠️ Deny stops this turn"
 OUTCOME = MappingProxyType({
     "allow": "✅ allowed",
     "deny": "⛔ denied",
     "void": "⌛ void — turn ended",
     "withdrawn": "↩️ withdrawn",
+    "approved": "✅ approved — the next turn implements it",
+    "change": "✏️ sent back with your changes",
 })
 DETAIL_CHARS = 600
 DETAIL_KEYS = ("command", "path", "file_path", "notebook_path")
@@ -127,9 +136,17 @@ def question_body(questions: tuple[Question, ...], answers: dict[str, str]) -> s
     return "\n\n".join(parts)
 
 
+def _plan_text(request: ApprovalRequest) -> str:
+    plan = request.input.get("plan")
+    return plan if isinstance(plan, str) else ""
+
+
 def _card_text(request: ApprovalRequest) -> str:
     if request.questions:
         return question_body(request.questions, {})
+    if request.kind == PLAN_KIND:
+        plan = _plan_text(request)
+        return f"{PLAN_HEAD}\n\n{plan}" if len(plan) <= PLAN_CARD_CHARS else PLAN_ABOVE_TEXT
     text = f"🔐 {request.summary}\n{_detail(request)}"
     if request.deny_aborts_turn and Decision.DENY in request.choices:
         text += DENY_WARNING
@@ -170,9 +187,19 @@ def _question_rows(card: _Card) -> list[list[tuple[str, CallbackData]]]:
     return rows
 
 
+def _plan_rows(card: _Card) -> list[list[tuple[str, CallbackData]]]:
+    """Run it (bypass) and Run it asking before edits, one row each; Change and Reject on the last row."""
+    nonce = card.nonce
+    return [[("✅ Run it", CallbackData("pP", (nonce, "b")))],
+            [("✅ Run it, ask before edits", CallbackData("pP", (nonce, "e")))],
+            [("✏️ Change", CallbackData("pc", (nonce,))), ("⛔ Reject", CallbackData("pd", (nonce,)))]]
+
+
 def _rows(card: _Card, with_buttons: bool) -> list[list[tuple[str, CallbackData]]]:
     if not with_buttons:
         return []
+    if card.request.kind == PLAN_KIND:
+        return _plan_rows(card)
     return _question_rows(card) if card.questions else _permission_rows(card)
 
 
@@ -216,6 +243,8 @@ class ApprovalCards:
                 raise ValueError(f"card {nonce} is already posted")
             self._cards[nonce] = card
         try:
+            if card.text == PLAN_ABOVE_TEXT:  # a long plan: its text goes first, in plain messages
+                self._messenger.send_text(chat_id, thread_id, f"{PLAN_HEAD}\n\n{_plan_text(request)}")
             sent = self._messenger.send_buttons(chat_id, thread_id, card.text[:EDIT_TEXT_LIMIT], rows)
         except Exception:
             self._forget(card)
@@ -281,6 +310,19 @@ class ApprovalCards:
                 return False
             self._await_text[card.thread_id] = (nonce, qi)
             card.text = question_body(card.questions, card.answers) + OTHER_WAIT_TEXT
+            view = self._view(card, with_buttons=True)
+        self._paint(view)
+        return True
+
+    def open_plan_change(self, nonce: str) -> bool:
+        """'Change' was tapped on a plan card: the next text in the card's topic is the owner's feedback on the plan."""
+        with self._lock:
+            card = self._open_card(nonce)
+            if card is None or card.request.kind != PLAN_KIND:
+                return False
+            self._await_text[card.thread_id] = (nonce, PLAN_CHANGE_QI)
+            if not card.text.endswith(PLAN_CHANGE_WAIT_TEXT):
+                card.text += PLAN_CHANGE_WAIT_TEXT
             view = self._view(card, with_buttons=True)
         self._paint(view)
         return True

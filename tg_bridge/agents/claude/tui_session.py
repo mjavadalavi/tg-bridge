@@ -34,7 +34,7 @@ from tg_bridge.agents.claude.session import BYPASS_MODE, INTERRUPT_TIMEOUT, KILL
 from tg_bridge.agents.claude.transcript_turns import (INTERRUPT_FALLBACK_SECONDS, TRANSCRIPT_WAIT_SECONDS,
                                                       TranscriptTurns)
 from tg_bridge.agents.claude.tui_helpers import _child_env, _socket_path, permission_args
-from tg_bridge.agents.claude.translate import NO_CONVERSATION, ClaudeTranslator
+from tg_bridge.agents.claude.translate import EXIT_PLAN_MODE, NO_CONVERSATION, ClaudeTranslator
 from tg_bridge.agents.claude.tui_gate import wait_for_hooks
 from tg_bridge.agents.claude.trust_dialog import prompt_showing, startup
 from tg_bridge.agents.claude.tui_turn import STARTUP_DIALOG_ERROR
@@ -260,7 +260,7 @@ class ClaudeTuiSession(PtyProcess, AgentSession):
     def _on_hook_request(self, request_id: str, payload: dict) -> None:
         with self._mode_lock:
             bypass = self._mode == BYPASS_MODE
-        if bypass:
+        if bypass and payload.get("tool_name") != EXIT_PLAN_MODE:  # a plan always goes to the owner's card
             self._server.answer(request_id, permission_allow())
             return
         event = {"type": "control_request", "request_id": request_id,

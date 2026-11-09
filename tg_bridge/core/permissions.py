@@ -18,22 +18,20 @@ import secrets
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 
 from tg_bridge.agents.base import AgentSession, RuleMatcher
-from tg_bridge.agents.events import AgentEvent, ApprovalRequest, ApprovalWithdrawn, Decision, TurnResult
+from tg_bridge.agents.events import PLAN_KIND, AgentEvent, ApprovalRequest, ApprovalWithdrawn, Decision, TurnResult
+from tg_bridge.core.ask_recovery import recover_asks
 from tg_bridge.core.cards import ApprovalCards
+from tg_bridge.core.plan_approval import PLAN_APPROVED_MESSAGE, PLAN_CHANGE_MESSAGE, PLAN_CHANGE_QI
 from tg_bridge.logging_ import Logger
 from tg_bridge.store.asks import VOID, AskRepo
 from tg_bridge.store.rules import RuleRepo
-from tg_bridge.telegram.keyboards import EMPTY_KEYBOARD
 from tg_bridge.telegram.messenger import Messenger
 
 BYPASS_MODE = "bypassPermissions"
 QUESTION_KIND = "question"
-VOID_RESTART_TEXT = "\n\n⌛ void — bridge restarted"
-DETAIL_KEYS = ("command", "file_path", "notebook_path", "path")
-DETAIL_CHARS = 600
 ERROR_TEXT_LIMIT = 150
 NONCE_BYTES = 4
 # Reasons the bridge (not the owner) denies with. The model reads them, so the live texts are kept word for word.
@@ -103,21 +101,13 @@ class _TurnListener:
             self._service.end_turn_bypass(self._binding)
 
 
-def _detail(inp: dict[str, Any]) -> str:
-    """The text a recovered card shows under its title: the command or path, else the input as JSON."""
-    for key in DETAIL_KEYS:
-        value = inp.get(key)
-        if isinstance(value, str) and value:
-            return value[:DETAIL_CHARS]
-    return str(inp)[:DETAIL_CHARS]
-
-
 class PermissionService:
     """One per App. Turns approval events into card asks, saved-rule answers or bypass answers, and resolves the asks."""
 
     def __init__(self, *, asks: AskRepo, rules: RuleRepo, cards: ApprovalCards, messenger: Messenger,
                  workers: Submitter, waiting: WaitObserver, logger: Logger,
-                 nonce_factory: Callable[[], str] = new_nonce) -> None:
+                 nonce_factory: Callable[[], str] = new_nonce,
+                 plan_approved: Callable[[int, int, str], None] | None = None) -> None:
         self._asks_repo = asks
         self._rules_repo = rules
         self._cards = cards
@@ -126,6 +116,7 @@ class PermissionService:
         self._waiting = waiting
         self._logger = logger
         self._new_nonce = nonce_factory
+        self._plan_approved = plan_approved  # (thread, chat, mode): stores the mode and queues the implementing turn
         self._lock = threading.Lock()
         self._asks: dict[str, _Ask] = {}
         self._turns: dict[int, TurnBinding] = {}
@@ -164,10 +155,10 @@ class PermissionService:
             if not req.questions:
                 self._answer(session, req, Decision.DENY, deny_message=NO_QUESTIONS_MESSAGE)
                 return
-        elif mode == BYPASS_MODE:
+        elif mode == BYPASS_MODE and req.kind != PLAN_KIND:  # a plan is the owner's to approve: no bypass, no rule
             self._answer(session, req, Decision.ALLOW_ONCE)
             return
-        elif self._saved_rule(binding, req) is not None:
+        elif req.kind != PLAN_KIND and self._saved_rule(binding, req) is not None:
             self._answer(session, req, Decision.ALLOW_ONCE)
             return
         self._register(binding, session, req)
@@ -187,12 +178,13 @@ class PermissionService:
 
     def answer_ask(self, nonce: str, allow: bool, by: str = "owner") -> bool:
         """Allow once or Deny a pending ask. False when the ask is gone (already answered, withdrawn or voided).
-        A question cannot be allowed without its answers, so allow=True on one returns False."""
-        verdict = "allow" if allow else "deny"
-        ask = self._claim(nonce, verdict, accept=lambda a: not (allow and a.request.kind == QUESTION_KIND))
+        A question cannot be allowed without its answers, nor a plan without its mode (answer_plan), so allow=True on
+        either returns False."""
+        ask = self._claim(nonce, "allow" if allow else "deny",
+                          accept=lambda a: not allow or a.request.kind not in (QUESTION_KIND, PLAN_KIND))
         if ask is None:
             return False
-        self._logger.log(f"ask {nonce}: {verdict} by {by}")
+        self._logger.log(f"ask {nonce}: {ask.verdict} by {by}")
         self._finish(ask, Decision.ALLOW_ONCE if allow else Decision.DENY)
         return True
 
@@ -222,6 +214,29 @@ class PermissionService:
         self._workers.submit(self._bypass_job, thread_id, by)
         return True
 
+    def answer_plan(self, nonce: str, mode: str, by: str = "owner") -> bool:
+        """Approves a plan (core/plan_approval): the ask is denied with the approval text, so the model ends the turn,
+        and the follow-up stores mode as the topic's mode and queues the turn that implements the plan."""
+        ask = self._claim(nonce, "approved", accept=lambda a: a.request.kind == PLAN_KIND)
+        if ask is None:
+            return False
+        self._logger.log(f"ask {nonce}: plan approved ({mode}) by {by}")
+        self._finish(ask, Decision.DENY, deny_message=PLAN_APPROVED_MESSAGE.format(mode=mode))
+        if self._plan_approved is not None:
+            try:
+                self._plan_approved(ask.binding.thread_id, ask.binding.chat_id, mode)
+            except Exception as exc:
+                self._logger.log(f"ask {nonce}: plan follow-up failed: {str(exc)[:ERROR_TEXT_LIMIT]}")
+        return True
+
+    def answer_plan_change(self, nonce: str) -> bool:
+        """'Change' on a plan card: the next text in the topic is the owner's feedback on the plan."""
+        with self._lock:
+            ask = self._asks.get(nonce)
+            if ask is None or ask.request.kind != PLAN_KIND:
+                return False
+        return self._cards.open_plan_change(nonce)
+
     def answer_other(self, nonce: str, qi: int) -> bool:
         """'Other' on question qi: the next text in the topic is that question's answer."""
         with self._lock:
@@ -236,9 +251,15 @@ class PermissionService:
         return label is not None and self._record(nonce, qi, label)
 
     def record_text(self, thread_id: int, text: str) -> bool:
-        """A typed message in a topic that waits for an 'Other' answer. True when it became that answer."""
+        """A typed message in a topic that waits for an 'Other' answer or for feedback on a plan. True when it became
+        that answer (a plan is then denied with the feedback, and the model revises it)."""
         waiting = self._cards.awaiting(thread_id)
-        return waiting is not None and self._record(waiting[0], waiting[1], text)
+        if waiting is None or waiting[1] != PLAN_CHANGE_QI:
+            return waiting is not None and self._record(waiting[0], waiting[1], text)
+        ask = self._claim(waiting[0], "change", accept=lambda a: a.request.kind == PLAN_KIND)
+        if ask is not None:
+            self._finish(ask, Decision.DENY, deny_message=PLAN_CHANGE_MESSAGE.format(text=text))
+        return ask is not None
 
     def set_live_mode(self, thread_id: int, mode: str, by: str = "owner") -> bool:
         """Switches the running turn of a topic to mode. Returns whether the session applied it live (False: the mode
@@ -297,20 +318,8 @@ class PermissionService:
 
     def recover_cards(self) -> int:
         """Start-up: every ask still pending in the database was never answered and its turn is gone. Each is voided
-        and its card, when it has one, is closed. Returns how many asks were voided."""
-        count = 0
-        for record in self._asks_repo.pending():
-            if not self._asks_repo.answer(record.nonce, VOID):
-                continue
-            count += 1
-            if record.message_id is None:
-                continue
-            text = f"🔐 {record.tool_name}\n{_detail(record.tool_input())}{VOID_RESTART_TEXT}"
-            try:
-                self._messenger.edit_text(record.chat_id, record.message_id, text, reply_markup=EMPTY_KEYBOARD)
-            except Exception as exc:
-                self._logger.log(f"recover card {record.nonce}: {str(exc)[:ERROR_TEXT_LIMIT]}")
-        return count
+        and its card, when it has one, is closed (core/ask_recovery). Returns how many asks were voided."""
+        return recover_asks(self._asks_repo, self._messenger, self._logger)
 
     # internals
 

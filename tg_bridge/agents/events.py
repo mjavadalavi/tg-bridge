@@ -87,7 +87,7 @@ class Question:
 @dataclass(frozen=True, slots=True)
 class ApprovalRequest:
     approval_id: str                 # bridge-unique key, stored in asks.request_id (Claude request_id; Codex 'rpc:<id>')
-    kind: str                        # 'tool' | 'command' | 'file' | 'question' | 'permissions' | 'elicitation'
+    kind: str                        # tool | command | file | question | plan | permissions | elicitation
     tool: str                        # tool name for rules and labels
     input: dict                      # what the card shows (command, path, diff summary)
     summary: str                     # one-line card title
@@ -96,6 +96,10 @@ class ApprovalRequest:
     questions: tuple[Question, ...] = ()
     deny_aborts_turn: bool = False   # Codex 'cancel' only -> the card warns
     raw: dict = field(default_factory=dict, compare=False)  # backend payload kept for answer(); never logged
+
+
+PLAN_KIND = "plan"  # ApprovalRequest.kind of a finished plan (Claude's ExitPlanMode): only the owner approves it
+PLAN_CHOICES = frozenset({Decision.ALLOW_ONCE, Decision.DENY})
 
 
 @dataclass(frozen=True, slots=True)
