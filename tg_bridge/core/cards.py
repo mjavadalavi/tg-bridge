@@ -39,6 +39,7 @@ OTHER_WAIT_TEXT = "\n\n✏️ type your answer in this topic"
 PLAN_HEAD = "📋 Plan — read it, then run it, ask for changes or reject it"
 PLAN_ABOVE_TEXT = "📋 The plan is in the messages above — run it, ask for changes or reject it"
 PLAN_CARD_CHARS = 3500  # a longer plan is sent as plain messages before its card, which then only holds the buttons
+PLAN_CHUNK_CHARS = 3500  # one message of a long plan; every part is sent (Messenger.send_text would cut a long text)
 PLAN_CHANGE_WAIT_TEXT = "\n\n✏️ type what to change in this topic — your next message goes to Claude"
 DENY_WARNING = "\n⚠️ Deny stops this turn"
 OUTCOME = MappingProxyType({
@@ -139,6 +140,17 @@ def question_body(questions: tuple[Question, ...], answers: dict[str, str]) -> s
 def _plan_text(request: ApprovalRequest) -> str:
     plan = request.input.get("plan")
     return plan if isinstance(plan, str) else ""
+
+
+def plan_chunks(text: str) -> list[str]:
+    """The messages of a long plan, at most PLAN_CHUNK_CHARS each, split at a line end when one is near; none is lost."""
+    chunks = []
+    while len(text) > PLAN_CHUNK_CHARS:
+        cut = text.rfind("\n", PLAN_CHUNK_CHARS // 2, PLAN_CHUNK_CHARS)
+        cut = PLAN_CHUNK_CHARS if cut < 0 else cut + 1
+        chunks.append(text[:cut])
+        text = text[cut:]
+    return [*chunks, text] if text else chunks
 
 
 def _card_text(request: ApprovalRequest) -> str:
@@ -243,8 +255,9 @@ class ApprovalCards:
                 raise ValueError(f"card {nonce} is already posted")
             self._cards[nonce] = card
         try:
-            if card.text == PLAN_ABOVE_TEXT:  # a long plan: its text goes first, in plain messages
-                self._messenger.send_text(chat_id, thread_id, f"{PLAN_HEAD}\n\n{_plan_text(request)}")
+            if card.text == PLAN_ABOVE_TEXT:  # a long plan: its whole text goes first, in plain messages
+                for chunk in plan_chunks(f"{PLAN_HEAD}\n\n{_plan_text(request)}"):
+                    self._messenger.send_text(chat_id, thread_id, chunk)
             sent = self._messenger.send_buttons(chat_id, thread_id, card.text[:EDIT_TEXT_LIMIT], rows)
         except Exception:
             self._forget(card)

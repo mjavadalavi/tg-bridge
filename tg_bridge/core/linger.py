@@ -306,6 +306,8 @@ class LingerService:
             return "the turn did not end OK"
         if not o.session.alive() or o.router.exited:
             return "the process is gone"
+        if o.binding.plan_approved:
+            return "a plan was approved: its CLI is still in plan mode, the next turn starts a fresh one"
         if o.router.pending <= 0 and not o.router.activity and not o.router.self_pending:
             return "no background work is pending"
         with self._lock:

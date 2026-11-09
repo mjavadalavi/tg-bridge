@@ -11,10 +11,11 @@ from tests.test_permissions import CHAT, THREAD, PermissionCase
 from tg_bridge.agents.claude.translate import ClaudeTranslator
 from tg_bridge.agents.events import PLAN_CHOICES, PLAN_KIND, ApprovalRequest, Decision
 from tg_bridge.bot.callbacks.approvals import ApprovalTaps
-from tg_bridge.core.cards import PLAN_ABOVE_TEXT, PLAN_CARD_CHARS, PLAN_HEAD
+from tg_bridge.core.cards import PLAN_ABOVE_TEXT, PLAN_CARD_CHARS, PLAN_CHUNK_CHARS, PLAN_HEAD
 from tg_bridge.core.permissions import BYPASS_MODE, PermissionService
-from tg_bridge.core.plan_approval import (EDITS_MODE, PLAN_APPROVED_MESSAGE, PLAN_CHANGE_MESSAGE, PLAN_GO_TEXT,
-                                          PLAN_SENDER, PlanFollowUp)
+from tg_bridge.core.plan_approval import (ASK_MODE, PLAN_APPROVED_MESSAGE, PLAN_CHANGE_MESSAGE, PLAN_GO_TEXT,
+                                          PLAN_NOT_QUEUED_TEXT, PLAN_SENDER, PlanFollowUp)
+from tg_bridge.core.topic_queues import Admission, Delivery
 
 PLAN = "# Plan\n\n1. add the fee column\n2. write the tests"
 
@@ -28,10 +29,13 @@ def plan_request(plan: str = PLAN, approval_id: str = "p1") -> ApprovalRequest:
 class PlanCase(PermissionCase):
     def build_service(self) -> PermissionService:
         self.approved: list[tuple[int, int, str]] = []
+        def approved(thread: int, chat: int, mode: str) -> None:
+            self.approved.append((thread, chat, mode))
+            self.answered_before_follow_up = bool(self.answers())
+
         return PermissionService(asks=self.asks, rules=self.rules, cards=self.cards, messenger=self.messenger,
                                  workers=self.workers, waiting=self.waits, logger=self.logger,
-                                 nonce_factory=lambda: next(self.nonces),
-                                 plan_approved=lambda thread, chat, mode: self.approved.append((thread, chat, mode)))
+                                 nonce_factory=lambda: next(self.nonces), plan_approved=approved)
 
     def deny_messages(self) -> list[tuple[str, str]]:
         return list(self.session.deny_messages)
@@ -52,6 +56,15 @@ class PlanCardTests(PlanCase):
         self.assertTrue(texts[0].startswith(PLAN_HEAD))
         self.assertEqual(texts[-1], PLAN_ABOVE_TEXT)
         self.assertEqual("".join(texts[:-1]).count("step"), long_plan.count("step"))
+
+    def test_a_very_long_plan_reaches_the_topic_whole(self) -> None:
+        long_plan = "".join(f"step {n}\n" for n in range(6 * PLAN_CHUNK_CHARS // 7)) + "THE LAST STEP"
+        self.emit(plan_request(long_plan))
+        texts = [params["text"] for params in self.posted()]
+        self.assertGreater(len(texts), 5)
+        self.assertTrue(all(len(text) <= PLAN_CHUNK_CHARS for text in texts))
+        sent = "\n".join(texts[:-1]).split()  # the sender trims the line end at each cut; no word is lost
+        self.assertEqual(sent, f"{PLAN_HEAD}\n\n{long_plan}".split())
 
     def test_bypass_does_not_approve_a_plan(self) -> None:
         self.binding.mode = BYPASS_MODE
@@ -79,6 +92,8 @@ class PlanAnswerTests(PlanCase):
         self.assertEqual(self.answers(), [("answer", "p1", Decision.DENY, None, None)])
         self.assertEqual(self.deny_messages(), [("p1", PLAN_APPROVED_MESSAGE.format(mode=BYPASS_MODE))])
         self.assertEqual(self.approved, [(THREAD, CHAT, BYPASS_MODE)])
+        self.assertFalse(self.answered_before_follow_up, "the mode is stored and the turn queued before the answer")
+        self.assertTrue(self.binding.plan_approved, "linger must not keep this session")
         self.assertEqual(self.row("00000001"), "approved")
         self.assertFalse(self.service.answer_plan("00000001", BYPASS_MODE), "a second tap finds nothing")
         self.assertEqual(len(self.approved), 1)
@@ -108,14 +123,8 @@ class PlanAnswerTests(PlanCase):
         self.assertEqual(self.answers(), [("answer", "p1", Decision.DENY, None, None)])
         self.assertEqual(self.approved, [])
 
-    def test_a_failing_follow_up_still_answers_the_plan(self) -> None:
-        def boom(*_: object) -> None:
-            raise RuntimeError("no dispatcher")
-
-        self.service._plan_approved = boom
-        self.emit(plan_request())
-        self.assertTrue(self.service.answer_plan("00000001", EDITS_MODE))
-        self.assertEqual(self.deny_messages(), [("p1", PLAN_APPROVED_MESSAGE.format(mode=EDITS_MODE))])
+    def test_the_ask_before_edits_button_is_the_default_mode(self) -> None:
+        self.assertEqual(ASK_MODE, "default")
 
 
 class FakeTap:
@@ -138,7 +147,7 @@ class PlanTapTests(PlanCase):
         taps._plan(FakeTap("00000001", "x"))
         self.assertEqual(self.approved, [])
         taps._plan(FakeTap("00000001", "e"))
-        self.assertEqual(self.approved, [(THREAD, CHAT, EDITS_MODE)])
+        self.assertEqual(self.approved, [(THREAD, CHAT, ASK_MODE)])
 
     def test_change_button_opens_the_wait(self) -> None:
         taps = ApprovalTaps(permissions=self.service)
@@ -161,20 +170,51 @@ class RecordingSessions:
 
 
 class RecordingDispatcher:
-    def __init__(self) -> None:
+    def __init__(self, admission: Admission = Admission.QUEUED, error: Exception | None = None) -> None:
         self.calls: list[tuple] = []
+        self.admission, self.error = admission, error
 
-    def deliver(self, thread_id, topic, chat_id, sender, update_id, text) -> None:
+    def deliver(self, thread_id, topic, chat_id, sender, update_id, text) -> Delivery:
         self.calls.append((thread_id, topic, chat_id, sender, update_id, text))
+        if self.error is not None:
+            raise self.error
+        return Delivery(self.admission)
+
+
+class RecordingNotices:
+    def __init__(self) -> None:
+        self.texts: list[tuple] = []
+        self.lines: list[str] = []
+
+    def send_text(self, chat_id, thread_id, text) -> None:
+        self.texts.append((chat_id, thread_id, text))
+
+    def log(self, line: str) -> None:
+        self.lines.append(line)
 
 
 class FollowUpTests(unittest.TestCase):
+    def follow_up(self, dispatcher: RecordingDispatcher) -> tuple[RecordingSessions, RecordingNotices]:
+        sessions, notices = RecordingSessions(), RecordingNotices()
+        PlanFollowUp(sessions, dispatcher, notices, notices)(7561, CHAT, BYPASS_MODE)
+        return sessions, notices
+
     def test_the_follow_up_stores_the_mode_then_queues_the_go_message(self) -> None:
-        sessions, dispatcher = RecordingSessions(), RecordingDispatcher()
-        PlanFollowUp(sessions, dispatcher)(7561, CHAT, BYPASS_MODE)
+        dispatcher = RecordingDispatcher()
+        sessions, notices = self.follow_up(dispatcher)
         self.assertEqual(sessions.modes, [(7561, BYPASS_MODE)])
         self.assertEqual(dispatcher.calls,
                          [(7561, "accounting", CHAT, PLAN_SENDER, None, PLAN_GO_TEXT.format(mode=BYPASS_MODE))])
+        self.assertEqual(notices.texts, [])
+
+    def test_a_full_queue_is_told_to_the_topic(self) -> None:
+        _, notices = self.follow_up(RecordingDispatcher(Admission.FULL))
+        self.assertEqual(notices.texts, [(CHAT, 7561, PLAN_NOT_QUEUED_TEXT.format(mode=BYPASS_MODE))])
+
+    def test_a_failure_is_logged_and_told_never_raised(self) -> None:
+        _, notices = self.follow_up(RecordingDispatcher(error=RuntimeError("down")))
+        self.assertEqual(len(notices.texts), 1)
+        self.assertIn("plan follow-up failed: down", notices.lines[0])
 
 
 class TranslateTests(unittest.TestCase):

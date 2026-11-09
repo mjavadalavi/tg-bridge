@@ -229,7 +229,7 @@ class App:
         handoff = HandoffService(kv, registry, logger)
         cards = ApprovalCards(messenger, logger, clock)
         def plan_approved(thread_id: int, chat_id: int, mode: str) -> None:  # the dispatcher is built below
-            PlanFollowUp(sessions, dispatcher)(thread_id, chat_id, mode)
+            PlanFollowUp(sessions, dispatcher, messenger, logger)(thread_id, chat_id, mode)
 
         permissions = PermissionService(asks=asks, rules=rules, cards=cards, messenger=messenger, workers=out,
                                         waiting=waits, logger=logger, plan_approved=plan_approved)

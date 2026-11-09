@@ -71,6 +71,7 @@ class TurnBinding:
     restore_mode: str = ""  # the topic's mode before 'Bypass this turn', put back when the turn ends
     waiting: int = 0
     closed: bool = False
+    plan_approved: bool = False  # the CLI is still in plan mode: linger must not keep this session for the next turn
 
 
 @dataclass(eq=False)
@@ -215,18 +216,18 @@ class PermissionService:
         return True
 
     def answer_plan(self, nonce: str, mode: str, by: str = "owner") -> bool:
-        """Approves a plan (core/plan_approval): the ask is denied with the approval text, so the model ends the turn,
-        and the follow-up stores mode as the topic's mode and queues the turn that implements the plan."""
+        """Approves a plan (core/plan_approval). The follow-up first stores mode as the topic's mode and queues the turn
+        that implements the plan; then the ask is denied with the approval text, so the model ends this turn. The
+        session of this turn is not kept for the next one, since its CLI is still in plan mode."""
         ask = self._claim(nonce, "approved", accept=lambda a: a.request.kind == PLAN_KIND)
         if ask is None:
             return False
+        with self._lock:
+            ask.binding.plan_approved = True
         self._logger.log(f"ask {nonce}: plan approved ({mode}) by {by}")
+        if self._plan_approved is not None:  # it never raises (PlanFollowUp tells the topic what failed)
+            self._plan_approved(ask.binding.thread_id, ask.binding.chat_id, mode)
         self._finish(ask, Decision.DENY, deny_message=PLAN_APPROVED_MESSAGE.format(mode=mode))
-        if self._plan_approved is not None:
-            try:
-                self._plan_approved(ask.binding.thread_id, ask.binding.chat_id, mode)
-            except Exception as exc:
-                self._logger.log(f"ask {nonce}: plan follow-up failed: {str(exc)[:ERROR_TEXT_LIMIT]}")
         return True
 
     def answer_plan_change(self, nonce: str) -> bool:
@@ -251,8 +252,7 @@ class PermissionService:
         return label is not None and self._record(nonce, qi, label)
 
     def record_text(self, thread_id: int, text: str) -> bool:
-        """A typed message in a topic that waits for an 'Other' answer or for feedback on a plan. True when it became
-        that answer (a plan is then denied with the feedback, and the model revises it)."""
+        """A typed message that answers an 'Other' question, or is the feedback a plan card waits for (a deny)."""
         waiting = self._cards.awaiting(thread_id)
         if waiting is None or waiting[1] != PLAN_CHANGE_QI:
             return waiting is not None and self._record(waiting[0], waiting[1], text)
