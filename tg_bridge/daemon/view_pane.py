@@ -82,7 +82,7 @@ HEADER_LINE = "tg-bridge view · {name}"
 DETAIL_LINE = "launcher: {launcher}   folder: {cwd}   session: {session}"
 NEW_SESSION = "new"
 SESSION_SHORT = 8               # the uuid's characters the header shows
-CLAUDE_ENV_PREFIX = "CLAUDE"    # every CLAUDECODE, CLAUDE_CODE_*, CLAUDE_CONFIG_DIR, CLAUDE_PID, CLAUDE_PLUGIN_* name
+CLAUDE_ENV_PREFIXES = ("CLAUDE", "BUN_OPTIONS", "AI_AGENT")  # CLAUDE*, and the preload/agent of a parent session
 BUSY_STATES = terminal_claim.BUSY_STATES
 
 
@@ -157,8 +157,8 @@ def child_env(environ: Mapping[str, str]) -> dict[str, str]:
     """The CLI's environment, built the way the bridge builds its turns' (turn_runner._spec adds TZ to the daemon's
     environment, and the daemon has no CLAUDE* variable). Every CLAUDE* variable of the pane is dropped: a session the
     pane was started from would hand its config dir, pid or plugin paths to the CLI, which would then resume the topic
-    in the wrong place. The bridge sets no config dir of its own; the launcher's command decides it."""
-    env = {key: value for key, value in environ.items() if not key.startswith(CLAUDE_ENV_PREFIX)}
+    in the wrong place, and its BUN_OPTIONS preloads that CLI version's hook.js, gone after an update. The launcher decides."""
+    env = {key: value for key, value in environ.items() if not key.startswith(CLAUDE_ENV_PREFIXES)}
     env["TZ"] = TIMEZONE
     return env
 

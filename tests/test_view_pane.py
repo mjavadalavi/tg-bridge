@@ -484,7 +484,8 @@ class ChildEnvTests(PaneCase):
 
     def test_the_child_env_drops_every_claude_variable_of_the_pane(self) -> None:
         inherited = {"CLAUDE_CONFIG_DIR": "/work/other-config", "CLAUDE_PID": "123", "CLAUDE_EFFORT": "high",
-                     "CLAUDE_PLUGIN_ROOT": "/plugins", "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"}
+                     "CLAUDE_PLUGIN_ROOT": "/plugins", "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli",
+                     "BUN_OPTIONS": "--preload /old/2.1.296/hook.js", "AI_AGENT": "claude-code_2-1-296_agent"}
         self.make_topic()
         seen: list[Mapping[str, str]] = []
 
@@ -497,7 +498,7 @@ class ChildEnvTests(PaneCase):
                                             stop_after=1, stdin=io.StringIO(), keys=ScriptedKeys([ENTER]),
                                             run=run_cli), 0)
         [env] = seen
-        self.assertEqual([name for name in env if name.startswith("CLAUDE")], [])
+        self.assertEqual([name for name in env if name.startswith(("CLAUDE", "BUN_OPTIONS", "AI_AGENT"))], [])
         self.assertEqual(env["TZ"], TIMEZONE)
         self.assertIn("PATH", env)
 
