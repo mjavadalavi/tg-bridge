@@ -161,6 +161,25 @@ class VoiceTests(DrivingCase):
             fn(*args)
         self.assertEqual((self.run.calls, self.uploader.uploads), ([], ()))
 
+    def test_a_mode_turned_off_between_upload_attempts_stops_the_retries(self) -> None:
+        self.mode.turn_on(CHAT)
+        mode = self.mode
+        clock = self.clock
+
+        class OffOnSleep:
+            def now(self) -> float:
+                return clock.now()
+
+            def sleep(self, seconds: float) -> None:
+                mode.turn_off()
+
+        voice = DrivingVoice(self.mode, Speech(self.clock, self.logger, None, self.run), self.uploader, self.messenger,
+                             self.sessions, InlinePool(), OffOnSleep(), self.logger)
+        self.uploader.fail_next()
+        voice.answer(CHAT, THREAD, "🔊 hi")
+        self.assertEqual(len(self.uploader.uploads), 1, "no upload after the mode went off")
+        self.assertEqual(self.telegram.texts(self.mode.known_thread()), [], "no 'could not be made' text either")
+
     def test_the_driving_topic_itself_is_never_spoken(self) -> None:
         drive = self.mode.turn_on(CHAT)
         self.voice.answer(CHAT, drive, "🔊 hi")

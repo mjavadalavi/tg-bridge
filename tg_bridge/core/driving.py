@@ -168,6 +168,8 @@ class DrivingVoice:
         for attempt in range(UPLOAD_ATTEMPTS):
             if attempt:
                 self._clock.sleep(UPLOAD_PAUSE)
+                if not self._mode.active():  # turned off during the pause: dropped, and nothing to tell
+                    return True
             try:
                 thread = self._mode.thread(chat_id)
                 self._uploader.send_doc_bytes(chat_id, thread, data, "voice.ogg", "audio/ogg", topic, "sendVoice",
