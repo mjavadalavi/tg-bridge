@@ -35,6 +35,7 @@ import shutil
 import tempfile
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -54,6 +55,8 @@ SONIOX_DELETE_TIMEOUT = 30  # seconds for each cleanup request
 POLL_LIMIT = 60  # status checks before the transcription counts as timed out; voice notes are short
 POLL_SECONDS = 1.0
 DOWNLOAD_TIMEOUT = 60  # seconds for one Telegram file download
+VOICE_ATTEMPTS = 3  # a voice note's download and its transcription are each tried this many times
+VOICE_PAUSES = (3.0, 8.0)  # seconds before the 2nd and the 3rd try
 BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # the Bot API's getFile serves files up to 20 MB
 NAME_LIMIT = 100  # characters of a document's original name kept in the inbox file name
 REDACTED = "<redacted>"
@@ -67,7 +70,7 @@ MSG_PHOTO_FAILED = "photo download failed: {error}"
 MSG_FILE_TOO_LARGE = ("📎 {name} is {size} MB: Telegram lets a bot download files up to 20 MB only. "
                       "Send it smaller, or put it on disk and send its path.")
 MSG_FILE_FAILED = "📎 file download failed: {error}"
-MSG_TRANSCRIPTION_FAILED = "🎙 transcription failed: {error}"
+MSG_TRANSCRIPTION_FAILED = "🎙 transcription failed after 3 tries: {error}"
 MSG_ECHO = "🎙 {heard}"
 MSG_EMPTY = "🎙 voice came through but transcribed to nothing — try again or type it."
 MSG_NO_KEY = "🎙 voice support needs a Soniox key in ~/.local/state/tg-bridge/soniox-key"
@@ -303,7 +306,8 @@ class MediaService:
 
     def _voice(self, file_id: str, chat_id: Any, thread: Any) -> str | None:
         try:
-            heard = self._transcriber.transcribe(self._download(file_id))
+            path = self._tries(self._download, file_id)
+            heard = self._tries(self._transcriber.transcribe, path)
         except TranscriberUnavailable:
             self._messenger.send_text(chat_id, thread, MSG_NO_KEY)
             return None
@@ -315,6 +319,22 @@ class MediaService:
             return None
         self._messenger.send_text(chat_id, thread, MSG_ECHO.format(heard=heard[:ECHO_LIMIT]))
         return heard
+
+    def _tries(self, step: Callable[[str], str], arg: str) -> str:
+        """step(arg), tried VOICE_ATTEMPTS times with VOICE_PAUSES between: Soniox and the Telegram file server drop a
+        request now and then. A missing Soniox key is not tried again (TranscriberUnavailable); the last failure is
+        raised."""
+        for attempt in range(VOICE_ATTEMPTS):
+            if attempt:
+                self._clock.sleep(VOICE_PAUSES[min(attempt - 1, len(VOICE_PAUSES) - 1)])
+            try:
+                return step(arg)
+            except TranscriberUnavailable:
+                raise
+            except Exception:
+                if attempt == VOICE_ATTEMPTS - 1:
+                    raise
+        raise AssertionError("unreachable")
 
     def _download(self, file_id: str, name: str = "") -> str:
         """Fetch a Telegram file into the inbox and return its local path. The file is created with mkstemp, so its

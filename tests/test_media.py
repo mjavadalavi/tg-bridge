@@ -34,6 +34,8 @@ from tg_bridge.core.media import (
     MSG_NO_KEY,
     NAME_LIMIT,
     POLL_LIMIT,
+    VOICE_ATTEMPTS,
+    VOICE_PAUSES,
     MediaOutcome,
     MediaService,
     SonioxTranscriber,
@@ -153,11 +155,12 @@ class StubTranscriber:
     def __init__(self, text: str = "", error: BaseException | None = None) -> None:
         self.text = text
         self.error = error
+        self.fails = 0  # how many calls raise error before the rest succeed (0: error, when set, is raised every time)
         self.paths: list[str] = []
 
     def transcribe(self, path: str) -> str:
         self.paths.append(path)
-        if self.error is not None:
+        if self.error is not None and (not self.fails or len(self.paths) <= self.fails):
             raise self.error
         return self.text
 
@@ -493,15 +496,37 @@ class VoiceTests(_MediaCase):
         self.serve(VOICE_PATH, VOICE_BYTES)
         self.transcriber.error = TranscriptionFailed("bad audio")
         self.assertIsNone(self.media.fetch(voice_message(), "", native_images=False))
-        self.assertEqual(self.topic_texts(), ["🎙 transcription failed: bad audio"])
+        self.assertEqual(self.topic_texts(), ["🎙 transcription failed after 3 tries: bad audio"])
+        self.assertEqual(len(self.transcriber.paths), VOICE_ATTEMPTS)
+        self.assertEqual(len(set(self.transcriber.paths)), 1, "the file is downloaded once, only Soniox is retried")
+        self.assertEqual(self.clock.sleeps, list(VOICE_PAUSES))
+
+    def test_a_transcription_that_fails_then_works_is_retried(self) -> None:
+        self.serve(VOICE_PATH, VOICE_BYTES)
+        self.transcriber.text = "second time lucky"
+        self.transcriber.error = TranscriptionFailed("timed out")
+        self.transcriber.fails = 2
+        outcome = self.media.fetch(voice_message(), "", native_images=False)
+        self.assertEqual(outcome, MediaOutcome(text="second time lucky"))
+        self.assertEqual(self.topic_texts(), ["🎙 second time lucky"])
+        self.assertEqual(len(self.transcriber.paths), 3)
 
     def test_voice_download_failure_is_reported_as_transcription_failure(self) -> None:
         self.telegram.script_result("getFile", {"file_path": VOICE_PATH})
         self.assertIsNone(self.media.fetch(voice_message(), "", native_images=False))
         texts = self.topic_texts()
         self.assertEqual(len(texts), 1)
-        self.assertTrue(texts[0].startswith("🎙 transcription failed: "), texts)
+        self.assertTrue(texts[0].startswith("🎙 transcription failed after 3 tries: "), texts)
         self.assertNotIn(FAKE_TOKEN, texts[0])
+        self.assertEqual(sum(1 for call in self.telegram.calls if call.method == "getFile"), VOICE_ATTEMPTS)
+        self.assertEqual(self.transcriber.paths, [], "nothing is transcribed without a file")
+
+    def test_a_voice_download_that_fails_once_is_retried(self) -> None:
+        self.serve(VOICE_PATH, VOICE_BYTES)
+        self.transcriber.text = "hello"
+        self.telegram.fail_next("getFile", 502, description="Bad Gateway")
+        self.assertEqual(self.media.fetch(voice_message(), "", native_images=False), MediaOutcome(text="hello"))
+        self.assertEqual(self.topic_texts(), ["🎙 hello"])
 
     def test_missing_soniox_key_tells_topic_and_keeps_the_download(self) -> None:
         service = self._service(SonioxTranscriber(self.paths, self.openers, self.clock, self.stub.url))
