@@ -164,13 +164,13 @@ class TurnHarness:
         return registry
 
     def runner(self, registry: BackendRegistry, views: ViewFactory | None = None, view_dir: str = "",
-               linger: LingerService | None = None, memory_dir: str = "") -> TurnRunner:
+               linger: LingerService | None = None, memory_dir: str = "", note=None) -> TurnRunner:
         return TurnRunner(
             config=self.config, registry=registry, live=self.live, permissions=self.permissions, waits=self.waits,
             sessions=self.sessions, history=self.history, rules=self.rules, turns=self.turns, kv=self.kv,
             handoff=HandoffService(self.kv, registry, self.logger), feeds=self.feeds, clock=self.clock, logger=self.logger, base_env=self.base_env,
             errfile_dir=self.errfile_dir, poll_seconds=self.poll_seconds, views=views, view_dir=view_dir,
-            linger=linger, memory_dir=memory_dir)
+            linger=linger, memory_dir=memory_dir, note=note)
 
     def linger(self, registry: BackendRegistry) -> LingerService:
         """A LingerService built from the config as it is now, with a real SelfTurns (its 🔔 replies go to the fake

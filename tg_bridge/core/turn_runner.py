@@ -99,7 +99,9 @@ class TurnRunner:
         base_env: Mapping[str, str], errfile_dir: str, poll_seconds: float = POLL_SECONDS,
         views: ViewFactory | None = None, view_dir: str = "", linger: LingerService | None = None,
         memory_dir: str = "",
+        note: Callable[[], str] | None = None,
     ) -> None:
+        self._note = note  # text added to every user turn's message (driving mode asks for a spoken line)
         self._config = config
         self._registry = registry
         self._live = live
@@ -132,6 +134,7 @@ class TurnRunner:
         self._kv.set(key, json.dumps({"chat_id": chat_id, "name": topic,
                                       "started": utc_stamp(self._clock.now())}))
         try:
+            text = text + (self._note() if self._note is not None else "")
             reply = self._run_body(thread_id, chat_id, topic, text, sender, slot, images, attach)
         finally:
             if not self._live.is_shutting_down():  # a shutdown keeps the marker on purpose

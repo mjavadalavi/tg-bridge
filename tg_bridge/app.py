@@ -20,11 +20,13 @@ from tg_bridge.agents.defaults import build_default_registry, title_launcher_fro
 from tg_bridge.agents.registry import BackendRegistry
 from tg_bridge.bot.callbacks.approvals import ApprovalTaps
 from tg_bridge.bot.callbacks.handlers import QueueTaps, StatusTaps, StopChoiceTaps, StopTap
+from tg_bridge.bot.callbacks.drive_taps import DriveTaps
 from tg_bridge.bot.callbacks.keep_taps import KeepTaps
 from tg_bridge.bot.callbacks.picker_taps import PickerTaps
 from tg_bridge.bot.callbacks.router import CallbackRouter
 from tg_bridge.bot.callbacks.terminal_taps import TerminalTaps
 from tg_bridge.bot.commands.base import CommandDeps, CommandRegistry
+from tg_bridge.bot.commands.driving import DriveCommand
 from tg_bridge.bot.commands.info import register_info_commands
 from tg_bridge.bot.commands.session import SessionCommands
 from tg_bridge.bot.commands.settings import SettingsCommands
@@ -34,6 +36,7 @@ from tg_bridge.bot.terminal_guard import TerminalGuard
 from tg_bridge.clock import Clock, SystemClock
 from tg_bridge.config import BACKEND_CLAUDE, Config
 from tg_bridge.core.cards import ApprovalCards
+from tg_bridge.core.driving import DrivingMode, DrivingVoice, drive_note
 from tg_bridge.core.cwd import CwdService
 from tg_bridge.core.dispatcher import Dispatcher
 from tg_bridge.core.handoff import HandoffService
@@ -46,6 +49,7 @@ from tg_bridge.core.permissions import PermissionService
 from tg_bridge.core.plan_approval import PlanFollowUp
 from tg_bridge.core.self_turn import SelfTurns
 from tg_bridge.core.slots import SLOT_COUNT, SlotPool
+from tg_bridge.core.speech import Speech
 from tg_bridge.core.terminal_claim import clear_turn_marks
 from tg_bridge.core.titles import TitleService
 from tg_bridge.core.topics import TopicResolver
@@ -129,7 +133,7 @@ def _new_fake_telegram(clock: Clock) -> TelegramClient:
 
 # the /help text and the setMyCommands menu, in the order of the live BRIDGE_COMMANDS (tg-bridge.py)
 LIVE_MENU_ORDER = ("status", "stop", "mode", "model", "launcher", "new", "clear", "resume", "cwd", "queue", "cost",
-                   "rules", "forget", "help")
+                   "rules", "forget", "drive", "help")
 
 class _QueueView:
     """What CommandDeps.queues needs (snapshot): a view of the queues the Dispatcher owns."""
@@ -227,7 +231,11 @@ class App:
 
         # turns: permissions, the turn runner, the dispatcher
         handoff = HandoffService(kv, registry, logger)
-        cards = ApprovalCards(messenger, logger, clock)
+        uploader = Uploader(paths, openers, logger)
+        driving = DrivingMode(kv, clock, telegram)  # driving mode: answers and cards are also spoken
+        voice = DrivingVoice(driving, Speech(clock, logger, os.path.join(paths.state, "speech")), uploader, messenger,
+                             sessions, WorkerPool("voice", 1, logger), clock, logger)
+        cards = ApprovalCards(messenger, logger, clock, on_posted=voice.card)
         def plan_approved(thread_id: int, chat_id: int, mode: str) -> None:  # the dispatcher is built below
             PlanFollowUp(sessions, dispatcher, messenger, logger)(thread_id, chat_id, mode)
 
@@ -241,8 +249,7 @@ class App:
         def views(thread_id: int, topic: str, transport: str, launcher: str) -> ViewRecorder:
             return ViewRecorder(paths.view, thread_id, topic, transport, launcher, clock, logger)
 
-        uploader = Uploader(paths, openers, logger)
-        answers = AnswerSender(telegram, uploader, messenger, logger, clock)
+        answers = AnswerSender(telegram, uploader, messenger, logger, clock, on_answer=voice.answer)
         self_turns = SelfTurns(
             config=config, clock=clock, logger=logger, feeds=feeds, views=views if views_on else None,
             permissions=permissions, handoff=handoff, waits=waits, live=live, turns=turns, answers=answers,
@@ -255,7 +262,7 @@ class App:
             history=history, rules=rules, turns=turns, kv=kv, handoff=handoff, feeds=feeds, clock=clock,
             logger=logger, base_env=dict(environ), errfile_dir=paths.turns,
             views=views if views_on else None, view_dir=paths.view if views_on else "", linger=linger,
-            memory_dir=paths.memory)
+            memory_dir=paths.memory, note=lambda: drive_note(driving))
         titles = TitleService(backend=registry.get(BACKEND_CLAUDE), sessions=sessions, messenger=messenger,
                               pool=title_pool, logger=logger)
         removals = Removals(clock)  # the marks of the topics being removed: the dispatcher and the remover share them
@@ -294,6 +301,7 @@ class App:
         register_info_commands(commands)
         stops.register(commands)
         settings.register(commands)
+        DriveCommand(driving, logger).register(commands)
         commands.set_menu_order(LIVE_MENU_ORDER)
         deps = CommandDeps(config=config, sessions=sessions, turns=turns, rules=rules, kv=kv, live=live,
                            queues=_QueueView(dispatcher), backends=registry, messenger=messenger, out=out,
@@ -308,6 +316,7 @@ class App:
                                permissions=permissions, launchers=launchers, stops=stops, rules=rules,
                                folders=cwd, logger=logger, keep=keep),
                     KeepTaps(keep=keep),
+                    DriveTaps(mode=driving, logger=logger),
                     TerminalTaps(terminal=terminal)):
             tap.register(router)
         panes = Panes(clock=clock)

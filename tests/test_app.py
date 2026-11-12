@@ -170,7 +170,7 @@ class AppEndToEndTests(unittest.TestCase):
         """The /help text and the setMyCommands menu both follow the live BRIDGE_COMMANDS order (STEP 57 compares them)."""
         words = [word for word, _ in self.app.commands.bridge_commands()]
         self.assertEqual(words, ["status", "stop", "mode", "model", "launcher", "new", "clear", "resume", "cwd", "queue",
-                                 "cost", "rules", "forget", "help"])
+                                 "cost", "rules", "forget", "drive", "help"])
 
     def test_the_command_registry_holds_the_info_session_and_settings_commands(self) -> None:
         for word in ("help", "status", "cost", "stop", "new", "resume", "mode", "model", "launcher", "cwd"):

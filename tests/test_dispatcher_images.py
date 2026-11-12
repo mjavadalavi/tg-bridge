@@ -49,9 +49,9 @@ class PhotoQueueCase(unittest.TestCase):
         for thread in self.threads:
             thread.join(10.0)
 
-    def start(self, capabilities=FAKE_CAPABILITIES) -> None:
+    def start(self, capabilities=FAKE_CAPABILITIES, note=None) -> None:
         self.backend = ProbingBackend([[OK], [OK]], capabilities=capabilities)
-        self.runner = self.h.runner(self.h.registry_for(self.backend))
+        self.runner = self.h.runner(self.h.registry_for(self.backend), note=note)
         self.dispatcher = Dispatcher(
             turns=self.runner, slots=self.h.slots, inbox=None, messenger=self.h.messenger,
             answers=AnswerSender(self.h.tg, FakeUploader(), self.h.messenger, self.h.logger, self.h.clock),
@@ -69,6 +69,15 @@ class PhotoQueueCase(unittest.TestCase):
     def wait_for_turn_end(self) -> None:
         self.assertTrue(wait_until(lambda: self.send_user_calls() and not any(t.is_alive() for t in self.threads)),
                         "the turn did not run to its end")
+
+
+class TurnNoteTests(PhotoQueueCase):
+    def test_the_runner_adds_its_note_to_the_turn_text(self) -> None:
+        # driving mode's note (core/driving.drive_note) rides every user turn while the mode is on
+        self.start(note=lambda: " [driving]")
+        self.dispatcher.deliver(THREAD, TOPIC, CHAT, SENDER, None, "hi")
+        self.wait_for_turn_end()
+        self.assertEqual(self.send_user_calls(), [("send_user", "hi [driving]", ())])
 
 
 class PhotoReachesSessionTests(PhotoQueueCase):

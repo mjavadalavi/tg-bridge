@@ -13,6 +13,7 @@ text fallback, the Logger, and the Clock (the document name is stamped from it, 
 """
 
 import datetime
+from collections.abc import Callable
 
 from tg_bridge.clock import Clock
 from tg_bridge.logging_ import Logger
@@ -40,8 +41,10 @@ class AnswerSender:
         messenger: Messenger,
         logger: Logger,
         clock: Clock,
+        on_answer: Callable[[int | str, int | str, str], None] | None = None,
     ) -> None:
         self._client = client
+        self._on_answer = on_answer  # told of every answer once it was sent (driving mode speaks it)
         self._documents = documents
         self._messenger = messenger
         self._logger = logger
@@ -59,8 +62,13 @@ class AnswerSender:
         chunks = _answer_chunks(body) if len(body) <= doc_threshold else None
         if chunks is None:
             self._send_document(chat_id, thread_id, body)
-            return
-        self._send_html(chat_id, thread_id, chunks)
+        else:
+            self._send_html(chat_id, thread_id, chunks)
+        if self._on_answer is not None:
+            try:
+                self._on_answer(chat_id, thread_id, body)
+            except Exception as exc:  # the listener never breaks the answer
+                self._logger.log(f"answer listener: {str(exc)[:ERROR_TEXT_LIMIT]}")
 
     def _send_html(self, chat_id: int | str, thread_id: int | str, chunks: list[str]) -> None:
         for md in chunks:

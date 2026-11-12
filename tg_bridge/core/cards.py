@@ -225,8 +225,10 @@ class ApprovalCards:
         clock: Clock,
         nudge_seconds: float = ASK_NUDGE_SECONDS,
         timer_factory: TimerFactory = threading_timer,
+        on_posted: Callable[[int | str, int, ApprovalRequest], None] | None = None,
     ) -> None:
         self._messenger = messenger
+        self._on_posted = on_posted  # told of every card once it is up (driving mode speaks a line for it)
         self._logger = logger
         self._clock = clock
         self._nudge_seconds = nudge_seconds
@@ -282,6 +284,11 @@ class ApprovalCards:
             self._paint(view)
         if timer is not None:
             timer.start()
+        if self._on_posted is not None:
+            try:
+                self._on_posted(chat_id, thread_id, request)
+            except Exception as exc:  # the listener never breaks the card
+                self._logger.log(f"card listener: {str(exc)[:ERROR_TEXT_LIMIT]}")
         return True
 
     def is_open(self, nonce: str) -> bool:
