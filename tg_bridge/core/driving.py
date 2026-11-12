@@ -152,9 +152,13 @@ class DrivingVoice:
 
     def _speak(self, chat_id: int | str, thread_id: int, words: str) -> None:
         try:
+            if not self._mode.active():  # turned off (or ended) while this voice waited in the queue
+                return
             row = self._sessions.get(thread_id)
             topic = (row.name if row is not None else "") or str(thread_id)
             data = self._speech.synth(f"{topic}. {words}", VOICES[self._mode.voice()]) if words else None
+            if not self._mode.active():  # turned off while the voice was being made
+                return
             if data is None or not self._send(chat_id, data, topic):
                 self._messenger.send_text(chat_id, self._mode.thread(chat_id), NO_VOICE_TEXT.format(topic=topic))
         except Exception as exc:

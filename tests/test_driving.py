@@ -149,6 +149,18 @@ class VoiceTests(DrivingCase):
         self.assertEqual(self.run.texts, ["accounting. کار تمام شد."])
         self.assertIn(FEMALE_VOICE, self.run.calls[0])
 
+    def test_a_voice_queued_before_the_mode_went_off_is_dropped(self) -> None:
+        jobs: list[tuple] = []
+        pool = type("Pool", (), {"submit": lambda _self, fn, *args: jobs.append((fn, args))})()
+        voice = DrivingVoice(self.mode, Speech(self.clock, self.logger, None, self.run), self.uploader, self.messenger,
+                             self.sessions, pool, self.clock, self.logger)
+        self.mode.turn_on(CHAT)
+        voice.answer(CHAT, THREAD, "🔊 hi")
+        self.mode.turn_off()
+        for fn, args in jobs:
+            fn(*args)
+        self.assertEqual((self.run.calls, self.uploader.uploads), ([], ()))
+
     def test_the_driving_topic_itself_is_never_spoken(self) -> None:
         drive = self.mode.turn_on(CHAT)
         self.voice.answer(CHAT, drive, "🔊 hi")
