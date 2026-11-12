@@ -159,7 +159,7 @@ class DrivingVoice:
             data = self._speech.synth(f"{topic}. {words}", VOICES[self._mode.voice()]) if words else None
             if not self._mode.active():  # turned off while the voice was being made
                 return
-            if data is None or not self._send(chat_id, data, topic):
+            if (data is None or not self._send(chat_id, data, topic)) and self._mode.active():
                 self._messenger.send_text(chat_id, self._mode.thread(chat_id), NO_VOICE_TEXT.format(topic=topic))
         except Exception as exc:
             self._logger.log(f"driving voice for thread {thread_id} failed: {str(exc)[:ERROR_CHARS]}")
