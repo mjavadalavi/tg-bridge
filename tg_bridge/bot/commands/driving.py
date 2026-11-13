@@ -1,4 +1,4 @@
-"""/drive: driving mode (core/driving.py). Every answer and approval card is also spoken, in one driving topic.
+"""/drive: driving mode (core/driving.py). Every answer and approval card is also spoken, as a voice note in its topic.
 
 /drive alone posts the panel: the mode's state and voice, with buttons to turn it on or off and to pick the female or
 the male voice (bot/callbacks/drive_taps.py edits the panel on each tap). The words on | off | female | male | status
@@ -23,15 +23,12 @@ WORDS = MappingProxyType({ON: ON, "روشن": ON, OFF: OFF, "خاموش": OFF, F
                           "مرد": MALE, STATUS: STATUS, "وضعیت": STATUS})
 VOICE_LABELS = MappingProxyType({FEMALE: "👩 female", MALE: "👨 male"})
 PANEL_ON = ("🚗 Driving mode: ON ({minutes} minutes left) · voice: {voice}\n"
-            "Every answer is also spoken in the topic \"🚗 رانندگی\": play the first voice note there, the next ones "
-            "play on their own.")
+            "Every answer also comes as a voice note, right after it in the same topic.")
 PANEL_OFF = "🚗 Driving mode: OFF · voice: {voice}"
 TURN_ON_LABEL = "▶️ Turn on"
 TURN_OFF_LABEL = "⏹ Turn off"
 PICKED_MARK = " ✓"
 UNKNOWN_TEXT = "usage: /drive [on|off|female|male|status]"
-FAILED_TEXT = "🚗 the driving topic could not be made: {detail}"
-ERROR_CHARS = 200
 
 
 def panel_text(mode: DrivingMode) -> str:
@@ -47,18 +44,14 @@ def panel_rows(mode: DrivingMode) -> ButtonRows:
     return [[switch], voices]
 
 
-def apply(mode: DrivingMode, action: str, chat_id: int | str, logger: Logger) -> str | None:
+def apply(mode: DrivingMode, action: str) -> str | None:
     """Applies one action of the panel or the command. None when it worked, else the text that says why not."""
     if action in VOICE_LABELS:
         mode.set_voice(action)
     elif action == OFF:
         mode.turn_off()
     elif action == ON:
-        try:
-            mode.turn_on(chat_id)
-        except Exception as exc:  # createForumTopic refused: the mode stays off
-            logger.log(f"/drive: {str(exc)[:ERROR_CHARS]}")
-            return FAILED_TEXT.format(detail=str(exc)[:ERROR_CHARS])
+        mode.turn_on()
     elif action != STATUS:
         return UNKNOWN_TEXT
     return None
@@ -76,7 +69,7 @@ class DriveCommand:
 
     def _run(self, ctx: CommandContext, args: str) -> None:
         word = args.strip().lower()
-        failed = apply(self._mode, WORDS.get(word, word), ctx.chat_id, self._logger) if word else None
+        failed = apply(self._mode, WORDS.get(word, word)) if word else None
         if failed is not None:
             ctx.say(failed)
             return

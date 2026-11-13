@@ -232,9 +232,9 @@ class App:
         # turns: permissions, the turn runner, the dispatcher
         handoff = HandoffService(kv, registry, logger)
         uploader = Uploader(paths, openers, logger)
-        driving = DrivingMode(kv, clock, telegram)  # driving mode: answers and cards are also spoken
+        driving = DrivingMode(kv, clock)  # driving mode: answers and cards are also spoken
         voice = DrivingVoice(driving, Speech(clock, logger, os.path.join(paths.state, "speech")), uploader, messenger,
-                             sessions, WorkerPool("voice", 1, logger), clock, logger)
+                             WorkerPool("voice", 1, logger), clock, logger)
         cards = ApprovalCards(messenger, logger, clock, on_posted=voice.card)
         def plan_approved(thread_id: int, chat_id: int, mode: str) -> None:  # the dispatcher is built below
             PlanFollowUp(sessions, dispatcher, messenger, logger)(thread_id, chat_id, mode)

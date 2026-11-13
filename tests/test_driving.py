@@ -12,9 +12,8 @@ from tg_bridge.agents.events import PLAN_KIND, ApprovalRequest, Decision
 from tg_bridge.bot.commands.base import CommandDeps, CommandRegistry
 from tg_bridge.bot.callbacks.drive_taps import DriveTaps
 from tg_bridge.bot.commands.driving import TURN_OFF_LABEL, TURN_ON_LABEL, DriveCommand
-from tg_bridge.core.driving import (CARD_SPEECH, DRIVE_NOTE, DRIVE_SECONDS, DRIVE_TOPIC_NAME, NO_VOICE_TEXT,
-                                    PLAN_SPEECH, UPLOAD_ATTEMPTS, DrivingMode, DrivingVoice, drive_note,
-                                    spoken_text)
+from tg_bridge.core.driving import (CARD_SPEECH, DRIVE_NOTE, DRIVE_SECONDS, NO_VOICE_TEXT, PLAN_SPEECH,
+                                    UPLOAD_ATTEMPTS, DrivingMode, DrivingVoice, drive_note, spoken_text)
 from tg_bridge.core.speech import ATTEMPTS, FEMALE_VOICE, MALE_VOICE, PAUSES, Speech
 from tg_bridge.core.workers import WorkerPool
 from tg_bridge.logging_ import Logger
@@ -74,12 +73,9 @@ class DrivingCase(unittest.TestCase):
         self.messenger = Messenger(self.telegram, self.logger, self.clock)
         self.uploader = FakeUploader()
         self.run = FakeRun()
-        self.mode = DrivingMode(self.kv, self.clock, self.telegram)
+        self.mode = DrivingMode(self.kv, self.clock)
         self.voice = DrivingVoice(self.mode, Speech(self.clock, self.logger, os.path.join(base, "speech"), self.run),
-                                  self.uploader, self.messenger, self.sessions, InlinePool(), self.clock, self.logger)
-
-    def topics_made(self) -> int:
-        return sum(1 for call in self.telegram.calls if call.method == "createForumTopic")
+                                  self.uploader, self.messenger, InlinePool(), self.clock, self.logger)
 
 
 class SpokenTextTests(unittest.TestCase):
@@ -98,21 +94,18 @@ class SpokenTextTests(unittest.TestCase):
 
 
 class ModeTests(DrivingCase):
-    def test_on_makes_the_topic_once_and_ends_by_itself(self) -> None:
+    def test_on_makes_no_topic_and_ends_by_itself(self) -> None:
         self.assertFalse(self.mode.active())
         self.assertEqual(drive_note(self.mode), "")
-        thread = self.mode.turn_on(CHAT)
-        self.assertEqual(self.mode.turn_on(CHAT), thread)
-        self.assertEqual(self.topics_made(), 1)
-        self.assertEqual([c.params["name"] for c in self.telegram.calls if c.method == "createForumTopic"],
-                         [DRIVE_TOPIC_NAME])
+        self.mode.turn_on()
+        self.assertEqual(self.telegram.calls, (), "no driving topic is made")
         self.assertTrue(self.mode.active())
         self.assertEqual(drive_note(self.mode), DRIVE_NOTE)
         self.clock.advance(DRIVE_SECONDS + 1)
         self.assertFalse(self.mode.active())
 
     def test_off_and_the_voice_pick(self) -> None:
-        self.mode.turn_on(CHAT)
+        self.mode.turn_on()
         self.mode.turn_off()
         self.assertFalse(self.mode.active())
         self.assertEqual(self.mode.voice(), "female")
@@ -140,21 +133,21 @@ class VoiceTests(DrivingCase):
         self.voice.answer(CHAT, THREAD, "🔊 hi")
         self.assertEqual(self.uploader.uploads, ())
 
-    def test_an_answer_becomes_a_voice_note_in_the_driving_topic(self) -> None:
-        drive = self.mode.turn_on(CHAT)
+    def test_an_answer_becomes_a_voice_note_in_its_own_topic(self) -> None:
+        self.mode.turn_on()
         self.voice.answer(CHAT, THREAD, "متن کامل\n🔊 کار تمام شد.")
         [upload] = self.uploader.uploads
         self.assertEqual((upload.thread_id, upload.method, upload.field_name, upload.caption, upload.data),
-                         (drive, "sendVoice", "voice", "accounting", VOICE_BYTES))
-        self.assertEqual(self.run.texts, ["accounting. کار تمام شد."])
+                         (THREAD, "sendVoice", "voice", "", VOICE_BYTES))
+        self.assertEqual(self.run.texts, ["کار تمام شد."], "the topic name is not spoken")
         self.assertIn(FEMALE_VOICE, self.run.calls[0])
 
     def test_a_voice_queued_before_the_mode_went_off_is_dropped(self) -> None:
         jobs: list[tuple] = []
         pool = type("Pool", (), {"submit": lambda _self, fn, *args: jobs.append((fn, args))})()
         voice = DrivingVoice(self.mode, Speech(self.clock, self.logger, None, self.run), self.uploader, self.messenger,
-                             self.sessions, pool, self.clock, self.logger)
-        self.mode.turn_on(CHAT)
+                             pool, self.clock, self.logger)
+        self.mode.turn_on()
         voice.answer(CHAT, THREAD, "🔊 hi")
         self.mode.turn_off()
         for fn, args in jobs:
@@ -162,7 +155,7 @@ class VoiceTests(DrivingCase):
         self.assertEqual((self.run.calls, self.uploader.uploads), ([], ()))
 
     def test_a_mode_turned_off_between_upload_attempts_stops_the_retries(self) -> None:
-        self.mode.turn_on(CHAT)
+        self.mode.turn_on()
         mode = self.mode
         clock = self.clock
 
@@ -174,50 +167,42 @@ class VoiceTests(DrivingCase):
                 mode.turn_off()
 
         voice = DrivingVoice(self.mode, Speech(self.clock, self.logger, None, self.run), self.uploader, self.messenger,
-                             self.sessions, InlinePool(), OffOnSleep(), self.logger)
+                             InlinePool(), OffOnSleep(), self.logger)
         self.uploader.fail_next()
         voice.answer(CHAT, THREAD, "🔊 hi")
         self.assertEqual(len(self.uploader.uploads), 1, "no upload after the mode went off")
-        self.assertEqual(self.telegram.texts(self.mode.known_thread()), [], "no 'could not be made' text either")
+        self.assertEqual(self.telegram.texts(THREAD), [], "no 'could not be made' text either")
 
-    def test_the_driving_topic_itself_is_never_spoken(self) -> None:
-        drive = self.mode.turn_on(CHAT)
-        self.voice.answer(CHAT, drive, "🔊 hi")
-        self.assertEqual(self.uploader.uploads, ())
-
-    def test_a_deleted_driving_topic_is_made_again(self) -> None:
-        first = self.mode.turn_on(CHAT)
+    def test_a_deleted_topic_is_not_retried(self) -> None:
+        self.mode.turn_on()
         self.uploader.fail_next("Bad Request: message thread not found")
         self.voice.answer(CHAT, THREAD, "🔊 hi")
-        threads = [upload.thread_id for upload in self.uploader.uploads]
-        self.assertEqual(len(threads), 2)
-        self.assertEqual(threads[0], first)
-        self.assertNotEqual(threads[1], first)
-        self.assertEqual(self.topics_made(), 2)
+        self.assertEqual(len(self.uploader.uploads), 1)
+        self.assertEqual(self.telegram.texts(THREAD), [])
 
     def test_a_voice_that_never_goes_out_is_told_in_text(self) -> None:
-        drive = self.mode.turn_on(CHAT)
+        self.mode.turn_on()
         for _ in range(UPLOAD_ATTEMPTS):
             self.uploader.fail_next()
         self.voice.answer(CHAT, THREAD, "🔊 hi")
-        self.assertEqual(self.telegram.texts(drive), [NO_VOICE_TEXT.format(topic="accounting")])
+        self.assertEqual(self.telegram.texts(THREAD), [NO_VOICE_TEXT])
 
     def test_a_voice_that_cannot_be_made_is_told_in_text(self) -> None:
-        drive = self.mode.turn_on(CHAT)
+        self.mode.turn_on()
         self.run.fails = ATTEMPTS
         self.voice.answer(CHAT, THREAD, "🔊 hi")
         self.assertEqual(self.uploader.uploads, ())
-        self.assertEqual(self.telegram.texts(drive), [NO_VOICE_TEXT.format(topic="accounting")])
+        self.assertEqual(self.telegram.texts(THREAD), [NO_VOICE_TEXT])
 
     def test_cards_are_spoken_as_one_line(self) -> None:
-        self.mode.turn_on(CHAT)
+        self.mode.turn_on()
         choices = frozenset({Decision.ALLOW_ONCE, Decision.DENY})
         plan = ApprovalRequest(approval_id="p", kind=PLAN_KIND, tool="ExitPlanMode", input={}, summary="",
                                choices=choices)
         tool = ApprovalRequest(approval_id="t", kind="command", tool="Bash", input={}, summary="Bash", choices=choices)
         self.voice.card(CHAT, THREAD, plan)
         self.voice.card(CHAT, THREAD, tool)
-        self.assertEqual(self.run.texts, [f"accounting. {PLAN_SPEECH}", f"accounting. {CARD_SPEECH}"])
+        self.assertEqual(self.run.texts, [PLAN_SPEECH, CARD_SPEECH])
 
     def test_the_answer_sender_tells_its_listener_and_survives_it(self) -> None:
         heard: list[tuple] = []
